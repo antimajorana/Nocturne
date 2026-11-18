@@ -5,7 +5,7 @@ import argparse
 from pathlib import Path
 from PIL import Image
 
-BG_COLOR = (5, 28, 72)
+BG_COLOR = (18, 22, 74)
 ICONS = (
     ("AppIcon60x60@2x.png", 120),
     ("AppIcon60x60@3x.png", 180),
@@ -14,11 +14,11 @@ ICONS = (
     ("AppIcon83.5x83.5@2x~ipad.png", 167),
     ("AppIcon1024x1024.png", 1024),
 )
-DEFAULT_SOURCE = Path(__file__).resolve().parent.parent / "assets" / "brand" / "nocturne-source.png"
+DEFAULT_SOURCE = Path(__file__).resolve().parent.parent / "assets" / "brand" / "nocturne-square.png"
 
 
 def composite_opaque_square(source: Path) -> Image.Image:
-    """Composite any source image onto an opaque #051C48 square RGB canvas."""
+    """Composite any source image onto an opaque #12164A square RGB canvas."""
     with Image.open(source) as raw:
         rgba = raw.convert("RGBA")
     side = max(rgba.width, rgba.height)

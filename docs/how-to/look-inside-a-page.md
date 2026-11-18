@@ -4,8 +4,6 @@ A OneNote section is one binary file. Open it in a text editor and you see noise
 is a folder of plain files, and the code view shows you that folder, file by file, so you can see
 for yourself what your notes are made of.
 
-![The code view: the files of one page down the left, and the whole page file, head and body, on the right](../images/page-source.png)
-
 ## Open it and close it
 
 Press the **`< >`** button beside the page. The page steps aside, the files of the page take its

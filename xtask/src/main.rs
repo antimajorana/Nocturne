@@ -221,7 +221,6 @@ fn assets(root: &Path) -> Result<(), String> {
     let attribution = fs::read_to_string(root.join("ATTRIBUTION.md")).map_err(|e| format!("ATTRIBUTION.md: {e}"))?;
     let mut files = Vec::new();
     files_under(root, &root.join("assets"), &mut files)?;
-    files_under(root, &root.join("docs").join("images"), &mut files)?;
     let rel: Vec<String> = files
         .iter()
         .filter_map(|f| f.strip_prefix(root).ok())

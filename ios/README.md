@@ -29,7 +29,7 @@ Native `egui` + `wgpu` Metal build of Nocturne packaged as a universal iPhone/iP
   `.html`, `.one`, and `.onepkg` (`LSHandlerRank = Alternate`) so iPadOS offers **Nocturne**
   in Share / Open In sheets ([`src/inbox.rs`](src/inbox.rs)).
 - **Opaque RGB icons**: [`generate_icons.py`](generate_icons.py) composites any RGBA icon onto an
-  opaque `#051C48` RGB canvas (`mode="RGB"`, no alpha channel) so iOS, Sideloadly, SideStore, and
+  opaque `#12164A` RGB canvas (`mode="RGB"`, no alpha channel) so iOS, Sideloadly, SideStore, and
   AltStore accept all six required `AppIcon*.png` sizes (including `167x167` for iPad Air 4th gen).
 - **Minimal entitlements**: [`entitlements.plist`](entitlements.plist) uses `<dict/>` for ad-hoc
   `codesign` and free-Apple-ID re-signing via Sideloadly, SideStore, or AltStore.
@@ -189,9 +189,9 @@ well. Because `UIFileSharingEnabled` and `LSSupportsOpeningDocumentsInPlace` are
 
 ## 6. Customizing the app icon with `--icon`
 
-The default icon source is [`assets/brand/nocturne-source.png`](../assets/brand/nocturne-source.png).
+The default icon source is [`assets/brand/nocturne-square.png`](../assets/brand/nocturne-square.png), the icon without rounded corners (iOS rounds them itself).
 You can substitute any PNG (square or non-square, RGB or RGBA with transparency):
-[`generate_icons.py`](generate_icons.py) centers and composites it onto an opaque `#051C48`
+[`generate_icons.py`](generate_icons.py) centers and composites it onto an opaque `#12164A`
 background and emits all six PNG sizes with Lanczos resampling.
 
 - **Via GitHub Actions (from Windows)**:
