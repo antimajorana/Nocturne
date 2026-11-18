@@ -24,6 +24,18 @@ pub const LONG_PRESS_SECS: f64 = 0.50;
 /// Maximum finger movement in points allowed before cancelling a pending touch long press.
 pub const LONG_PRESS_MOVE_TOLERANCE_PTS: f32 = 10.0;
 
+/// How far in points a finger may drift between touch-down and lift and still count as a tap.
+/// egui's default of 6 suits a mouse; a fingertip rolls further than that on glass, and the
+/// long press above already allows 10.
+pub const TOUCH_CLICK_SLOP_PTS: f32 = 10.0;
+
+/// Widens egui's click tolerance for fingers without narrowing a larger custom value, so a tap
+/// that drifts a few points still presses the button under it. Note that egui also uses
+/// `max_click_dist` as its click-and-drag start threshold and double-tap distance.
+pub fn apply_mobile_touch_input_options(options: &mut egui::Options) {
+    options.input_options.max_click_dist = options.input_options.max_click_dist.max(TOUCH_CLICK_SLOP_PTS);
+}
+
 /// Raises spacing minimums for finger-friendly touch targets without shrinking larger custom values.
 pub fn apply_mobile_touch_style(style: &mut egui::Style) {
     style.spacing.interact_size.x = style.spacing.interact_size.x.max(TABLET_MIN_INTERACT_HEIGHT);
@@ -139,6 +151,50 @@ mod tests {
         style.spacing.item_spacing = spacing;
         style.spacing.scroll.bar_width = bar_width;
         style
+    }
+
+    /// Replays what egui-winit sends for one finger tap: the touch plus the emulated pointer.
+    fn drifting_tap_clicks(configure: impl FnOnce(&mut egui::Options), drift: f32) -> bool {
+        let ctx = egui::Context::default();
+        ctx.options_mut(configure);
+        let at = pos2(60.0, 40.0);
+        let end = at + vec2(drift, 0.0);
+        let button =
+            |pressed: bool, pos: Pos2| Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        let frame = |time: f64, events: Vec<Event>| {
+            let mut clicked = false;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                clicked = ui.put(egui::Rect::from_center_size(at, vec2(120.0, 60.0)), egui::Button::new("Tap")).clicked();
+            });
+            out.textures_delta.clear();
+            clicked
+        };
+        assert!(!frame(0.0, Vec::new()), "layout frame");
+        assert!(!frame(0.02, vec![touch(1, Start, at, None), Event::PointerMoved(at), button(true, at)]));
+        assert!(!frame(0.06, vec![touch(1, Move, end, None), Event::PointerMoved(end)]));
+        frame(0.10, vec![touch(1, End, end, None), button(false, end), Event::PointerGone])
+    }
+
+    #[test]
+    fn finger_tap_that_drifts_a_few_points_still_clicks_with_mobile_input_options() {
+        // egui's mouse default: a tap that rolls 8 points is thrown away.
+        assert!(drifting_tap_clicks(|_| {}, 3.0));
+        assert!(!drifting_tap_clicks(|_| {}, 8.0), "egui default max_click_dist is 6");
+
+        assert!(drifting_tap_clicks(apply_mobile_touch_input_options, 8.0), "an 8 point drift is still a tap on a tablet");
+        assert!(!drifting_tap_clicks(apply_mobile_touch_input_options, 14.0), "a real drag is still not a click");
+
+        // A larger custom value is not narrowed.
+        let mut options = egui::Options::default();
+        options.input_options.max_click_dist = 16.0;
+        apply_mobile_touch_input_options(&mut options);
+        assert_eq!(options.input_options.max_click_dist, 16.0);
     }
 
     #[test]

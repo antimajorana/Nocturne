@@ -4,7 +4,7 @@ use crate::{clipboard, diagnostics, edit_menu, gestures, inbox, keyboard, pencil
 use nocturne_engine::Session;
 use nocturne_store::Settings;
 use nocturne_ui_egui::clipboard::Board as _;
-use nocturne_ui_egui::touch_ux::{TouchLongPress, apply_mobile_touch_style};
+use nocturne_ui_egui::touch_ux::{TouchLongPress, apply_mobile_touch_input_options, apply_mobile_touch_style};
 use nocturne_ui_egui::{NocturneApp, PlatformEditAction};
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
@@ -248,6 +248,7 @@ pub(crate) fn run() -> Result<(), String> {
         native_options(),
         Box::new(move |cc| {
             cc.egui_ctx.all_styles_mut(apply_mobile_touch_style);
+            cc.egui_ctx.options_mut(apply_mobile_touch_input_options);
             let mut app = NocturneApp::new(session).with_clipboard(Box::new(clipboard::IosPasteboard::new()));
             apply_ingest_report(&mut app, initial_ingest);
 
@@ -289,10 +290,25 @@ pub(crate) fn run() -> Result<(), String> {
                 pending_text_commands: VecDeque::new(),
                 move_cursor_focus_wait: 0,
                 active_stylus_touches: BTreeSet::new(),
+                last_geometry: None,
             }))
         }),
     )
     .map_err(|e| format!("the window failed: {e}"))
+}
+
+/// Snapshot of the window and layout geometry fields logged by `Shell`, so each change logs once.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GeometrySnapshot {
+    layout_bits: [u32; 4],
+    safe_window_bits: Option<[u32; 4]>,
+    full_window_bits: Option<[u32; 4]>,
+    native_ppp_bits: Option<u32>,
+    zoom_bits: u32,
+}
+
+fn rect_bits(rect: egui::Rect) -> [u32; 4] {
+    [rect.min.x.to_bits(), rect.min.y.to_bits(), rect.max.x.to_bits(), rect.max.y.to_bits()]
 }
 
 /// The egui application hosted inside the iPadOS / iOS window.
@@ -308,6 +324,7 @@ struct Shell {
     pending_text_commands: VecDeque<text_input::TextEditCommand>,
     move_cursor_focus_wait: u8,
     active_stylus_touches: BTreeSet<egui::TouchId>,
+    last_geometry: Option<GeometrySnapshot>,
 }
 
 impl Shell {
@@ -452,6 +469,24 @@ impl eframe::App for Shell {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let focused = ctx.input(|i| i.focused);
+        let zoom = ctx.zoom_factor();
+        let (layout, safe_window, full_window, native_ppp) = ctx.input(|i| {
+            let viewport = i.viewport();
+            (i.viewport_rect(), viewport.inner_rect, viewport.outer_rect, viewport.native_pixels_per_point)
+        });
+        let snapshot = GeometrySnapshot {
+            layout_bits: rect_bits(layout),
+            safe_window_bits: safe_window.map(rect_bits),
+            full_window_bits: full_window.map(rect_bits),
+            native_ppp_bits: native_ppp.map(f32::to_bits),
+            zoom_bits: zoom.to_bits(),
+        };
+        if self.last_geometry != Some(snapshot) {
+            self.last_geometry = Some(snapshot);
+            log::info!(
+                "geometry: layout={layout:?} safe_area_window={safe_window:?} full_window={full_window:?} native_ppp={native_ppp:?} zoom={zoom}"
+            );
+        }
         if self.focused && !focused {
             self.app.save_page_now();
             export_current_diagnostics_log();

@@ -12599,6 +12599,35 @@ mod m2_regression_tests {
         ed.caret = Some(pageedit::Caret { block, text, focus: true, selection, place: Some(selection.0), cell: None, span: None, inline: None });
     }
 
+    /// The iPad's route: Open > long press a notebook > Delete notebook, with one of its pages
+    /// open and edited. Verifies the open editor is cleared so a late save does not recreate it.
+    #[test]
+    fn deleting_the_open_notebook_from_the_list_removes_it_and_it_stays_gone() {
+        let (_t, mut app, sample) = setup_app("m2-reg-delete-open-notebook", "Start\n");
+        focus_block(&mut app, 0, (5, 5));
+        app.insert_platform_text(" edited");
+        let listed = std::fs::canonicalize(&sample.notebook).expect("canonical notebook path");
+        app.dialog = Some(Dialog::DeleteNotebook { path: listed, title: "Sample".into() });
+        let mut h: H = egui_kittest::Harness::builder()
+            .with_size(vec2(1280.0, 800.0))
+            .with_accessibility_check(false)
+            .build_ui_state(|ui, app: &mut NocturneApp| app.show(ui), app);
+        settle(&mut h);
+
+        h.query_all_by_label("Delete notebook").last().expect("the confirm button").click();
+        settle(&mut h);
+
+        assert!(h.state().dialog.is_none(), "the dialog closes");
+        assert!(!sample.notebook.exists(), "the notebook folder is removed");
+        assert!(h.state().editor.is_none(), "the deleted notebook's page is no longer open");
+        h.state_mut().save_page_now();
+        for _ in 0..30 {
+            h.step();
+        }
+        assert!(!sample.notebook.exists(), "a late save must not bring the folder back");
+        assert!(!h.state().status_is_error, "no error is reported: {}", h.state().status);
+    }
+
     #[test]
     fn platform_edit_hooks_and_cut_paste_round_trip_undo_redo() {
         let (_t, mut app, sample) = setup_app("m2-reg-platform-undo", "Start\n");
