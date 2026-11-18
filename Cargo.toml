@@ -4,7 +4,7 @@ members = ["crates/*", "apps/*", "android", "ios", "xtask", "docs/demo/scripts"]
 default-members = ["crates/*", "apps/nocturne", "apps/nocturne-cli", "apps/nocturne-setup", "xtask"]
 
 [workspace.package]
-version = "0.0.11"
+version = "0.0.12"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
@@ -73,6 +73,13 @@ time = { version = "0.3", default-features = false, features = ["std", "local-of
 # Keep the upstream crate local until its WASM-safe timer fix is released.
 [patch.crates-io]
 mermaid-rs-renderer = { path = "vendor/mermaid-rs-renderer" }
+# eframe / egui-wgpu 0.37.0 size the iOS drawing surface from winit's inner_size(), which is only
+# the safe area, while egui-winit lays out over outer_size(). The picture is then stretched to the
+# full screen, so Pencil ink and taps do not land where they are drawn. These vendored copies add
+# `surface_size` to use outer_size() on iOS; drop both lines once an egui release sizes iOS
+# surfaces from the full window. See vendor/eframe/NOCTURNE.md.
+egui-wgpu = { path = "vendor/egui-wgpu" }
+eframe = { path = "vendor/eframe" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -82,6 +82,14 @@ imports shared documents placed in `Documents/Inbox/` (Share > Nocturne), and re
   - The first-responder request is made only when focus is first wanted and is not retried.
   - The edit menu's anchor rect is given in egui points where UIKit expects view points, and
     its titles (Cut, Copy, Paste, Select All, Delete) are English strings, not i18n ids.
+  - eframe / egui-wgpu 0.37.0 sized the drawing surface from the safe area while egui-winit laid out
+    for the whole window, so the picture was stretched and Pencil ink and taps landed away from
+    what was drawn. `vendor/egui-wgpu` and `vendor/eframe` carry a Nocturne `surface_size` patch
+    until an egui release sizes iOS surfaces from the full window. Read from the sources; still to
+    confirm on the iPad.
+  - A finger tap may drift 10 points and still click (egui's default is 6; `max_click_dist` also
+    sets egui's click-and-drag and double-tap distance to 10 points). A press held for half a
+    second on a plain button is taken as a long press and does not click it.
 - **No desktop folder or file picker.** Open a notebook folder, Import, Add file or picture, Print
   out, Save picture as, and Export telemetry use the `filepicker.ios.rs` stand-in, returning no
   selection and posting a status notice pointing to `Files > On My iPad > Nocturne` or
