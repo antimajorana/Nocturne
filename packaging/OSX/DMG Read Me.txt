@@ -1,0 +1,13 @@
+Nocturne for macOS
+
+Install the app
+1. Drag Nocturne.app to Applications.
+2. Open Nocturne from Applications.
+3. On the first launch after installation, Nocturne opens a short setup: a welcome page, the local
+logging level, your page format, and whether to add the Welcome notebook in that format. Choosing Yes
+creates `welcome-to-nocturne` in your notebooks folder when you press Finish, then opens it. Changes
+in an existing Welcome notebook will be lost. Other notebooks are unchanged. Choosing No creates
+nothing. The setup does not appear again unless you reset the preferences.
+
+The Welcome notebook is an ordinary user-owned folder. You can edit or delete it like any other
+notebook. The app bundle includes the source used to create it.

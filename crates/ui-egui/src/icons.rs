@@ -1,0 +1,883 @@
+//! Shared icon mapping. The ribbon uses locally vendored Fluent UI SVGs where a
+//! polished platform icon exists; the remaining app icons retain the native
+//! painter fallback.
+//!
+//! Notebooks, section groups and sections are drawn as solid shapes in their own colour,
+//! which is how OneNote shows a notebook cover and a section tab. Pages stay as outlines,
+//! so a page never competes with the coloured containers above it.
+
+use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, Ui, pos2};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Icon {
+    /// A closed notebook seen from the front: a cover with a darker spine.
+    Notebook,
+    /// Two section tabs behind one another: a group of sections.
+    SectionGroup,
+    /// One open section group: the tabs fan out.
+    SectionGroupOpen,
+    /// A single section tab, the coloured divider of a notebook.
+    Section,
+    /// One sheet with a folded corner.
+    Page,
+    /// An open folder with a tab.
+    Folder,
+    /// A stack of sheets: a page that has sub-pages, shown while collapsed.
+    PageStack,
+    /// An arrow showing a page moving earlier among its siblings.
+    MoveUp,
+    /// An arrow showing a page moving later among its siblings.
+    MoveDown,
+    /// Angle brackets: show or hide the page source.
+    Code,
+    /// A magnifier: search.
+    Search,
+    /// Two arrows pushing apart: the page fills the window.
+    FullPage,
+    /// Two arrows pulling together: leave the full page view.
+    ExitFullPage,
+    /// The sun: the light themes.
+    Sun,
+    /// The moon: the dark themes.
+    Moon,
+    /// Three lines with dots: a bullet list.
+    ListBullet,
+    /// Three lines with numbers: a numbered list.
+    ListNumber,
+    /// A ticked box: a to-do.
+    Todo,
+    /// A grid: a table.
+    Table,
+    /// A frame with a hill and a sun: a picture.
+    Picture,
+    /// A paperclip: a file on the page.
+    Attach,
+    /// Two links of a chain.
+    Link,
+    /// A radical sign: an equation.
+    Equation,
+    /// Two boxes and an arrow: a diagram.
+    Diagram,
+    /// Quotation marks: a quote.
+    Quote,
+    /// Three thin lines, well apart: show or hide the notebooks column.
+    Bars,
+    /// Three lines sharing a left edge: align the paragraph to the left.
+    AlignLeft,
+    /// Three lines sharing a centre: centre the paragraph.
+    AlignCenter,
+    /// Three lines sharing a right edge: align the paragraph to the right.
+    AlignRight,
+    /// Lines with modestly varying lengths: justify with low kashida strength.
+    JustifyLow,
+    /// Lines with medium variation: justify with medium kashida strength.
+    JustifyMedium,
+    /// Lines filling the column: justify with high kashida strength.
+    JustifyHigh,
+    /// Lines of text with an arrow under them pointing right: this reads left to right.
+    DirLtr,
+    /// The same, mirrored: this reads right to left.
+    DirRtl,
+    /// A pilcrow with an arrow beside it pointing right: this paragraph reads left to
+    /// right. Word, LibreOffice and the Office web apps all mark paragraph direction with
+    /// a pilcrow and an arrow, and a writer of Arabic looks for that shape, so Nocturne
+    /// draws one too. The lines-and-arrow pair above is the whole page; this pair is one
+    /// paragraph.
+    ParaLtr,
+    /// The same, mirrored: this paragraph reads right to left.
+    ParaRtl,
+    /// A text caret with a right-pointing marker: the text run reads left to right.
+    CaretLtr,
+    /// A text caret with a left-pointing marker: the text run reads right to left.
+    CaretRtl,
+    /// Lines of text with an asterisk: let each paragraph decide its own direction.
+    DirAuto,
+    /// A pilcrow with an asterisk: let this paragraph decide its own direction.
+    ParaAuto,
+    /// A block rubber held at an angle, with the worn end on the page: the ink eraser.
+    Eraser,
+    /// An arrow curving back to the left: take the last thing back.
+    Undo,
+    /// The same arrow the other way: do it again.
+    Redo,
+    /// An arrow head: the select tool.
+    Pointer,
+    /// A loop drawn round something: lasso select.
+    Lasso,
+    /// An open hand: drag the page about instead of drawing on it.
+    Hand,
+    /// A ruler lying at an angle, with its marks along one edge.
+    Ruler,
+    /// Two arrows pushing apart with a line between: make room.
+    InsertSpace,
+    /// A circle behind a square: shapes.
+    Shapes,
+    /// A written stroke beside printed lines: handwriting becomes words.
+    InkToText,
+    /// An arrow running round a circle: watch the ink drawn again.
+    Replay,
+    /// A question mark in a ring.
+    Help,
+    /// A pen nib pointing down and to the left: ink.
+    Pen,
+    /// A plain plus: add one more of something.
+    Plus,
+    /// A plain minus: zoom out.
+    Minus,
+    /// A magnifying glass with a minus sign: zoom out of the page.
+    ZoomOut,
+    /// A magnifying glass with a plus sign: zoom into the page.
+    ZoomIn,
+    /// A page fitted across the available view width.
+    PageWidth,
+    /// A calendar page with two rings: a date.
+    Calendar,
+    /// A clock face with two hands: a time.
+    Clock,
+    /// A screen with a play triangle on it.
+    Video,
+    /// A microphone on its stand: recording and transcribing.
+    Mic,
+    /// A sheet with a filled header row: a spreadsheet.
+    Spreadsheet,
+    /// Four corner brackets: clipping part of the screen.
+    Clip,
+    /// A round face: stickers.
+    Sticker,
+    /// An omega: a symbol from outside the keyboard.
+    Symbol,
+    /// A table with one row picked out.
+    TableRow,
+    /// A table with one column picked out.
+    TableColumn,
+}
+
+/// Maps points from a 24 x 24 design grid into `rect`.
+struct Grid {
+    rect: Rect,
+}
+
+impl Grid {
+    fn p(&self, x: f32, y: f32) -> Pos2 {
+        pos2(self.rect.min.x + self.rect.width() * x / 24.0, self.rect.min.y + self.rect.height() * y / 24.0)
+    }
+
+    fn pts(&self, pts: &[(f32, f32)]) -> Vec<Pos2> {
+        pts.iter().map(|&(x, y)| self.p(x, y)).collect()
+    }
+}
+
+/// Mixes towards black (or towards white when the colour is already dark) for the spine and
+/// the tabs behind the first one, so one colour gives a whole icon.
+fn shade(c: Color32, amount: f32) -> Color32 {
+    let bright = f32::from(c.r()) * 0.299 + f32::from(c.g()) * 0.587 + f32::from(c.b()) * 0.114;
+    let target = if bright > 110.0 { 0.0f32 } else { 255.0 };
+    let mix = |x: u8| (f32::from(x) + (target - f32::from(x)) * amount).clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(mix(c.r()), mix(c.g()), mix(c.b()))
+}
+
+pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
+    let g = Grid { rect };
+    let w = rect.width().max(1.0);
+    let stroke = Stroke::new((w / 14.0).max(1.2), color);
+    let closed = |pts: &[(f32, f32)]| Shape::closed_line(g.pts(pts), stroke);
+    let line = |a: (f32, f32), b: (f32, f32)| Shape::line_segment([g.p(a.0, a.1), g.p(b.0, b.1)], stroke);
+    let path = |pts: &[(f32, f32)]| Shape::line(g.pts(pts), stroke);
+    let fill = |pts: &[(f32, f32)], c: Color32| Shape::convex_polygon(g.pts(pts), c, Stroke::NONE);
+    let shapes: Vec<Shape> = match icon {
+        // A cover with a darker spine down its left edge, and two faint rule lines.
+        Icon::Notebook => {
+            let spine = shade(color, 0.35);
+            let rule = shade(color, 0.55);
+            vec![
+                fill(&[(5.0, 3.0), (19.0, 3.0), (19.0, 21.0), (5.0, 21.0)], color),
+                fill(&[(5.0, 3.0), (8.5, 3.0), (8.5, 21.0), (5.0, 21.0)], spine),
+                Shape::line_segment([g.p(11.5, 8.5), g.p(16.5, 8.5)], Stroke::new((w / 16.0).max(1.0), rule)),
+                Shape::line_segment([g.p(11.5, 12.0), g.p(16.5, 12.0)], Stroke::new((w / 16.0).max(1.0), rule)),
+            ]
+        }
+        // One tab: a rounded rectangle standing on its end, like a section divider.
+        Icon::Section => {
+            vec![Shape::rect_filled(Rect::from_min_max(g.p(8.5, 3.5), g.p(15.5, 20.5)), egui::CornerRadius::same((w / 8.0).max(1.0) as u8), color)]
+        }
+        // Several tabs, the ones behind in a lighter shade.
+        Icon::SectionGroup => {
+            let back = shade(color, 0.45);
+            vec![
+                Shape::rect_filled(Rect::from_min_max(g.p(13.5, 5.5), g.p(18.0, 18.5)), egui::CornerRadius::same(2), back),
+                Shape::rect_filled(Rect::from_min_max(g.p(9.5, 4.5), g.p(14.0, 19.5)), egui::CornerRadius::same(2), shade(color, 0.2)),
+                Shape::rect_filled(Rect::from_min_max(g.p(5.5, 3.5), g.p(10.0, 20.5)), egui::CornerRadius::same(2), color),
+            ]
+        }
+        // The same tabs, fanned out: the group is open.
+        Icon::SectionGroupOpen => {
+            let back = shade(color, 0.45);
+            vec![
+                Shape::rect_filled(Rect::from_min_max(g.p(16.0, 7.0), g.p(20.5, 20.0)), egui::CornerRadius::same(2), back),
+                Shape::rect_filled(Rect::from_min_max(g.p(10.0, 5.0), g.p(14.5, 20.0)), egui::CornerRadius::same(2), shade(color, 0.2)),
+                Shape::rect_filled(Rect::from_min_max(g.p(4.0, 3.5), g.p(8.5, 20.0)), egui::CornerRadius::same(2), color),
+            ]
+        }
+        Icon::Page => vec![
+            closed(&[(5.0, 3.0), (14.0, 3.0), (19.0, 8.0), (19.0, 21.0), (5.0, 21.0)]),
+            path(&[(14.0, 3.0), (14.0, 8.0), (19.0, 8.0)]),
+            line((8.5, 13.0), (15.5, 13.0)),
+            line((8.5, 16.5), (15.5, 16.5)),
+        ],
+        Icon::Folder => vec![closed(&[(3.0, 7.0), (9.0, 7.0), (11.0, 9.0), (21.0, 9.0), (21.0, 20.0), (3.0, 20.0), (3.0, 7.0)])],
+        Icon::PageStack => vec![
+            path(&[(8.5, 3.0), (15.0, 3.0), (20.0, 8.0), (20.0, 15.0)]),
+            closed(&[(4.5, 6.0), (12.0, 6.0), (17.0, 11.0), (17.0, 21.0), (4.5, 21.0)]),
+            path(&[(12.0, 6.0), (12.0, 11.0), (17.0, 11.0)]),
+            line((7.5, 16.0), (14.0, 16.0)),
+        ],
+        Icon::Code => vec![path(&[(9.0, 6.0), (4.0, 12.0), (9.0, 18.0)]), path(&[(15.0, 6.0), (20.0, 12.0), (15.0, 18.0)])],
+        Icon::Search => vec![Shape::circle_stroke(g.p(10.5, 10.5), w * 5.5 / 24.0, stroke), line((14.6, 14.6), (19.5, 19.5))],
+        Icon::FullPage => vec![
+            path(&[(14.0, 4.0), (20.0, 4.0), (20.0, 10.0)]),
+            line((20.0, 4.0), (14.5, 9.5)),
+            path(&[(10.0, 20.0), (4.0, 20.0), (4.0, 14.0)]),
+            line((4.0, 20.0), (9.5, 14.5)),
+        ],
+        Icon::ExitFullPage => vec![
+            path(&[(20.0, 10.0), (14.0, 10.0), (14.0, 4.0)]),
+            line((14.0, 10.0), (19.5, 4.5)),
+            path(&[(4.0, 14.0), (10.0, 14.0), (10.0, 20.0)]),
+            line((10.0, 14.0), (4.5, 19.5)),
+        ],
+        Icon::Sun => {
+            let mut v = vec![Shape::circle_stroke(g.p(12.0, 12.0), w * 4.6 / 24.0, stroke)];
+            for i in 0..8 {
+                let a = std::f32::consts::TAU * f32::from(i as u8) / 8.0;
+                let (sx, sy) = (12.0 + a.cos() * 7.4, 12.0 + a.sin() * 7.4);
+                let (ex, ey) = (12.0 + a.cos() * 9.6, 12.0 + a.sin() * 9.6);
+                v.push(line((sx, sy), (ex, ey)));
+            }
+            v
+        }
+        Icon::ListBullet => vec![
+            Shape::circle_filled(g.p(5.0, 7.0), w / 22.0, color),
+            Shape::circle_filled(g.p(5.0, 12.0), w / 22.0, color),
+            Shape::circle_filled(g.p(5.0, 17.0), w / 22.0, color),
+            line((10.0, 7.0), (20.0, 7.0)),
+            line((10.0, 12.0), (20.0, 12.0)),
+            line((10.0, 17.0), (20.0, 17.0)),
+        ],
+        Icon::ListNumber => vec![
+            line((4.0, 5.5), (4.0, 9.0)),
+            line((3.0, 6.5), (4.0, 5.5)),
+            path(&[(3.0, 11.0), (5.0, 11.0), (3.0, 14.5), (5.0, 14.5)]),
+            path(&[(3.0, 16.5), (5.0, 16.5), (5.0, 18.0), (3.0, 18.0), (5.0, 18.0), (5.0, 19.5), (3.0, 19.5)]),
+            line((10.0, 7.0), (20.0, 7.0)),
+            line((10.0, 12.5), (20.0, 12.5)),
+            line((10.0, 18.0), (20.0, 18.0)),
+        ],
+        Icon::Todo => vec![closed(&[(4.0, 5.0), (20.0, 5.0), (20.0, 19.0), (4.0, 19.0)]), path(&[(7.5, 12.0), (10.5, 15.5), (16.5, 8.5)])],
+        Icon::Table => vec![
+            closed(&[(3.5, 5.0), (20.5, 5.0), (20.5, 19.0), (3.5, 19.0)]),
+            line((3.5, 9.5), (20.5, 9.5)),
+            line((3.5, 14.5), (20.5, 14.5)),
+            line((9.0, 5.0), (9.0, 19.0)),
+            line((15.0, 5.0), (15.0, 19.0)),
+        ],
+        Icon::Picture => vec![
+            fill(&[(3.5, 5.0), (20.5, 5.0), (20.5, 19.0), (3.5, 19.0)], shade(color, 0.78)),
+            closed(&[(3.5, 5.0), (20.5, 5.0), (20.5, 19.0), (3.5, 19.0)]),
+            Shape::circle_filled(g.p(8.5, 9.5), w * 1.6 / 24.0, color),
+            fill(&[(5.0, 17.0), (10.0, 12.0), (13.0, 15.0), (16.0, 11.5), (19.5, 16.5)], shade(color, 0.35)),
+            path(&[(5.0, 17.0), (10.0, 12.0), (13.0, 15.0), (16.0, 11.5), (19.5, 16.5)]),
+        ],
+        Icon::Attach => vec![
+            fill(&[(5.0, 4.0), (14.5, 4.0), (19.0, 8.5), (19.0, 20.0), (5.0, 20.0)], shade(color, 0.78)),
+            closed(&[(5.0, 4.0), (14.5, 4.0), (19.0, 8.5), (19.0, 20.0), (5.0, 20.0)]),
+            path(&[(14.5, 4.0), (14.5, 8.5), (19.0, 8.5)]),
+            path(&[(16.5, 7.0), (9.0, 14.5), (9.0, 17.0), (11.5, 17.0), (19.0, 9.5), (19.0, 6.0), (15.5, 4.5), (7.0, 13.0)]),
+        ],
+        Icon::Link => vec![
+            path(&[(10.0, 14.0), (7.0, 17.0), (4.5, 14.5), (7.5, 11.5)]),
+            path(&[(14.0, 10.0), (17.0, 7.0), (19.5, 9.5), (16.5, 12.5)]),
+            line((9.5, 14.5), (14.5, 9.5)),
+        ],
+        Icon::Equation => vec![path(&[(4.0, 13.0), (7.0, 13.0), (10.0, 19.5), (14.0, 5.0), (20.0, 5.0)]), line((11.5, 12.0), (18.0, 12.0))],
+        Icon::Diagram => vec![
+            closed(&[(3.5, 4.5), (10.5, 4.5), (10.5, 9.5), (3.5, 9.5)]),
+            closed(&[(13.5, 14.5), (20.5, 14.5), (20.5, 19.5), (13.5, 19.5)]),
+            line((7.0, 9.5), (7.0, 17.0)),
+            path(&[(7.0, 17.0), (13.5, 17.0)]),
+            path(&[(11.5, 15.5), (13.5, 17.0), (11.5, 18.5)]),
+        ],
+        Icon::Quote => vec![
+            path(&[(9.0, 6.0), (5.0, 9.0), (5.0, 13.0), (9.0, 13.0), (9.0, 9.0), (5.0, 9.0)]),
+            path(&[(19.0, 6.0), (15.0, 9.0), (15.0, 13.0), (19.0, 13.0), (19.0, 9.0), (15.0, 9.0)]),
+        ],
+        // Three lines, thin and well apart, for the button that hides the notebooks.
+        Icon::Bars => vec![path(&[(4.0, 7.0), (20.0, 7.0)]), path(&[(4.0, 12.0), (20.0, 12.0)]), path(&[(4.0, 17.0), (20.0, 17.0)])],
+        Icon::AlignLeft => vec![path(&[(4.0, 6.0), (20.0, 6.0)]), path(&[(4.0, 12.0), (15.0, 12.0)]), path(&[(4.0, 18.0), (20.0, 18.0)])],
+        Icon::AlignCenter => vec![path(&[(4.0, 6.0), (20.0, 6.0)]), path(&[(7.0, 12.0), (17.0, 12.0)]), path(&[(5.5, 18.0), (18.5, 18.0)])],
+        Icon::AlignRight => vec![path(&[(4.0, 6.0), (20.0, 6.0)]), path(&[(9.0, 12.0), (20.0, 12.0)]), path(&[(4.0, 18.0), (20.0, 18.0)])],
+        Icon::JustifyLow => vec![
+            path(&[(4.0, 6.0), (10.0, 6.0)]),
+            path(&[(14.0, 6.0), (20.0, 6.0)]),
+            path(&[(4.0, 12.0), (10.0, 12.0)]),
+            path(&[(14.0, 12.0), (20.0, 12.0)]),
+            path(&[(4.0, 18.0), (10.0, 18.0)]),
+            path(&[(14.0, 18.0), (20.0, 18.0)]),
+        ],
+        Icon::JustifyMedium => vec![path(&[(4.0, 6.0), (12.0, 6.0)]), path(&[(4.0, 12.0), (16.0, 12.0)]), path(&[(4.0, 18.0), (20.0, 18.0)])],
+        Icon::JustifyHigh => vec![path(&[(4.0, 6.0), (20.0, 6.0)]), path(&[(4.0, 12.0), (20.0, 12.0)]), path(&[(4.0, 18.0), (20.0, 18.0)])],
+        // A block rubber leaning on the page: the body, the worn band across its foot, and
+        // the line it sits on, which is what says it is rubbing something out.
+        // An arrow curving back on itself to the left: take the last thing back.
+        Icon::Undo => {
+            vec![path(&[(9.0, 6.0), (5.0, 10.0), (9.0, 14.0)]), path(&[(5.0, 10.0), (15.0, 10.0), (18.0, 13.0), (18.0, 17.0), (15.0, 20.0)])]
+        }
+        // The same arrow, mirrored: do it again.
+        Icon::Redo => {
+            vec![path(&[(15.0, 6.0), (19.0, 10.0), (15.0, 14.0)]), path(&[(19.0, 10.0), (9.0, 10.0), (6.0, 13.0), (6.0, 17.0), (9.0, 20.0)])]
+        }
+        // An arrow head with its tail: the ordinary select tool.
+        Icon::Pointer => vec![fill(&[(6.0, 3.0), (18.5, 13.5), (12.5, 14.0), (15.5, 20.5), (12.0, 22.0), (9.0, 15.5), (6.0, 19.5)], color)],
+        // A loop thrown round something, with its tail hanging down.
+        Icon::Lasso => vec![closed(&[(12.0, 4.0), (19.0, 8.5), (16.5, 15.0), (7.5, 15.0), (5.0, 8.5)]), path(&[(8.0, 15.0), (8.0, 21.0)])],
+        // An open hand: the fingers and the thumb as one outline.
+        Icon::Hand => vec![fill(
+            &[
+                (9.0, 4.0),
+                (11.0, 4.0),
+                (11.0, 12.0),
+                (13.0, 12.0),
+                (13.0, 5.5),
+                (15.0, 5.5),
+                (15.0, 12.5),
+                (17.5, 13.5),
+                (17.5, 19.0),
+                (14.0, 22.0),
+                (9.5, 22.0),
+                (6.5, 17.0),
+                (6.5, 11.0),
+                (9.0, 11.0),
+            ],
+            color,
+        )],
+        // A ruler lying at an angle, with its marks along the upper edge.
+        Icon::Ruler => vec![
+            closed(&[(3.5, 15.0), (15.0, 3.5), (20.5, 9.0), (9.0, 20.5)]),
+            line((7.0, 11.5), (9.5, 14.0)),
+            line((10.0, 8.5), (12.5, 11.0)),
+            line((13.0, 5.5), (15.5, 8.0)),
+        ],
+        // Two arrows pushing apart, with the line they are making room at.
+        Icon::InsertSpace => {
+            vec![line((4.0, 12.0), (20.0, 12.0)), path(&[(9.0, 7.0), (12.0, 4.0), (15.0, 7.0)]), path(&[(9.0, 17.0), (12.0, 20.0), (15.0, 17.0)])]
+        }
+        // A circle behind a square.
+        Icon::Shapes => vec![
+            Shape::circle_stroke(g.p(9.5, 9.5), rect.width() * 5.5 / 24.0, stroke),
+            closed(&[(11.5, 11.5), (20.5, 11.5), (20.5, 20.5), (11.5, 20.5)]),
+        ],
+        // A written stroke beside printed lines: handwriting turning into words.
+        Icon::InkToText => vec![
+            path(&[(4.0, 17.0), (6.5, 7.0), (9.0, 17.0), (11.5, 7.0), (14.0, 17.0)]),
+            line((16.5, 8.0), (20.5, 8.0)),
+            line((16.5, 12.5), (20.5, 12.5)),
+            line((16.5, 17.0), (20.5, 17.0)),
+        ],
+        // An arrow running round a circle: the ink drawn again.
+        Icon::Replay => vec![
+            path(&[(18.5, 7.5), (18.5, 12.0), (14.0, 12.0)]),
+            path(&[(18.0, 12.0), (16.0, 17.5), (10.5, 19.5), (5.5, 16.5), (4.5, 11.0), (8.0, 6.5), (13.5, 5.5), (18.0, 8.5)]),
+        ],
+        // A question mark in a ring.
+        Icon::Help => vec![
+            Shape::circle_stroke(g.p(12.0, 12.0), rect.width() * 8.5 / 24.0, stroke),
+            path(&[(9.5, 9.5), (10.5, 7.5), (13.5, 7.5), (14.5, 9.5), (13.5, 11.5), (12.0, 12.5), (12.0, 14.5)]),
+            Shape::circle_filled(g.p(12.0, 17.5), rect.width() / 20.0, color),
+        ],
+        // A pen nib pointing down and to the left, with its slit.
+        // A calendar page hanging from two rings.
+        Icon::Calendar => vec![
+            closed(&[(4.0, 6.5), (20.0, 6.5), (20.0, 20.5), (4.0, 20.5)]),
+            line((4.0, 11.0), (20.0, 11.0)),
+            line((8.5, 3.5), (8.5, 8.0)),
+            line((15.5, 3.5), (15.5, 8.0)),
+        ],
+        // A clock face, reading ten past ten as every clock in a shop window does.
+        Icon::Clock => vec![
+            Shape::circle_stroke(g.p(12.0, 12.5), rect.width() * 8.5 / 24.0, stroke),
+            line((12.0, 12.5), (12.0, 7.0)),
+            line((12.0, 12.5), (16.0, 14.5)),
+        ],
+        // A screen with a play triangle on it.
+        Icon::Video => vec![closed(&[(3.5, 5.5), (20.5, 5.5), (20.5, 18.5), (3.5, 18.5)]), fill(&[(10.0, 9.0), (16.0, 12.0), (10.0, 15.0)], color)],
+        // A microphone: the capsule, the cradle it sits in, and its stand.
+        Icon::Mic => vec![
+            closed(&[(9.5, 3.5), (14.5, 3.5), (14.5, 13.5), (9.5, 13.5)]),
+            path(&[(6.5, 11.0), (6.5, 13.5), (12.0, 17.5), (17.5, 13.5), (17.5, 11.0)]),
+            line((12.0, 17.5), (12.0, 20.5)),
+        ],
+        // A sheet with its header row filled, which is what tells it from a plain table.
+        Icon::Spreadsheet => vec![
+            fill(&[(4.0, 5.5), (20.0, 5.5), (20.0, 9.5), (4.0, 9.5)], shade(color, 0.45)),
+            closed(&[(4.0, 5.5), (20.0, 5.5), (20.0, 20.5), (4.0, 20.5)]),
+            line((4.0, 9.5), (20.0, 9.5)),
+            line((4.0, 15.0), (20.0, 15.0)),
+            line((12.0, 9.5), (12.0, 20.5)),
+        ],
+        // Four corner brackets: the part of the screen being cut out.
+        Icon::Clip => vec![
+            path(&[(5.0, 9.5), (5.0, 5.0), (9.5, 5.0)]),
+            path(&[(14.5, 5.0), (19.0, 5.0), (19.0, 9.5)]),
+            path(&[(19.0, 14.5), (19.0, 19.0), (14.5, 19.0)]),
+            path(&[(9.5, 19.0), (5.0, 19.0), (5.0, 14.5)]),
+        ],
+        // A round face.
+        Icon::Sticker => vec![
+            Shape::circle_stroke(g.p(12.0, 12.0), rect.width() * 8.5 / 24.0, stroke),
+            Shape::circle_filled(g.p(9.0, 10.0), rect.width() / 20.0, color),
+            Shape::circle_filled(g.p(15.0, 10.0), rect.width() / 20.0, color),
+            path(&[(8.0, 14.5), (10.0, 17.0), (14.0, 17.0), (16.0, 14.5)]),
+        ],
+        // An omega, which is the mark every word processor puts on this button.
+        Icon::Symbol => vec![path(&[
+            (6.5, 20.0),
+            (10.5, 20.0),
+            (10.5, 17.0),
+            (7.0, 14.0),
+            (7.0, 9.5),
+            (12.0, 6.0),
+            (17.0, 9.5),
+            (17.0, 14.0),
+            (13.5, 17.0),
+            (13.5, 20.0),
+            (17.5, 20.0),
+        ])],
+        // A table with its middle row picked out.
+        Icon::TableRow => vec![
+            fill(&[(4.0, 10.0), (20.0, 10.0), (20.0, 14.5), (4.0, 14.5)], shade(color, 0.45)),
+            closed(&[(4.0, 5.5), (20.0, 5.5), (20.0, 19.0), (4.0, 19.0)]),
+            line((4.0, 10.0), (20.0, 10.0)),
+            line((4.0, 14.5), (20.0, 14.5)),
+        ],
+        // The same, with a column picked out instead.
+        Icon::TableColumn => vec![
+            fill(&[(9.5, 5.5), (14.5, 5.5), (14.5, 19.0), (9.5, 19.0)], shade(color, 0.45)),
+            closed(&[(4.0, 5.5), (20.0, 5.5), (20.0, 19.0), (4.0, 19.0)]),
+            line((9.5, 5.5), (9.5, 19.0)),
+            line((14.5, 5.5), (14.5, 19.0)),
+        ],
+        Icon::MoveUp => vec![line((12.0, 20.0), (12.0, 4.5)), path(&[(6.0, 10.5), (12.0, 4.5), (18.0, 10.5)])],
+        Icon::MoveDown => vec![line((12.0, 4.0), (12.0, 19.5)), path(&[(6.0, 13.5), (12.0, 19.5), (18.0, 13.5)])],
+        // A plain plus.
+        Icon::Plus => vec![line((12.0, 4.5), (12.0, 19.5)), line((4.5, 12.0), (19.5, 12.0))],
+        // A plain minus, the companion to the plus above.
+        Icon::Minus => vec![line((4.5, 12.0), (19.5, 12.0))],
+        Icon::ZoomOut => {
+            vec![Shape::circle_stroke(g.p(10.0, 10.0), w * 6.0 / 24.0, stroke), line((14.5, 14.5), (20.0, 20.0)), line((6.5, 10.0), (13.5, 10.0))]
+        }
+        Icon::ZoomIn => vec![
+            Shape::circle_stroke(g.p(10.0, 10.0), w * 6.0 / 24.0, stroke),
+            line((14.5, 14.5), (20.0, 20.0)),
+            line((6.5, 10.0), (13.5, 10.0)),
+            line((10.0, 6.5), (10.0, 13.5)),
+        ],
+        Icon::PageWidth => vec![
+            closed(&[(5.0, 3.5), (19.0, 3.5), (19.0, 20.5), (5.0, 20.5)]),
+            line((8.0, 8.0), (16.0, 8.0)),
+            path(&[(8.0, 12.0), (5.5, 14.0), (8.0, 16.0)]),
+            path(&[(16.0, 12.0), (18.5, 14.0), (16.0, 16.0)]),
+        ],
+        Icon::Pen => vec![
+            fill(&[(16.0, 3.5), (20.5, 8.0), (9.0, 19.5), (3.5, 20.5), (4.5, 15.0)], color),
+            Shape::line_segment([g.p(6.0, 18.0), g.p(13.5, 10.5)], Stroke::new((w / 18.0).max(1.0), shade(color, 0.45))),
+        ],
+        Icon::Eraser => vec![
+            fill(&[(4.5, 15.5), (12.0, 5.0), (19.5, 10.5), (12.0, 21.0)], color),
+            fill(&[(7.6, 18.0), (12.0, 11.8), (19.5, 10.5), (12.0, 21.0)], shade(color, 0.45)),
+            Shape::line_segment([g.p(3.0, 21.0), g.p(21.0, 21.0)], stroke),
+        ],
+        // Lines of text with a clear angle-bracket direction mark beneath them.
+        Icon::DirLtr => vec![
+            path(&[(5.0, 6.0), (17.0, 6.0)]),
+            path(&[(5.0, 10.0), (19.0, 10.0)]),
+            path(&[(5.0, 14.0), (14.0, 14.0)]),
+            Shape::line_segment([g.p(4.0, 19.0), g.p(13.0, 19.0)], Stroke::new((w / 7.0).max(1.8), color)),
+            path(&[(14.0, 15.0), (20.0, 19.0), (14.0, 23.0)]),
+        ],
+        Icon::DirRtl => vec![
+            path(&[(19.0, 6.0), (7.0, 6.0)]),
+            path(&[(19.0, 10.0), (5.0, 10.0)]),
+            path(&[(19.0, 14.0), (10.0, 14.0)]),
+            Shape::line_segment([g.p(20.0, 19.0), g.p(11.0, 19.0)], Stroke::new((w / 7.0).max(1.8), color)),
+            path(&[(10.0, 15.0), (4.0, 19.0), (10.0, 23.0)]),
+        ],
+        // Paragraph controls read as a small angle bracket followed by a rounded pilcrow.
+        Icon::ParaLtr => vec![
+            fill(
+                &[
+                    (17.0, 4.0),
+                    (15.0, 4.0),
+                    (12.0, 5.0),
+                    (10.0, 7.0),
+                    (9.0, 9.0),
+                    (9.0, 11.0),
+                    (10.0, 13.0),
+                    (12.0, 14.5),
+                    (15.0, 15.0),
+                    (17.0, 15.0),
+                ],
+                color,
+            ),
+            fill(&[(16.0, 4.0), (23.0, 4.0), (23.0, 6.0), (16.0, 6.0)], color),
+            fill(&[(16.0, 14.0), (18.0, 14.0), (18.0, 22.0), (16.0, 22.0)], color),
+            fill(&[(21.0, 4.0), (23.0, 4.0), (23.0, 22.0), (21.0, 22.0)], color),
+            path(&[(1.0, 9.0), (5.0, 13.0), (1.0, 17.0)]),
+        ],
+        // The pilcrow sits left of the arrow head, which points left at the right edge: `[ q< ]`.
+        Icon::ParaRtl => vec![
+            fill(
+                &[(10.0, 4.0), (8.0, 4.0), (5.0, 5.0), (3.0, 7.0), (2.0, 9.0), (2.0, 11.0), (3.0, 13.0), (5.0, 14.5), (8.0, 15.0), (10.0, 15.0)],
+                color,
+            ),
+            fill(&[(9.0, 4.0), (16.0, 4.0), (16.0, 6.0), (9.0, 6.0)], color),
+            fill(&[(9.0, 14.0), (11.0, 14.0), (11.0, 22.0), (9.0, 22.0)], color),
+            fill(&[(14.0, 4.0), (16.0, 4.0), (16.0, 22.0), (14.0, 22.0)], color),
+            path(&[(23.0, 9.0), (19.0, 13.0), (23.0, 17.0)]),
+        ],
+        Icon::ParaAuto => vec![
+            fill(
+                &[
+                    (17.0, 4.0),
+                    (15.0, 4.0),
+                    (12.0, 5.0),
+                    (10.0, 7.0),
+                    (9.0, 9.0),
+                    (9.0, 11.0),
+                    (10.0, 13.0),
+                    (12.0, 14.5),
+                    (15.0, 15.0),
+                    (17.0, 15.0),
+                ],
+                color,
+            ),
+            fill(&[(16.0, 4.0), (23.0, 4.0), (23.0, 6.0), (16.0, 6.0)], color),
+            fill(&[(16.0, 14.0), (18.0, 14.0), (18.0, 22.0), (16.0, 22.0)], color),
+            fill(&[(21.0, 4.0), (23.0, 4.0), (23.0, 22.0), (21.0, 22.0)], color),
+            Shape::line_segment([g.p(5.0, 17.0), g.p(5.0, 23.0)], Stroke::new((w / 7.0).max(1.5), color)),
+            Shape::line_segment([g.p(2.5, 18.5), g.p(7.5, 21.5)], Stroke::new((w / 7.0).max(1.5), color)),
+            Shape::line_segment([g.p(2.5, 21.5), g.p(7.5, 18.5)], Stroke::new((w / 7.0).max(1.5), color)),
+        ],
+        Icon::CaretLtr => vec![
+            Shape::line_segment([g.p(10.0, 3.0), g.p(10.0, 19.0)], Stroke::new((w / 10.0).max(1.5), color)),
+            fill(&[(10.0, 16.0), (20.0, 21.0), (10.0, 24.0)], color),
+        ],
+        Icon::CaretRtl => vec![
+            Shape::line_segment([g.p(14.0, 3.0), g.p(14.0, 19.0)], Stroke::new((w / 10.0).max(1.5), color)),
+            fill(&[(14.0, 16.0), (4.0, 21.0), (14.0, 24.0)], color),
+        ],
+        Icon::DirAuto => vec![
+            path(&[(5.0, 6.0), (17.0, 6.0)]),
+            path(&[(5.0, 10.0), (19.0, 10.0)]),
+            path(&[(5.0, 14.0), (14.0, 14.0)]),
+            line((16.0, 15.0), (16.0, 23.0)),
+            line((12.5, 17.0), (19.5, 21.0)),
+            line((12.5, 21.0), (19.5, 17.0)),
+        ],
+        // A crescent: the outer circle, with the inner edge drawn across it.
+        Icon::Moon => vec![
+            Shape::circle_stroke(g.p(12.0, 12.0), w * 7.4 / 24.0, stroke),
+            path(&[(16.6, 5.0), (12.6, 7.2), (11.0, 11.6), (12.6, 16.0), (16.6, 19.0)]),
+        ],
+    };
+    for s in shapes {
+        painter.add(s);
+    }
+}
+
+/// Paint the vendored Fluent UI version of a ribbon icon without creating a
+/// widget or changing layout. Icons not yet migrated fall back to Nocturne's
+/// native drawing, so the migration can happen incrementally.
+pub fn paint_ribbon(ui: &Ui, rect: Rect, icon: Icon, color: Color32) {
+    if let Some((name, bytes)) = fluent_color_asset(icon) {
+        // A colour icon keeps its own colours and is only faded when its control is disabled.
+        let tint = if ui.is_enabled() { Color32::WHITE } else { Color32::from_white_alpha(90) };
+        egui::Image::from_bytes(format!("bytes://nocturne-fluent-color/{name}.svg"), bytes)
+            .fit_to_exact_size(rect.size())
+            .tint(tint)
+            .paint_at(ui, rect);
+        return;
+    }
+    let Some((name, bytes)) = fluent_asset(icon) else {
+        paint(ui.painter(), rect, icon, color);
+        return;
+    };
+    // Keep the extension in the URI: egui uses it to choose the SVG loader for
+    // byte-backed images. Without it the asset is reported as a missing image.
+    coloured_svg(name, bytes, color).fit_to_exact_size(rect.size()).paint_at(ui, rect);
+}
+
+/// A monochrome Fluent icon drawn in `colour`. The SVG is drawn in one near-black, and a tint
+/// can only multiply that, so it can never show a light icon. The colour is written into the
+/// file instead, and the picture is keyed by that colour so each colour is loaded once.
+pub fn coloured_svg(name: &str, bytes: &[u8], colour: Color32) -> egui::Image<'static> {
+    let hex = format!("#{:02x}{:02x}{:02x}", colour.r(), colour.g(), colour.b());
+    let text = String::from_utf8_lossy(bytes).replace("#212121", &hex);
+    // Keep the extension in the URI: egui uses it to choose the SVG loader for byte-backed images.
+    egui::Image::from_bytes(format!("bytes://nocturne-fluent/{name}-{}.svg", &hex[1..]), text.into_bytes())
+}
+
+/// The Fluent colour versions, for the icons that have one. The others stay monochrome.
+fn fluent_color_asset(icon: Icon) -> Option<(&'static str, &'static [u8])> {
+    Some(match icon {
+        Icon::Calendar => ("calendar", include_bytes!("../assets/fluent-color/calendar.svg")),
+        Icon::Clock => ("clock", include_bytes!("../assets/fluent-color/clock.svg")),
+        Icon::Link => ("link", include_bytes!("../assets/fluent-color/link.svg")),
+        Icon::Picture => ("image", include_bytes!("../assets/fluent-color/image.svg")),
+        Icon::Table => ("table", include_bytes!("../assets/fluent-color/table.svg")),
+        Icon::Video => ("video", include_bytes!("../assets/fluent-color/video.svg")),
+        Icon::Mic => ("mic", include_bytes!("../assets/fluent-color/mic.svg")),
+        Icon::Page => ("document", include_bytes!("../assets/fluent-color/document.svg")),
+        _ => return None,
+    })
+}
+
+fn fluent_asset(icon: Icon) -> Option<(&'static str, &'static [u8])> {
+    Some(match icon {
+        Icon::Attach => ("attach", include_bytes!("../assets/fluent/attach.svg")),
+        Icon::Calendar => ("calendar", include_bytes!("../assets/fluent/calendar.svg")),
+        Icon::Clock => ("clock", include_bytes!("../assets/fluent/clock.svg")),
+        Icon::Link => ("link", include_bytes!("../assets/fluent/link.svg")),
+        Icon::Picture => ("image", include_bytes!("../assets/fluent/image.svg")),
+        Icon::Table => ("table", include_bytes!("../assets/fluent/table.svg")),
+        Icon::Video => ("video", include_bytes!("../assets/fluent/video.svg")),
+        Icon::Mic => ("mic", include_bytes!("../assets/fluent/mic.svg")),
+        Icon::Page => ("document", include_bytes!("../assets/fluent/document.svg")),
+        Icon::Equation => ("mathformula", include_bytes!("../assets/fluent/mathformula.svg")),
+        Icon::Symbol => ("symbols", include_bytes!("../assets/fluent/symbols.svg")),
+        Icon::Ruler => ("ruler", include_bytes!("../assets/fluent/ruler.svg")),
+        Icon::InsertSpace => ("spacebar", include_bytes!("../assets/fluent/spacebar.svg")),
+        _ => return None,
+    })
+}
+
+/// The crescent needs the surface behind it, because it is drawn by covering a disc.
+pub fn paint_moon(painter: &Painter, rect: Rect, color: Color32, behind: Color32) {
+    let g = Grid { rect };
+    let w = rect.width().max(1.0);
+    painter.add(Shape::circle_filled(g.p(13.0, 12.0), w * 8.0 / 24.0, color));
+    painter.add(Shape::circle_filled(g.p(17.0, 8.6), w * 7.2 / 24.0, behind));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    pub const ALL: [Icon; 68] = [
+        Icon::Notebook,
+        Icon::SectionGroup,
+        Icon::SectionGroupOpen,
+        Icon::Section,
+        Icon::Page,
+        Icon::Folder,
+        Icon::PageStack,
+        Icon::MoveUp,
+        Icon::MoveDown,
+        Icon::Code,
+        Icon::Search,
+        Icon::FullPage,
+        Icon::ExitFullPage,
+        Icon::Sun,
+        Icon::Moon,
+        Icon::ListBullet,
+        Icon::ListNumber,
+        Icon::Todo,
+        Icon::Table,
+        Icon::Picture,
+        Icon::Attach,
+        Icon::Link,
+        Icon::Equation,
+        Icon::Diagram,
+        Icon::Quote,
+        Icon::DirLtr,
+        Icon::DirRtl,
+        Icon::ParaLtr,
+        Icon::ParaRtl,
+        Icon::CaretLtr,
+        Icon::CaretRtl,
+        Icon::DirAuto,
+        Icon::ParaAuto,
+        Icon::Bars,
+        Icon::AlignLeft,
+        Icon::AlignCenter,
+        Icon::AlignRight,
+        Icon::JustifyLow,
+        Icon::JustifyMedium,
+        Icon::JustifyHigh,
+        Icon::Eraser,
+        Icon::Undo,
+        Icon::Redo,
+        Icon::Pointer,
+        Icon::Lasso,
+        Icon::Hand,
+        Icon::Ruler,
+        Icon::InsertSpace,
+        Icon::Shapes,
+        Icon::InkToText,
+        Icon::Replay,
+        Icon::Help,
+        Icon::Pen,
+        Icon::Plus,
+        Icon::Minus,
+        Icon::ZoomOut,
+        Icon::ZoomIn,
+        Icon::PageWidth,
+        Icon::Calendar,
+        Icon::Clock,
+        Icon::Video,
+        Icon::Mic,
+        Icon::Spreadsheet,
+        Icon::Clip,
+        Icon::Sticker,
+        Icon::Symbol,
+        Icon::TableRow,
+        Icon::TableColumn,
+    ];
+
+    #[test]
+    fn the_grid_maps_corners() {
+        let g = Grid { rect: Rect::from_min_size(pos2(10.0, 20.0), egui::vec2(24.0, 24.0)) };
+        assert_eq!(g.p(0.0, 0.0), pos2(10.0, 20.0));
+        assert_eq!(g.p(24.0, 24.0), pos2(34.0, 44.0));
+        assert_eq!(g.p(12.0, 12.0), pos2(22.0, 32.0));
+    }
+
+    #[test]
+    fn every_icon_paints_without_panicking() {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let painter = ui.painter().clone();
+            for icon in ALL {
+                paint(&painter, Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(17.0, 17.0)), icon, Color32::WHITE);
+                paint(&painter, Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(0.0, 0.0)), icon, Color32::WHITE);
+            }
+            paint_moon(&painter, Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(17.0, 17.0)), Color32::WHITE, Color32::BLACK);
+        });
+        out.textures_delta.clear();
+    }
+
+    /// The points of the filled shapes and of the open shapes `paint` draws for `icon` on a 24
+    /// point square.
+    fn painted(icon: Icon) -> (Vec<Vec<Pos2>>, Vec<Vec<Pos2>>) {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let painter = ui.painter().clone();
+            paint(&painter, Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(24.0, 24.0)), icon, Color32::WHITE);
+        });
+        out.textures_delta.clear();
+        let (mut filled, mut open) = (Vec::new(), Vec::new());
+        for clipped in out.shapes {
+            if let egui::Shape::Path(path) = clipped.shape {
+                if path.fill.a() > 0 {
+                    filled.push(path.points);
+                } else {
+                    open.push(path.points);
+                }
+            }
+        }
+        (filled, open)
+    }
+
+    /// SUP-005: the right-to-left paragraph icon has its arrow head to the right of the pilcrow,
+    /// pointing left, as in Word: `[ q< ]`. The pilcrow must not reach the arrow.
+    #[test]
+    fn the_rtl_paragraph_arrow_sits_right_of_the_pilcrow() {
+        let (filled, open) = painted(Icon::ParaRtl);
+        let pilcrow_right = filled.iter().flatten().map(|p| p.x).fold(f32::MIN, f32::max);
+        let arrow = open.iter().find(|pts| pts.len() == 3).expect("the arrow head is an open three-point path");
+        let arrow_left = arrow.iter().map(|p| p.x).fold(f32::MAX, f32::min);
+        assert!(arrow_left > pilcrow_right, "the arrow starts right of the pilcrow: arrow {arrow_left}, pilcrow {pilcrow_right}");
+        // The arrow head points left: its tip is the left-most point, and it sits on the middle line.
+        let tip = arrow.iter().min_by(|a, b| a.x.total_cmp(&b.x)).expect("a point");
+        assert!((tip.y - 13.0).abs() < 0.01, "the tip is on the middle of the head at 13: {tip:?}");
+        // A gap of at least 3 points between the pilcrow stem and the arrow tip, as Word has.
+        assert!(tip.x - pilcrow_right >= 3.0, "the arrow is spaced from the pilcrow: {tip:?}");
+    }
+
+    /// The LTR and RTL direction icons carry their arrow heads at the same height, so the pair
+    /// reads as one set.
+    #[test]
+    fn the_ltr_and_rtl_arrow_heads_sit_at_the_same_height() {
+        let centre = |icon: Icon| {
+            let (_, open) = painted(icon);
+            let arrow = open.iter().find(|pts| pts.len() == 3).expect("an arrow head").clone();
+            arrow.iter().map(|p| p.y).sum::<f32>() / 3.0
+        };
+        let (rtl, ltr) = (centre(Icon::ParaRtl), centre(Icon::ParaLtr));
+        assert!((rtl - ltr).abs() < 0.01, "the LTR arrow head is level with the RTL one: rtl {rtl}, ltr {ltr}");
+    }
+
+    /// The LTR and RTL direction icons carry arrow heads of the same size.
+    #[test]
+    fn the_ltr_and_rtl_arrow_heads_are_the_same_size() {
+        let size = |icon: Icon| {
+            let (_, open) = painted(icon);
+            let arrow = open.iter().find(|pts| pts.len() == 3).expect("an arrow head").clone();
+            let xs = arrow.iter().map(|p| p.x);
+            let ys = arrow.iter().map(|p| p.y);
+            let width = xs.clone().fold(f32::MIN, f32::max) - xs.fold(f32::MAX, f32::min);
+            let height = ys.clone().fold(f32::MIN, f32::max) - ys.fold(f32::MAX, f32::min);
+            (width, height)
+        };
+        let (rtl, ltr) = (size(Icon::ParaRtl), size(Icon::ParaLtr));
+        assert!((rtl.0 - ltr.0).abs() < 0.01 && (rtl.1 - ltr.1).abs() < 0.01, "the arrow heads match in size: rtl {rtl:?}, ltr {ltr:?}");
+        assert!((rtl.0 - 4.0).abs() < 0.01 && (rtl.1 - 8.0).abs() < 0.01, "the arrow head is 4 by 8 points: {rtl:?}");
+    }
+
+    /// The pilcrow keeps its original 18 point height: only the arrow shows the direction (owner, 2026-11-11).
+    #[test]
+    fn the_pilcrow_keeps_its_size() {
+        let (filled, _) = painted(Icon::ParaRtl);
+        let ys = filled.iter().flatten().map(|p| p.y);
+        let height = ys.clone().fold(f32::MIN, f32::max) - ys.fold(f32::MAX, f32::min);
+        assert!((height - 18.0).abs() < 0.01, "the pilcrow is 18 points tall: {height}");
+    }
+
+    /// The pilcrow keeps its normal shape in both direction icons: its stems stand on the right of
+    /// its bowl. A mirrored pilcrow is wrong (owner, 2026-11-11).
+    #[test]
+    fn the_pilcrow_is_not_mirrored_in_either_direction() {
+        let centre_x = |pts: &[Pos2]| {
+            let xs = pts.iter().map(|p| p.x);
+            (xs.clone().fold(f32::MAX, f32::min) + xs.fold(f32::MIN, f32::max)) / 2.0
+        };
+        for icon in [Icon::ParaRtl, Icon::ParaLtr] {
+            let (filled, _) = painted(icon);
+            let bowl = filled.iter().max_by_key(|pts| pts.len()).expect("the bowl").as_slice();
+            let stems: Vec<&Vec<Pos2>> = filled
+                .iter()
+                .filter(|pts| {
+                    pts.len() == 4 && {
+                        let ys = pts.iter().map(|p| p.y);
+                        ys.clone().fold(f32::MIN, f32::max) - ys.fold(f32::MAX, f32::min) > 10.0
+                    }
+                })
+                .collect();
+            assert!(!stems.is_empty(), "{icon:?} has its stems");
+            for stem in stems {
+                assert!(centre_x(stem.as_slice()) > centre_x(bowl), "{icon:?}: the stems stand right of the bowl");
+            }
+        }
+    }
+
+    /// The shading keeps a spine visible on a light colour and on a dark one.
+    #[test]
+    fn shading_moves_away_from_the_colour() {
+        let light = Color32::from_rgb(0xF2, 0xC9, 0x4C);
+        let dark = Color32::from_rgb(0x1E, 0x2A, 0x44);
+        assert_ne!(shade(light, 0.35), light);
+        assert_ne!(shade(dark, 0.35), dark);
+        // A light colour gets darker, a dark one gets lighter.
+        assert!(shade(light, 0.35).r() < light.r());
+        assert!(shade(dark, 0.35).r() > dark.r());
+        assert_eq!(shade(light, 0.0), light);
+    }
+}

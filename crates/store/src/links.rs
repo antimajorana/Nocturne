@@ -1,0 +1,482 @@
+//! What a link in a page points at.
+//!
+//! A page links to things by relative path, the way its pictures are linked: `../other-page/`
+//! is the page next door, `assets/notes.pdf` is a file of its own, `https://...` is the web.
+//! This module turns such a target into something the window can act on, and keeps every
+//! path inside the notebooks folder: a link cannot climb out of it, however many `..` it has.
+//!
+//! The resolution is lexical first (no file is touched while the path is normalised) and
+//! looks at the disk only at the end, to tell a node from a file from nothing.
+
+use crate::tree::read_node;
+use std::path::{Component, Path, PathBuf};
+
+/// The scheme a link to a page of one's own carries: `nocturne:/notebook/section/page`,
+/// the path from the notebooks folder.
+///
+/// OneNote has `onenote:` for the same job. A relative path cannot do it, because what it
+/// is relative to is the page the link is pasted into, which nobody knows when the link is
+/// copied; this names the page from the top and reads the same wherever it is pasted.
+pub const SCHEME: &str = "nocturne:";
+
+/// A link to this page, to paste into another one. `None` when the folder is not under any
+/// of the open notebooks.
+///
+/// The path always starts with the notebook's folder name. For a notebook opened from
+/// elsewhere the open folder is the notebook itself, and stripping it whole left
+/// `section/page`, the same for every such notebook laid out alike, so a link to a page in
+/// one opened the matching page of whichever was open first (issue #128).
+pub fn page_uri(roots: &[PathBuf], dir: &Path) -> Option<String> {
+    let full = normalise(dir.to_path_buf())?;
+    let root = roots.iter().find(|r| full.starts_with(r))?;
+    let rest = full.strip_prefix(link_base(root)).ok()?;
+    let path = rest.components().filter_map(|c| c.as_os_str().to_str()).collect::<Vec<_>>().join("/");
+    // The page's id goes with its path, so the link still finds the page once it has moved,
+    // as Make Subpage moves it (issue #129). Only an id made of plain characters is written:
+    // it is read back from the link as it stands.
+    let id = read_node(&full).map(|n| n.id).filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    Some(match id {
+        Some(id) => format!("{SCHEME}/{path}?id={id}"),
+        None => format!("{SCHEME}/{path}"),
+    })
+}
+
+/// Where a link leads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Link {
+    /// A web address or another scheme the operating system handles (`https:`, `mailto:`).
+    Web(String),
+    /// A Nocturne node: a notebook, section group, section or page folder.
+    Node(PathBuf),
+    /// A file, or a folder that is not a node (such as `assets/`).
+    File(PathBuf),
+    /// A path inside the notebooks folder with nothing there.
+    Missing(PathBuf),
+    /// A path that would leave the notebooks folder, or one that cannot be read.
+    Outside,
+}
+
+/// Resolves `href` against the notebooks folder alone. Most callers want [`resolve_in`],
+/// which also knows about notebooks opened from elsewhere.
+pub fn resolve(root: &Path, page_dir: &Path, href: &str) -> Link {
+    resolve_in(std::slice::from_ref(&root.to_path_buf()), page_dir, href)
+}
+
+/// Resolves `href`, as written in a page in `page_dir`, against every folder a notebook is
+/// open from: the notebooks folder, and any notebook opened from somewhere else.
+///
+/// A link may not leave all of them, however many `..` it has. It took more than one
+/// folder the day notebooks could be opened from outside the notebooks folder: until then
+/// `resolve` knew one root, so every link inside such a notebook was judged to point out
+/// of the notebooks folder and was refused, which is what the owner saw.
+///
+/// `page_dir` is expected absolute and inside one of `roots`; a relative link is taken
+/// from the page's own folder, which is where its file lives.
+pub fn resolve_in(roots: &[PathBuf], page_dir: &Path, href: &str) -> Link {
+    let href = href.trim();
+    if href.is_empty() {
+        return Link::Missing(page_dir.to_path_buf());
+    }
+    // A link of our own: the path after the scheme is read from each open notebook's
+    // folder, so the same link works from any page and in any notebook that holds it.
+    // `get` rather than slicing: the first bytes of a link such as `../日本語.txt` end inside a
+    // character, and a slice there panics (issue #102).
+    if let Some(rest) = href.get(..SCHEME.len()).filter(|head| head.eq_ignore_ascii_case(SCHEME)).map(|_| &href[SCHEME.len()..]) {
+        let rest = rest.trim_start_matches('/');
+        // The page's id, which Copy Link to Page adds: the path is where the page was, the id
+        // is which page it is, and it still finds the page after it moved (issue #129).
+        let id = rest
+            .split('#')
+            .next()
+            .and_then(|r| r.split_once('?'))
+            .and_then(|(_, query)| query.split('&').find_map(|pair| pair.strip_prefix("id=")))
+            .map(percent_decode)
+            .filter(|id| !id.is_empty());
+        let rest = rest.split(['#', '?']).next().unwrap_or("");
+        let by_path = resolve_scheme_path(roots, &percent_decode(rest));
+        let Some(id) = id else { return by_path };
+        // The path is kept when it is still that page. Anything else (nothing there, or another
+        // page now in its place) is looked for by id, inside the open notebooks only.
+        if let Link::Node(dir) = &by_path
+            && read_node(dir).is_some_and(|n| n.id == id)
+        {
+            return by_path;
+        }
+        return roots.iter().find_map(|root| node_with_id(root, &id, 0)).map(Link::Node).unwrap_or(by_path);
+    }
+    if href.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("file:")) {
+        // A `file:` address is a path in disguise and could name anything on the disk.
+        return Link::Outside;
+    }
+    if let Some(url) = web(href) {
+        return Link::Web(url);
+    }
+    // The part before `#` or `?`: a fragment or query has no meaning for a folder.
+    let path_part = href.split(['#', '?']).next().unwrap_or("");
+    if path_part.is_empty() {
+        // `#heading` on the page itself.
+        return Link::Node(page_dir.to_path_buf());
+    }
+    let decoded = percent_decode(path_part);
+    if decoded.contains('\\') || decoded.contains('\0') {
+        return Link::Outside;
+    }
+    let target = Path::new(&decoded);
+    // Only Windows reads `C:/x` as absolute. Elsewhere it would be a folder called `C:` inside the
+    // page, and one notebook, synced between machines, would mean two things. A drive path is
+    // outside unless this system really treats it as an absolute path (and then the root check
+    // below decides).
+    if is_drive(&decoded) && !target.is_absolute() {
+        return Link::Outside;
+    }
+    let Some(full) = normalise(if target.is_absolute() { target.to_path_buf() } else { page_dir.join(target) }) else {
+        return Link::Outside;
+    };
+    // Inside any one of the open notebooks is inside. A link that leaves all of them is
+    // out, which is the rule that keeps a notebook from reaching into the rest of a disk.
+    if !roots.iter().any(|r| full.starts_with(r)) {
+        return Link::Outside;
+    }
+    if full.is_dir() {
+        if read_node(&full).is_some() { Link::Node(full) } else { Link::File(full) }
+    } else if full.is_file() {
+        Link::File(full)
+    } else {
+        Link::Missing(full)
+    }
+}
+
+/// A link of our own's path, read from each open notebook's folder.
+fn resolve_scheme_path(roots: &[PathBuf], decoded: &str) -> Link {
+    if decoded.is_empty() || decoded.contains('\\') || decoded.contains('\0') {
+        return Link::Outside;
+    }
+    let mut inside_somewhere = None;
+    for root in roots {
+        // From the folder above a notebook opened from elsewhere, where links start now;
+        // then from the notebook itself, where links copied before issue #128 started.
+        let base = link_base(root);
+        let bases: &[&Path] = if base == root.as_path() { &[root] } else { &[base, root] };
+        for base in bases {
+            let Some(full) = normalise(base.join(decoded)) else { continue };
+            if !full.starts_with(root) {
+                // A link that climbs out of this notebook; it may still be in another.
+                continue;
+            }
+            if full.is_dir() {
+                return if read_node(&full).is_some() { Link::Node(full) } else { Link::File(full) };
+            }
+            if full.is_file() {
+                return Link::File(full);
+            }
+            inside_somewhere.get_or_insert(full);
+        }
+    }
+    // Nothing of that name: missing when the path at least stayed inside a notebook,
+    // out when it climbed above every one of them.
+    match inside_somewhere {
+        Some(full) => Link::Missing(full),
+        None => Link::Outside,
+    }
+}
+
+/// The node under `dir` whose id is `id`, looking no deeper than a notebook ever goes.
+fn node_with_id(dir: &Path, id: &str, depth: usize) -> Option<PathBuf> {
+    if depth > 32 {
+        return None;
+    }
+    crate::tree::child_dirs(dir)
+        .into_iter()
+        .find_map(|child| if read_node(&child).is_some_and(|n| n.id == id) { Some(child.clone()) } else { node_with_id(&child, id, depth + 1) })
+}
+
+/// The folder a link of our own is written from: the notebooks folder, or, for a notebook
+/// opened from elsewhere, the folder holding it, so the link names the notebook.
+fn link_base(root: &Path) -> &Path {
+    let is_notebook = read_node(root).is_some_and(|n| n.kind == nocturne_model::NodeKind::Notebook);
+    match root.parent() {
+        Some(parent) if is_notebook => parent,
+        _ => root,
+    }
+}
+
+/// `C:/x` or `C:x`: starts with a Windows drive letter.
+fn is_drive(path: &str) -> bool {
+    matches!(path.as_bytes(), [d, b':', ..] if d.is_ascii_alphabetic())
+}
+
+/// `scheme:rest` for a web or application scheme, `None` for a path. A single letter before
+/// the colon is a Windows drive, not a scheme.
+fn web(href: &str) -> Option<String> {
+    let colon = href.find(':')?;
+    let scheme = href.get(..colon)?;
+    let ok = scheme.len() > 1
+        && scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    if ok && !scheme.eq_ignore_ascii_case("file") { Some(href.to_string()) } else { None }
+}
+
+/// Folds `.` and `..` away without touching the disk. `None` when `..` would climb above the
+/// root of the path, which no link inside a notebook needs.
+fn normalise(path: PathBuf) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    let mut depth = 0usize;
+    for c in path.components() {
+        match c {
+            Component::Prefix(_) | Component::RootDir => out.push(c.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if depth == 0 {
+                    return None;
+                }
+                out.pop();
+                depth -= 1;
+            }
+            Component::Normal(part) => {
+                out.push(part);
+                depth += 1;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// `%20` and friends turned back into their bytes; anything that is not valid UTF-8 after
+/// that, or not a percent escape, is kept as written.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+        if bytes[i] == b'%'
+            && let (Some(h), Some(l)) = (bytes.get(i + 1).copied().and_then(hex), bytes.get(i + 2).copied().and_then(hex))
+        {
+            out.push(h * 16 + l);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::TempDir;
+
+    /// A notebooks folder with one notebook, a section, two pages and an attachment.
+    fn fixture(label: &str) -> (TempDir, PathBuf, PathBuf, PathBuf) {
+        let t = TempDir::new(label);
+        let root = t.path().join("notebooks");
+        let settings = crate::Settings::at(t.path().join("settings.toml"));
+        let nb = crate::ops::create_notebook(&root, "Book", None, &settings).expect("notebook");
+        let section = crate::ops::create_node(&nb, "Section", nocturne_model::NodeKind::Section, None, &settings).expect("section");
+        let a = crate::ops::create_node(&section, "Page A", nocturne_model::NodeKind::Page, None, &settings).expect("a");
+        let b = crate::ops::create_node(&section, "Page B", nocturne_model::NodeKind::Page, None, &settings).expect("b");
+        std::fs::create_dir_all(a.join("assets")).expect("assets");
+        std::fs::write(a.join("assets").join("my notes.pdf"), b"%PDF").expect("pdf");
+        (t, root, a, b)
+    }
+
+    #[test]
+    fn a_relative_link_finds_the_page_next_door_and_the_levels_above() {
+        let (_t, root, a, b) = fixture("links-rel");
+        assert_eq!(resolve(&root, &a, "../page-b/"), Link::Node(b.clone()));
+        assert_eq!(resolve(&root, &a, "../page-b"), Link::Node(b.clone()));
+        assert_eq!(resolve(&root, &a, "./../page-b/#heading"), Link::Node(b));
+        assert_eq!(resolve(&root, &a, ".."), Link::Node(a.parent().expect("section").to_path_buf()));
+        assert_eq!(resolve(&root, &a, "../../"), Link::Node(root.join("book")));
+        assert_eq!(resolve(&root, &a, "#top"), Link::Node(a.clone()));
+    }
+
+    /// A notebook opened from outside the notebooks folder: its pages link to each other
+    /// exactly as they would inside it. Judging such a page by the notebooks folder alone
+    /// made every link in it dead, with "that link points outside the notebooks folder",
+    /// which is what the owner saw on the Welcome notebook.
+    #[test]
+    fn a_notebook_opened_from_elsewhere_can_link_inside_itself() {
+        let t = TempDir::new("links-elsewhere");
+        let root = t.path().join("notebooks");
+        let away = t.path().join("somewhere-else");
+        let settings = crate::Settings::at(t.path().join("settings.toml"));
+        std::fs::create_dir_all(&root).expect("root");
+        let nb = crate::ops::create_notebook(&away, "Away", None, &settings).expect("notebook");
+        let section = crate::ops::create_node(&nb, "Section", nocturne_model::NodeKind::Section, None, &settings).expect("section");
+        let a = crate::ops::create_node(&section, "Page A", nocturne_model::NodeKind::Page, None, &settings).expect("a");
+        let b = crate::ops::create_node(&section, "Page B", nocturne_model::NodeKind::Page, None, &settings).expect("b");
+
+        // Knowing only the notebooks folder, every link in it is refused.
+        assert_eq!(resolve(&root, &a, "../page-b/"), Link::Outside, "the fault, as it was");
+
+        // Knowing the notebook is open too, the link is the page next door.
+        let roots = vec![root.clone(), nb.clone()];
+        assert_eq!(resolve_in(&roots, &a, "../page-b/"), Link::Node(b));
+        assert_eq!(resolve_in(&roots, &a, "../../"), Link::Node(nb.clone()));
+
+        // A link that leaves every open notebook is still out, which is the rule that
+        // keeps a notebook from reaching into the rest of the disk.
+        assert_eq!(resolve_in(&roots, &a, "../../../"), Link::Outside);
+        assert_eq!(resolve_in(&roots, &a, "../../../../etc/passwd"), Link::Outside);
+    }
+
+    #[test]
+    fn files_and_folders_that_are_not_nodes_are_files() {
+        let (_t, root, a, _b) = fixture("links-file");
+        assert_eq!(resolve(&root, &a, "assets/my%20notes.pdf"), Link::File(a.join("assets").join("my notes.pdf")));
+        assert_eq!(resolve(&root, &a, "assets/"), Link::File(a.join("assets")));
+        assert_eq!(resolve(&root, &a, "assets/none.pdf"), Link::Missing(a.join("assets").join("none.pdf")));
+        assert_eq!(resolve(&root, &a, "../no-such-page/"), Link::Missing(a.parent().expect("s").join("no-such-page")));
+    }
+
+    #[test]
+    fn nothing_climbs_out_of_the_notebooks_folder() {
+        let (_t, root, a, _b) = fixture("links-out");
+        assert_eq!(resolve(&root, &a, "../../../../"), Link::Outside, "above the notebooks folder");
+        assert_eq!(resolve(&root, &a, "../../../../../../../../../../etc/passwd"), Link::Outside);
+        assert_eq!(resolve(&root, &a, "..\\..\\x"), Link::Outside, "backslashes are not path separators in a link");
+        assert_eq!(resolve(&root, &a, "/etc/passwd"), Link::Outside, "an absolute path outside");
+        assert_eq!(resolve(&root, &a, "C:/Windows"), Link::Outside, "a drive is not a scheme");
+        assert_eq!(resolve(&root, &a, "file:///etc/passwd"), Link::Outside, "file: is a path in disguise");
+        // An absolute path inside the folder is allowed, written with forward slashes as every
+        // link is: it is the page's own folder. With backslashes it is not a link at all.
+        let forward = a.to_string_lossy().replace('\\', "/");
+        assert_eq!(resolve(&root, &a, &forward), Link::Node(a.clone()));
+    }
+
+    #[test]
+    fn a_drive_is_recognised_on_every_system() {
+        for drive in ["C:/Windows", "c:/x", "Z:", "d:file"] {
+            assert!(is_drive(drive), "{drive}");
+        }
+        for not in ["", "C", "page/C:/x", "1:/x", "ab:/x", "../C:/x"] {
+            assert!(!is_drive(not), "{not}");
+        }
+    }
+
+    #[test]
+    fn a_link_of_our_own_names_a_page_from_the_notebooks_folder() {
+        let (_t, root, a, b) = fixture("links-scheme");
+        let roots = vec![root.clone()];
+        let uri = page_uri(&roots, &b).expect("a link to the page");
+        assert!(uri.starts_with("nocturne:/"), "{uri}");
+        assert!(!uri.contains('\\'), "written with forward slashes: {uri}");
+
+        // It leads to that page from anywhere, not only from the page next door.
+        assert_eq!(resolve_in(&roots, &a, &uri), Link::Node(b.clone()));
+        assert_eq!(resolve_in(&roots, &b, &uri), Link::Node(b.clone()), "and from the page itself");
+
+        // Upper case scheme, and a fragment on the end, are the same link.
+        let shouted = uri.replacen("nocturne:", "Nocturne:", 1);
+        assert_eq!(resolve_in(&roots, &a, &shouted), Link::Node(b.clone()));
+        assert_eq!(resolve_in(&roots, &a, &format!("{uri}#heading")), Link::Node(b.clone()));
+
+        // A link of this kind cannot climb out of the notebooks folder.
+        assert_eq!(resolve_in(&roots, &a, "nocturne:/../secret"), Link::Outside);
+        assert_eq!(resolve_in(&roots, &a, "nocturne:/"), Link::Outside);
+        assert!(matches!(resolve_in(&roots, &a, "nocturne:/nothing/here"), Link::Missing(_)));
+    }
+
+    /// Issue #128: two notebooks opened from elsewhere, laid out alike, gave their matching
+    /// pages the same link, and it opened whichever notebook had been opened first.
+    #[test]
+    fn links_to_pages_in_two_notebooks_from_elsewhere_name_their_notebook() {
+        let t = TempDir::new("links-two-away");
+        let root = t.path().join("notebooks");
+        let settings = crate::Settings::at(t.path().join("settings.toml"));
+        std::fs::create_dir_all(&root).expect("root");
+        let page_in = |away: &str, name: &str| {
+            let nb = crate::ops::create_notebook(&t.path().join(away), name, None, &settings).expect("notebook");
+            let section = crate::ops::create_node(&nb, "Section", nocturne_model::NodeKind::Section, None, &settings).expect("section");
+            let page = crate::ops::create_node(&section, "Page", nocturne_model::NodeKind::Page, None, &settings).expect("page");
+            (nb, page)
+        };
+        let (nb_a, page_a) = page_in("away-a", "Book A");
+        let (nb_b, page_b) = page_in("away-b", "Book B");
+
+        for roots in [vec![root.clone(), nb_a.clone(), nb_b.clone()], vec![root.clone(), nb_b.clone(), nb_a.clone()]] {
+            let uri_a = page_uri(&roots, &page_a).expect("a link to page A");
+            let uri_b = page_uri(&roots, &page_b).expect("a link to page B");
+            assert_ne!(uri_a, uri_b, "two pages, two links");
+            assert!(uri_b.starts_with("nocturne:/book-b/"), "the link names its notebook: {uri_b}");
+            assert_eq!(resolve_in(&roots, &page_a, &uri_b), Link::Node(page_b.clone()));
+            assert_eq!(resolve_in(&roots, &page_b, &uri_a), Link::Node(page_a.clone()));
+        }
+
+        // A link copied before the fix, without the notebook's name, still opens a page.
+        let roots = vec![root.clone(), nb_a.clone()];
+        assert_eq!(resolve_in(&roots, &page_a, "nocturne:/section/page"), Link::Node(page_a.clone()));
+        // And the folder above the notebook is not a way out of it.
+        assert_eq!(resolve_in(&roots, &page_a, "nocturne:/away-a-sibling/x"), Link::Missing(root.join("away-a-sibling").join("x")));
+    }
+
+    /// Issue #129: Make Subpage moved the page's folder, and a link copied before the move
+    /// pointed at the old path and found nothing. The link carries the page's id, which the
+    /// move does not change, so it still finds the page, here and from another notebook.
+    #[test]
+    fn a_link_finds_its_page_after_make_subpage_moves_it() {
+        let (_t, root, a, b) = fixture("links-moved");
+        let roots = vec![root.clone()];
+        let uri = page_uri(&roots, &b).expect("a link to page B");
+        assert!(uri.contains("?id="), "the link carries the page's id: {uri}");
+        assert_eq!(resolve_in(&roots, &a, &uri), Link::Node(b.clone()), "before the move");
+
+        let moved = crate::ops::make_subpage(&b).expect("make page B a subpage of page A");
+        // The move names the folder canonically; compare folders, not spellings of them.
+        let node = |link: Link| match link {
+            Link::Node(p) => p.canonicalize().ok(),
+            _ => None,
+        };
+        let moved_at = moved.canonicalize().ok();
+        assert_ne!(moved, b, "the page's folder moved");
+        assert_eq!(node(resolve_in(&roots, &a, &uri)), moved_at, "the link follows the page");
+        assert_eq!(node(resolve_in(&roots, &a, &format!("{uri}#heading"))), moved_at, "with a fragment too");
+
+        // A link without the id, as one copied before this change, still goes by its path.
+        let bare = uri.split('?').next().expect("the path").to_string();
+        assert!(matches!(resolve_in(&roots, &a, &bare), Link::Missing(_)), "a bare old path is only a path");
+
+        // Another page in the old place: the link is for page B, not for whatever is there now.
+        let section = a.parent().expect("section").to_path_buf();
+        let settings = crate::Settings::at(root.parent().expect("temp").join("settings2.toml"));
+        let other = crate::ops::create_node(&section, "Page B", nocturne_model::NodeKind::Page, None, &settings).expect("a new page B");
+        assert_eq!(other, b, "the new page took the old folder name");
+        assert_eq!(node(resolve_in(&roots, &a, &uri)), moved_at, "the link still finds the page it was copied for");
+
+        // An id that is nowhere is no way out of the notebooks: the path decides as before.
+        assert_eq!(resolve_in(&roots, &a, "nocturne:/../secret?id=nothing"), Link::Outside);
+    }
+
+    #[test]
+    fn web_and_mail_addresses_are_handed_to_the_system() {
+        let (_t, root, a, _b) = fixture("links-web");
+        assert_eq!(resolve(&root, &a, "https://example.test/x?y#z"), Link::Web("https://example.test/x?y#z".into()));
+        assert_eq!(resolve(&root, &a, " mailto:someone@example.test "), Link::Web("mailto:someone@example.test".into()));
+        assert_eq!(resolve(&root, &a, ""), Link::Missing(a));
+    }
+
+    /// Issue #102: a link whose first bytes end inside a character panicked on the check for
+    /// `nocturne:`. Each of these has a character across byte 9, the length of the scheme.
+    #[test]
+    fn a_link_with_characters_across_the_scheme_length_does_not_panic() {
+        let (_t, root, a, _b) = fixture("links-unicode");
+        for href in ["../a日本語.txt", "a日本語語.txt", "aaéééé.txt", "fasicul日本"] {
+            assert!(href.len() > SCHEME.len() && !href.is_char_boundary(SCHEME.len()), "{href} must straddle the scheme length");
+            assert!(matches!(resolve(&root, &a, href), Link::Missing(_) | Link::Outside), "{href}");
+            assert!(matches!(resolve_in(std::slice::from_ref(&root), &a, href), Link::Missing(_) | Link::Outside), "{href}");
+        }
+        std::fs::write(a.join("assets").join("日本語.txt"), b"text").expect("a file with a Japanese name");
+        assert_eq!(resolve(&root, &a, "assets/日本語.txt"), Link::File(a.join("assets").join("日本語.txt")));
+    }
+
+    #[test]
+    fn percent_escapes_decode_and_junk_is_kept() {
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(percent_decode("%D9%85"), "\u{645}");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("%FF"), "%FF", "not UTF-8: kept as written");
+    }
+}

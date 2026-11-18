@@ -1,0 +1,90 @@
+name: iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      custom_icon_path:
+        description: "Optional repo-relative PNG path to override the app icon"
+        required: false
+        default: ""
+        type: string
+  push:
+    paths:
+      - "ios/**"
+      - "crates/ui-egui/**"
+      - "apps/nocturne-setup/**"
+      - "Cargo.*"
+      - ".github/workflows/ios-ipa.yml"
+  pull_request:
+    paths:
+      - "ios/**"
+      - "crates/ui-egui/**"
+      - "apps/nocturne-setup/**"
+      - "Cargo.*"
+      - ".github/workflows/ios-ipa.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_JOBS: "3"
+
+jobs:
+  ios:
+    name: iPadOS / iOS arm64 IPA
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain and iOS target
+        run: |
+          rustup install
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ios
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install Pillow
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ios-venv"
+          "$RUNNER_TEMP/ios-venv/bin/python" -m pip install --upgrade pip pillow
+          echo "$RUNNER_TEMP/ios-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Clippy (aarch64-apple-ios)
+        run: cargo clippy --target aarch64-apple-ios -p nocturne-ios --lib --bins -- -D warnings
+
+      - name: Test nocturne-ios
+        run: cargo test -p nocturne-ios
+
+      - name: Build iOS IPA
+        env:
+          CUSTOM_ICON_PATH: ${{ inputs.custom_icon_path }}
+        run: |
+          if [[ -n "$CUSTOM_ICON_PATH" ]]; then
+            bash ios/build.sh --icon "$CUSTOM_ICON_PATH"
+          else
+            bash ios/build.sh
+          fi
+
+      - name: Verify iOS IPA
+        run: bash ios/test.sh
+
+      - name: Smoke-test Nocturne in iPadOS Simulator
+        run: bash ios/sim_smoke.sh
+
+      - name: Upload IPA artifact
+        if: success() || failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nocturne-ios-arm64
+          path: dist/ios/*
+          if-no-files-found: error

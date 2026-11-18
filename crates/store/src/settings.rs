@@ -1,0 +1,231 @@
+//! The global settings file. It lives in the user's config folder, outside any
+//! notebook, so notebooks carry no personal settings.
+
+use crate::error::{Result, StoreError};
+use nocturne_model::{PageFormat, kv};
+use std::path::{Path, PathBuf};
+
+/// Where the format for a new page came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FormatSource {
+    /// Chosen explicitly for this page.
+    Explicit,
+    /// A `_node.toml` in the notebook tree (notebook, section group or section).
+    Tree,
+    /// The global setting.
+    Global,
+    /// The built-in default.
+    BuiltIn,
+}
+
+impl FormatSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            FormatSource::Explicit => "chosen for this page",
+            FormatSource::Tree => "the notebook or section setting",
+            FormatSource::Global => "the global setting",
+            FormatSource::BuiltIn => "the built-in default",
+        }
+    }
+}
+
+/// The default notebooks folder: `NOCTURNE_NOTEBOOKS`, else `Documents/Nocturne` in the home folder.
+pub fn default_notebooks_dir() -> PathBuf {
+    if let Some(p) = std::env::var_os("NOCTURNE_NOTEBOOKS") {
+        return PathBuf::from(p);
+    }
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    default_notebooks_dir_for_home(home)
+}
+
+/// The per-user notebook folder, kept separate so every platform can test the same contract.
+pub fn default_notebooks_dir_for_home(home: impl AsRef<Path>) -> PathBuf {
+    home.as_ref().join("Documents").join("Nocturne")
+}
+
+/// The notebook root the app should use when no explicit command-line root is supplied.
+pub fn configured_notebooks_dir(settings: &Settings) -> Option<PathBuf> {
+    let saved = settings.get("last_notebooks_root")?;
+    #[cfg(not(target_os = "windows"))]
+    if saved.starts_with("\\\\?\\") || saved.contains(":\\") {
+        return None;
+    }
+    let path = PathBuf::from(saved);
+    let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+    let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    (!canonical.starts_with(temp)).then_some(path)
+}
+
+#[derive(Clone, Debug)]
+pub struct Settings {
+    path: PathBuf,
+}
+
+impl Settings {
+    /// Settings stored in `path` (used by tests and by `NOCTURNE_SETTINGS`).
+    pub fn at(path: impl Into<PathBuf>) -> Settings {
+        Settings { path: path.into() }
+    }
+
+    /// The usual place: `NOCTURNE_SETTINGS`, else `%APPDATA%\Nocturne\settings.toml`,
+    /// else `$XDG_CONFIG_HOME/nocturne/settings.toml`, else `$HOME/.config/nocturne/settings.toml`.
+    pub fn default_location() -> Settings {
+        if let Some(p) = std::env::var_os("NOCTURNE_SETTINGS") {
+            return Settings::at(p);
+        }
+        // Development mode: prefer local folder next to executable/cwd
+        let local_dev = PathBuf::from("local/settings.toml");
+        if local_dev.exists() {
+            return Settings::at(local_dev);
+        }
+        // Check if we're in a development environment (local/ folder exists nearby)
+        if let Ok(cwd) = std::env::current_dir()
+            && (cwd.join("local").exists() || cwd.join("Cargo.toml").exists())
+        {
+            return Settings::at(local_dev);
+        }
+        // Production: use platform-specific locations
+        let path = if let Some(appdata) = std::env::var_os("APPDATA") {
+            PathBuf::from(appdata).join("Nocturne").join("settings.toml")
+        } else if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+            PathBuf::from(xdg).join("nocturne").join("settings.toml")
+        } else if let Some(home) = std::env::var_os("HOME") {
+            PathBuf::from(home).join(".config").join("nocturne").join("settings.toml")
+        } else {
+            PathBuf::from("nocturne-settings.toml")
+        };
+        Settings::at(path)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The global default format, if one was saved and is valid.
+    pub fn default_format(&self) -> Option<PageFormat> {
+        let text = std::fs::read_to_string(&self.path).ok()?;
+        kv::parse(&text).get("default_format").and_then(|v| PageFormat::parse(v).ok())
+    }
+
+    pub fn set_default_format(&self, format: PageFormat) -> Result<()> {
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| StoreError::io("create", dir, e))?;
+        }
+        let mut map = std::fs::read_to_string(&self.path).map(|t| kv::parse(&t)).unwrap_or_default();
+        map.insert("default_format".into(), format.id().into());
+        std::fs::write(&self.path, kv::render(&map)).map_err(|e| StoreError::io("write", &self.path, e))
+    }
+
+    /// Any saved setting by key (for example `theme_mode`). Unknown keys are kept by every write.
+    pub fn get(&self, key: &str) -> Option<String> {
+        let text = std::fs::read_to_string(&self.path).ok()?;
+        kv::parse(&text).get(key).cloned()
+    }
+
+    pub fn set(&self, key: &str, value: &str) -> Result<()> {
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| StoreError::io("create", dir, e))?;
+        }
+        let mut map = std::fs::read_to_string(&self.path).map(|t| kv::parse(&t)).unwrap_or_default();
+        map.insert(key.to_string(), value.to_string());
+        std::fs::write(&self.path, kv::render(&map)).map_err(|e| StoreError::io("write", &self.path, e))
+    }
+
+    /// Removes all saved application preferences. Missing settings are already at defaults.
+    pub fn reset(&self) -> Result<()> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(StoreError::io("remove", &self.path, e)),
+        }
+    }
+
+    /// The format used for new pages when nothing nearer says otherwise.
+    pub fn global_format(&self) -> (PageFormat, FormatSource) {
+        match self.default_format() {
+            Some(f) => (f, FormatSource::Global),
+            None => (PageFormat::DEFAULT, FormatSource::BuiltIn),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::TempDir;
+
+    #[test]
+    fn built_in_default_is_html() {
+        let t = TempDir::new("settings1");
+        let s = Settings::at(t.path().join("settings.toml"));
+        assert_eq!(s.global_format(), (PageFormat::Html, FormatSource::BuiltIn));
+    }
+
+    #[test]
+    fn notebooks_default_is_under_the_current_users_documents_folder() {
+        assert_eq!(default_notebooks_dir_for_home(r"C:\Users\Ada"), PathBuf::from(r"C:\Users\Ada").join("Documents").join("Nocturne"));
+        assert_eq!(default_notebooks_dir_for_home("/home/ada"), PathBuf::from("/home/ada/Documents/Nocturne"));
+    }
+
+    #[test]
+    fn configured_notebooks_root_uses_the_saved_user_location() {
+        let t = TempDir::new("settings-notebook-root");
+        let s = Settings::at(t.path().join("settings.toml"));
+        s.set("last_notebooks_root", "Notes/Research").expect("save notebooks root");
+        assert_eq!(configured_notebooks_dir(&s), Some(PathBuf::from("Notes/Research")));
+    }
+
+    #[test]
+    fn configured_notebooks_root_ignores_a_saved_temporary_test_location() {
+        let t = TempDir::new("settings-notebook-root-temp");
+        let s = Settings::at(t.path().join("settings.toml"));
+        s.set("last_notebooks_root", &t.path().to_string_lossy()).expect("save temporary root");
+        assert_eq!(configured_notebooks_dir(&s), None);
+    }
+
+    #[test]
+    fn saves_and_reads_the_global_format() {
+        let t = TempDir::new("settings2");
+        let s = Settings::at(t.path().join("sub").join("settings.toml"));
+        s.set_default_format(PageFormat::Cmgfm).expect("save");
+        assert_eq!(s.global_format(), (PageFormat::Cmgfm, FormatSource::Global));
+        s.set_default_format(PageFormat::Html).expect("save");
+        assert_eq!(s.default_format(), Some(PageFormat::Html));
+    }
+
+    #[test]
+    fn generic_keys_round_trip_and_do_not_disturb_the_format() {
+        let t = TempDir::new("settings4");
+        let s = Settings::at(t.path().join("settings.toml"));
+        assert_eq!(s.get("theme_mode"), None);
+        s.set("theme_mode", "dark").expect("set");
+        s.set_default_format(PageFormat::Cmgfm).expect("set");
+        s.set("theme_accent", "red").expect("set");
+        assert_eq!(s.get("theme_mode").as_deref(), Some("dark"));
+        assert_eq!(s.get("theme_accent").as_deref(), Some("red"));
+        assert_eq!(s.default_format(), Some(PageFormat::Cmgfm));
+    }
+
+    #[test]
+    fn keeps_unknown_keys_and_ignores_bad_values() {
+        let t = TempDir::new("settings3");
+        let p = t.path().join("settings.toml");
+        std::fs::write(&p, "other = \"keep\"\ndefault_format = \"docx\"\n").expect("write");
+        let s = Settings::at(&p);
+        assert_eq!(s.default_format(), None);
+        s.set_default_format(PageFormat::Cmgfm).expect("save");
+        let text = std::fs::read_to_string(&p).expect("read");
+        assert!(text.contains("other = \"keep\""));
+        assert!(text.contains("default_format = \"cmgfm\""));
+    }
+
+    #[test]
+    fn reset_removes_saved_preferences() {
+        let t = TempDir::new("settings-reset");
+        let s = Settings::at(t.path().join("settings.toml"));
+        s.set("theme_mode", "dark").expect("set");
+        s.reset().expect("reset");
+        assert_eq!(s.get("theme_mode"), None);
+        s.reset().expect("reset missing settings");
+    }
+}

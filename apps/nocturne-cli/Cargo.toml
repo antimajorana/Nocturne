@@ -1,0 +1,21 @@
+[package]
+name = "nocturne-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Nocturne command line: list and run engine commands, check a notebooks folder"
+
+[lints]
+workspace = true
+
+[dependencies]
+nocturne-engine = { workspace = true }
+nocturne-import = { workspace = true }
+nocturne-mcp = { workspace = true }
+nocturne-store = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = { workspace = true }

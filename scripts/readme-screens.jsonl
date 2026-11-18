@@ -1,0 +1,54 @@
+{"width": 1440, "height": 900, "scale": 1.0, "theme": "light-default"}
+{"method": "engine.execute", "params": {"command": "node.color", "params": {"path": "my-notebook", "color": "blue"}}}
+{"method": "engine.execute", "params": {"command": "node.color", "params": {"path": "my-notebook/work", "color": "orange"}}}
+{"method": "engine.execute", "params": {"command": "node.color", "params": {"path": "my-notebook/ideas", "color": "teal"}}}
+{"method": "ui.expandAll"}
+{"method": "ui.open", "params": {"path": "my-notebook/ideas/format-ideas"}}
+{"wait": 800}
+{"shot": "docs/images/hero.png"}
+{"method": "ui.click", "params": {"x": 1343, "y": 185}}
+{"wait": 600}
+{"method": "ui.move", "params": {"x": 150, "y": 790}}
+{"wait": 300}
+{"shot": "docs/images/page-source.png"}
+{"method": "ui.click", "params": {"x": 1343, "y": 185}}
+{"wait": 400}
+{"method": "ui.open", "params": {"path": "my-notebook/work/projects/project-x"}}
+{"wait": 400}
+{"shot": "docs/images/html-page.png"}
+{"method": "engine.execute", "params": {"command": "node.create", "params": {"parent": "my-notebook/ideas", "kind": "page", "title": "Equations", "format": "cmgfm"}}}
+{"method": "engine.execute", "params": {"command": "page.save", "params": {"path": "my-notebook/ideas/equations", "body": "# Equations\n\nInline: $E = mc^2$, a fraction $\\frac{a+b}{2}$ and a root $\\sqrt{x^2+y^2}$ flow with the text.\n\n$$\nx = \\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}\n$$\n\n$$\n\\sum_{n=1}^{\\infty} \\frac{1}{n^2} = \\frac{\\pi^2}{6} \\qquad \\int_0^1 x^2\\,dx = \\tfrac{1}{3}\n$$\n"}}}
+{"method": "ui.open", "params": {"path": "my-notebook/ideas/equations"}}
+{"wait": 400}
+{"shot": "docs/images/equations.png"}
+{"method": "engine.execute", "params": {"command": "node.create", "params": {"parent": "my-notebook/ideas", "kind": "page", "title": "Tags", "format": "cmgfm"}}}
+{"method": "engine.execute", "params": {"command": "page.save", "params": {"path": "my-notebook/ideas/tags", "body": "# Trip\n\n- [ ] book the train\n- [x] passport\n\n#important leave on Friday\n\n#question which hotel?\n\n#idea take the coast road\n\n#phone call the office\n\n#website routes.example\n"}}}
+{"method": "ui.open", "params": {"path": "my-notebook/ideas/tags"}}
+{"wait": 400}
+{"shot": "docs/images/tags.png"}
+{"method": "ui.click", "params": {"x": 145, "y": 52}}
+{"steps": 6}
+{"shot": "docs/images/ribbon-insert.png"}
+{"method": "ui.click", "params": {"x": 87, "y": 52}}
+{"steps": 6}
+{"shot": "docs/images/ribbon-home.png"}
+{"method": "ui.theme", "params": {"mode": "dark", "accent": "green"}}
+{"wait": 300}
+{"shot": "docs/images/dark-green.png"}
+{"method": "ui.theme", "params": {"mode": "light", "accent": "default"}}
+{"method": "ui.click", "params": {"x": 1264, "y": 15}}
+{"steps": 8}
+{"shot": "docs/images/theme-switcher.png"}
+{"method": "ui.key", "params": {"key": "Escape"}}
+{"method": "ui.click", "params": {"x": 34, "y": 52}}
+{"steps": 8}
+{"shot": "docs/images/file-screen.png"}
+{"method": "ui.click", "params": {"x": 33, "y": 70}}
+{"wait": 300}
+{"method": "engine.execute", "params": {"command": "node.create", "params": {"parent": "my-notebook/ideas", "kind": "page", "title": "Diagrams", "format": "cmgfm"}}}
+{"method": "engine.execute", "params": {"command": "page.save", "params": {"path": "my-notebook/ideas/diagrams", "body": "# Diagrams\n\nA diagram is Mermaid source in the page. It is drawn where it stands; click one to edit its source:\n\n```mermaid\npie title Pages by format\n  \"HTML\" : 62\n  \"CommonMark\" : 31\n  \"Other\" : 7\n```\n\n```mermaid\nxychart-beta\n    title \"Pages per month\"\n    x-axis [jan, feb, mar, apr, may]\n    y-axis \"Pages\" 0 --> 100\n    bar [20, 45, 60, 80, 95]\n    line [20, 45, 60, 80, 95]\n```\n"}}}
+{"method": "ui.open", "params": {"path": "my-notebook/ideas/diagrams"}}
+{"wait": 2500}
+{"method": "ui.move", "params": {"x": 150, "y": 790}}
+{"wait": 300}
+{"shot": "docs/images/diagrams.png"}

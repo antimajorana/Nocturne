@@ -1,0 +1,22 @@
+[package]
+name = "nocturne-setup"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Nocturne installation setup helper"
+
+[[bin]]
+name = "nocturne-setup"
+path = "src/main.rs"
+
+[dependencies]
+nocturne-store = { workspace = true }
+
+# Only the setup program's own message boxes use it; the library half is shared with mobile builds.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+rfd = { workspace = true }
+
+[lints]
+workspace = true

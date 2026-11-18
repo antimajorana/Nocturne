@@ -1,0 +1,14 @@
+[package]
+name = "nocturne-formats"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Nocturne page formats: HTML and CommonMark + GFM text handling, page templates, and a preview block model"
+
+[lints]
+workspace = true
+
+[dependencies]
+nocturne-model = { workspace = true }

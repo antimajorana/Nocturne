@@ -1,0 +1,1156 @@
+//! The code view: every file of a page on the left, the one that is picked on the right.
+//!
+//! A page is a folder, and the window should be able to show that folder as it is. The
+//! old Source button put the page's text beside the page itself, which showed one file of
+//! the several a page owns and left two editable copies of the same page on screen at
+//! once. This is the view [`docs/dom_serialization/page-model.md`](../../../docs/dom_serialization/page-model.md) section 4
+//! asks for: a list, a viewer, and one editable copy.
+//!
+//! What can be edited: the page file, whole, head and all, and the SVG of a drawing.
+//! The head was read-only at first, so that a hand edit could not break the page's id;
+//! the owner asked for the whole file on 2026-10-19, which is the point of a code view -
+//! a person debugging a page needs to change the line that is wrong, wherever it is.
+//! Everything else is read-only, because a hand edit to a picture or to a `_node.toml`
+//! is not something to do with a text box.
+
+use crate::floating::{self, Glyph};
+use crate::highlight::{self, Class, Lang, Span};
+use crate::icons::Icon;
+use crate::ribbon_icons::Mark;
+use crate::theme::{Tokens, mix};
+use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
+use egui::{Color32, CursorIcon, Key, Modifiers, Rect, Sense, Ui, vec2};
+use std::path::Path;
+
+/// How much of a file is read for the viewer. A larger file shows its first part and says
+/// so, which keeps the view quick whatever is in the folder.
+pub const MAX_SHOWN: usize = 256 * 1024;
+
+/// What kind of file a row is, which decides how it is shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// `index.html` or `index.md`: the page's own text.
+    PageFile,
+    /// A drawing of ours: SVG carrying the ink namespace.
+    Ink,
+    /// An ordinary SVG asset, shown rendered above its editable source.
+    Svg,
+    /// A Mermaid diagram's source kept as a file of its own (`.mmd`): text, and it can be typed in.
+    Diagram,
+    /// A picture the window can draw.
+    Picture,
+    /// A PDF document; the source view shows extracted text and can open the system viewer.
+    Pdf,
+    /// A DOCX, XLSX or PPTX package; the source view shows its readable XML text.
+    Office,
+    /// Anything else we can show as text.
+    Text,
+    /// A file shown by name, size and type only.
+    Other,
+}
+
+impl Kind {
+    /// Whether what is shown can be typed in.
+    pub fn editable(self) -> bool {
+        matches!(self, Kind::PageFile | Kind::Ink | Kind::Svg | Kind::Diagram)
+    }
+}
+
+/// One row of the list.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Entry {
+    /// What the row is called, and what the page would link to: `index.html`, `ink.svg`,
+    /// `assets/nocturne.png`.
+    pub name: String,
+    pub kind: Kind,
+    pub bytes: u64,
+    /// False when nothing in the page names this file: an orphan, kept and never drawn.
+    pub used: bool,
+}
+
+/// The state the view keeps between frames.
+#[derive(Clone, Debug, Default)]
+pub struct State {
+    /// The row that is picked. The page file when the view opens.
+    pub picked: Option<String>,
+    /// The text of the picked file while it is being read or edited. The page file is not
+    /// held here: its body is the editor's own, so there is only ever one copy of it.
+    pub text: String,
+    /// Which file `text` was read from, so a change of row reads the new one.
+    pub loaded: Option<String>,
+    /// The picked file has been typed in and not yet written.
+    pub dirty: bool,
+    /// `text` is only the start of the picked file, cut to [`MAX_SHOWN`]. It is then shown and
+    /// never typed in: what was typed would be written over the whole file, and everything
+    /// after the cut lost with it (issue #124).
+    pub cut: bool,
+    /// The page's own file was typed in, so the page has to be read again when the view
+    /// closes.
+    pub page_edited: bool,
+    /// A drawing is shown as its strokes; this is the one the code is shown for instead.
+    pub as_code: bool,
+    /// The page folder the state belongs to. Another page is another folder, so everything held
+    /// from the last one is dropped: its text would otherwise be shown, and typed over, as this
+    /// page's own.
+    pub dir: Option<std::path::PathBuf>,
+    /// The Find bar under the editor.
+    pub find: Find,
+    /// The colour spans of `text`, and a fingerprint of the text and format they were made for.
+    pub coloured: Vec<Span>,
+    pub coloured_for: u64,
+    /// Width of the file list in the source view, in points.
+    pub list_width: f32,
+}
+
+const DEFAULT_LIST_WIDTH: f32 = 240.0;
+const MIN_LIST_WIDTH: f32 = 150.0;
+const MIN_EDITOR_WIDTH: f32 = 260.0;
+
+fn clamp_list_width(value: f32, available: f32) -> f32 {
+    value.clamp(MIN_LIST_WIDTH, (available - MIN_EDITOR_WIDTH).max(MIN_LIST_WIDTH))
+}
+
+/// The Find bar: what is being looked for, and where it was found in the text in hand.
+#[derive(Clone, Debug, Default)]
+pub struct Find {
+    pub open: bool,
+    pub query: String,
+    /// Match the case of the letters.
+    pub case: bool,
+    /// Where the query was found, as character positions `(from, to)` in the text, which is how
+    /// the text box counts.
+    pub matches: Vec<(usize, usize)>,
+    /// Which of them is the one the bar is on.
+    pub current: usize,
+    /// A fingerprint of the text, query and case the matches were found in.
+    pub found_in: u64,
+    /// Put the caret in the query box on the next frame.
+    pub focus: bool,
+    /// Scroll the current match into view on the next frame.
+    pub jump: bool,
+    /// Select the current match in the text and give it the caret on the next frame: closing the
+    /// bar leaves you where the search ended.
+    pub select: bool,
+}
+
+/// The most matches kept. A search for one letter in a big file would otherwise be thousands of
+/// highlights that nobody reads.
+pub const MAX_MATCHES: usize = 5_000;
+
+fn lower(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
+}
+
+/// Where `query` is in `text`, as character positions `(from, to)`, none overlapping, in order.
+pub fn find_matches(text: &str, query: &str, case: bool) -> Vec<(usize, usize)> {
+    let needle: Vec<char> = query.chars().collect();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let hay: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    if hay.len() < needle.len() {
+        return out;
+    }
+    let same = |a: char, b: char| a == b || (!case && lower(a) == lower(b));
+    let mut i = 0;
+    while i + needle.len() <= hay.len() && out.len() < MAX_MATCHES {
+        if needle.iter().enumerate().all(|(j, n)| same(hay[i + j], *n)) {
+            out.push((i, i + needle.len()));
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+fn fingerprint(parts: &[&str], flag: bool) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for p in parts {
+        p.hash(&mut h);
+    }
+    flag.hash(&mut h);
+    h.finish()
+}
+
+/// The colour a kind of text is drawn in. All are tokens, so every theme has them readable.
+pub fn class_colour(class: Class, t: &Tokens) -> Color32 {
+    // Four hues that differ from each other in every theme: the accent for what structures a file
+    // (tags, keywords, headings), teal for names (attributes, keys, code), green for strings and
+    // amber for numbers and emphasis; the rest is the quiet colour.
+    match class {
+        Class::Tag | Class::Keyword | Class::Heading => t.accent,
+        Class::Attr | Class::Code => t.section,
+        Class::Str => t.ok,
+        Class::Number | Class::Emphasis => t.group,
+        Class::Link => t.link,
+        Class::Comment | Class::Punct | Class::Meta => t.muted,
+    }
+}
+
+/// The background of every match, and of the one the bar is on.
+pub fn match_colours(t: &Tokens) -> (Color32, Color32) {
+    (t.row_selected, mix(t.row_selected, t.accent, 0.15))
+}
+
+/// Byte ranges for character ranges, in one pass. The ranges are in order.
+fn byte_ranges(text: &str, chars: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut out = Vec::with_capacity(chars.len());
+    let mut at = text.char_indices().map(|(b, _)| b).chain(std::iter::once(text.len()));
+    let mut seen = 0usize;
+    let mut last = 0usize;
+    let mut next = |want: usize, seen: &mut usize, last: &mut usize| {
+        while *seen < want {
+            match at.next() {
+                Some(b) => {
+                    *last = b;
+                    *seen += 1;
+                }
+                None => break,
+            }
+        }
+        *last
+    };
+    for (from, to) in chars {
+        // `seen` counts characters passed, so the byte of character `n` is the n-th boundary.
+        let a = if *from == 0 { 0 } else { next(*from + 1, &mut seen, &mut last) };
+        let b = next(*to + 1, &mut seen, &mut last);
+        out.push((a, b));
+    }
+    out
+}
+
+/// The text as one laid out job: syntax colours, with the matches of the Find bar behind them.
+#[allow(clippy::too_many_arguments)]
+pub fn colour_job(
+    text: &str,
+    spans: &[Span],
+    matches: &[(usize, usize)],
+    current: Option<usize>,
+    t: &Tokens,
+    font: egui::FontId,
+    base: Color32,
+    wrap: f32,
+) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = wrap;
+    let found = byte_ranges(text, matches);
+    let mut cuts: Vec<usize> = vec![0, text.len()];
+    for s in spans {
+        cuts.push(s.range.start);
+        cuts.push(s.range.end);
+    }
+    for (a, b) in &found {
+        cuts.push(*a);
+        cuts.push(*b);
+    }
+    cuts.retain(|c| *c <= text.len() && text.is_char_boundary(*c));
+    cuts.sort_unstable();
+    cuts.dedup();
+    let (all, here) = match_colours(t);
+    let (mut si, mut mi) = (0, 0);
+    for w in cuts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        while si < spans.len() && spans[si].range.end <= a {
+            si += 1;
+        }
+        let class = spans.get(si).filter(|s| s.range.start <= a && a < s.range.end).map(|s| s.class);
+        while mi < found.len() && found[mi].1 <= a {
+            mi += 1;
+        }
+        let hit = found.get(mi).filter(|r| r.0 <= a && a < r.1).map(|_| mi);
+        let mut f = TextFormat::simple(font.clone(), class.map_or(base, |c| class_colour(c, t)));
+        f.italics = class == Some(Class::Comment);
+        if let Some(k) = hit {
+            let this = Some(k) == current;
+            f.background = if this { here } else { all };
+            if this {
+                f.underline = egui::Stroke::new(1.5, t.accent);
+            }
+        }
+        job.append(&text[a..b], 0.0, f);
+    }
+    job
+}
+
+/// What the Find bar asked for.
+enum FindAct {
+    None,
+    Next,
+    Previous,
+    Close,
+    Edited,
+}
+
+/// The bar under the editor: a box to type in, Previous and Next, a case switch, how many were found.
+fn find_bar(ui: &mut Ui, find: &mut Find, id: egui::Id, t: &Tokens) -> FindAct {
+    let mut act = FindAct::None;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(crate::tl_id!("ui.find")).small().color(t.muted));
+        let query = ui.add(egui::TextEdit::singleline(&mut find.query).id(id).desired_width(240.0).hint_text(crate::tl_id!("ui.find_in_this_file")));
+        if find.focus {
+            query.request_focus();
+            find.focus = false;
+        }
+        if query.changed() {
+            act = FindAct::Edited;
+        }
+        // Shift is read from the key press itself as well as from the held keys: a press that is sent
+        // in (by a script, or a remote desktop) carries its own modifiers.
+        let (enter, shift) = ui.input(|i| {
+            let shifted = i.events.iter().any(|e| matches!(e, egui::Event::Key { key: Key::Enter, pressed: true, modifiers, .. } if modifiers.shift));
+            (i.key_pressed(Key::Enter), i.modifiers.shift || shifted)
+        });
+        if (query.has_focus() || query.lost_focus()) && enter {
+            act = if shift { FindAct::Previous } else { FindAct::Next };
+            query.request_focus();
+        }
+        if ui.small_button(crate::tl_id!("ui.previous")).on_hover_text(crate::tl_id!("ui.previous_match_shift_enter")).clicked() {
+            act = FindAct::Previous;
+        }
+        if ui.small_button(crate::tl_id!("ui.next")).on_hover_text(crate::tl_id!("ui.next_match_enter_f3")).clicked() {
+            act = FindAct::Next;
+        }
+        if ui.selectable_label(find.case, crate::tl_id!("ui.match_case")).clicked() {
+            find.case = !find.case;
+            act = FindAct::Edited;
+        }
+        let count = if find.query.is_empty() {
+            String::new()
+        } else if find.matches.is_empty() {
+            "No matches".to_string()
+        } else {
+            let more = if find.matches.len() >= MAX_MATCHES { "+" } else { "" };
+            format!("{} of {}{more}", find.current + 1, find.matches.len())
+        };
+        ui.label(egui::RichText::new(count).small().color(if find.matches.is_empty() && !find.query.is_empty() { t.warn } else { t.muted }));
+        if ui.small_button(crate::tl_id!("ui.close")).on_hover_text(crate::tl_id!("ui.close_the_find_bar_escape")).clicked() {
+            act = FindAct::Close;
+        }
+    });
+    act
+}
+#[derive(Clone, Debug, Default)]
+pub struct Out {
+    /// A file was typed in: its name and its new text, for the window to write.
+    pub wrote: Option<(String, String)>,
+    pub file_action: Option<FileAction>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FileAction {
+    CopyPath(String),
+    OpenFolder(std::path::PathBuf),
+    OpenShell(std::path::PathBuf),
+    Delete(String),
+    AddFile,
+}
+
+fn delete_action(entry: &Entry) -> Option<FileAction> {
+    (!matches!(entry.kind, Kind::PageFile)).then(|| FileAction::Delete(entry.name.strip_prefix("assets/").unwrap_or(&entry.name).to_string()))
+}
+
+/// The files of a page, the page file first, then what sits beside it, then `assets/`.
+///
+/// `named` is what the page's text links to, so a file nothing names can be marked as an
+/// orphan rather than quietly listed as if it were in use.
+pub fn files(dir: &Path, page_file: &str, named: &[String]) -> Vec<Entry> {
+    let mut beside: Vec<Entry> = Vec::new();
+    let mut assets: Vec<Entry> = Vec::new();
+    let mut page = None;
+    for (folder, prefix) in [(dir.to_path_buf(), ""), (dir.join("assets"), "assets/")] {
+        let Ok(entries) = std::fs::read_dir(&folder) else { continue };
+        for entry in entries.flatten() {
+            if !entry.path().is_file() {
+                continue;
+            }
+            let file = entry.file_name().to_string_lossy().into_owned();
+            let name = format!("{prefix}{file}");
+            let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let kind = kind_of(&entry.path(), &name, page_file);
+            let used = kind == Kind::PageFile || named.iter().any(|n| n.trim() == name);
+            let row = Entry { name, kind, bytes, used };
+            match (kind, prefix) {
+                (Kind::PageFile, _) => page = Some(row),
+                (_, "assets/") => assets.push(row),
+                _ => beside.push(row),
+            }
+        }
+    }
+    beside.sort_by(|a, b| a.name.cmp(&b.name));
+    assets.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut out = Vec::with_capacity(beside.len() + assets.len() + 1);
+    out.extend(page);
+    out.append(&mut beside);
+    out.append(&mut assets);
+    out
+}
+
+fn kind_of(path: &Path, name: &str, page_file: &str) -> Kind {
+    if name == page_file {
+        return Kind::PageFile;
+    }
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    match ext.as_str() {
+        "svg" => {
+            if head_of(path, 4096).is_some_and(|head| nocturne_ink::svg::is_ink(&head)) {
+                Kind::Ink
+            } else {
+                Kind::Svg
+            }
+        }
+        "mmd" | "mermaid" => Kind::Diagram,
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "jxl" => Kind::Picture,
+        "pdf" => Kind::Pdf,
+        "docx" | "xlsx" | "pptx" => Kind::Office,
+        "md" | "html" | "htm" | "txt" | "json" | "toml" | "csv" | "xml" | "yaml" | "yml" => Kind::Text,
+        _ => Kind::Other,
+    }
+}
+
+fn office_text(path: &Path) -> (String, bool) {
+    let Ok(file) = std::fs::File::open(path) else { return ("The package could not be opened.".into(), false) };
+    let Ok(mut archive) = zip::ZipArchive::new(file) else { return ("The file is not a readable Office Open XML package.".into(), false) };
+    let mut names = Vec::new();
+    let mut text = String::new();
+    for i in 0..archive.len() {
+        let Ok(mut item) = archive.by_index(i) else { continue };
+        let name = item.name().to_string();
+        if !name.ends_with(".xml") || (!name.contains("document") && !name.contains("sharedStrings") && !name.contains("/slide")) {
+            continue;
+        }
+        names.push(name.clone());
+        let mut bytes = Vec::new();
+        use std::io::Read;
+        let _ = item.read_to_end(&mut bytes);
+        let xml = String::from_utf8_lossy(&bytes);
+        let mut in_tag = false;
+        for ch in xml.chars() {
+            match ch {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                _ if !in_tag => text.push(ch),
+                _ => {}
+            }
+        }
+        text.push_str("\n\n");
+        if text.len() >= MAX_SHOWN {
+            // Cut at a character's edge: a character across the limit panicked the cut, and
+            // opening the document in the code view took the window down (issue #125).
+            text.truncate(text.floor_char_boundary(MAX_SHOWN));
+            return (format!("Package parts: {}\n\n{}", names.join(", "), text), true);
+        }
+    }
+    if text.trim().is_empty() {
+        text = "The package contains no readable text parts.".into();
+    }
+    (format!("Package parts: {}\n\n{}", names.join(", "), text), false)
+}
+
+fn pdf_text(path: &Path) -> (String, bool) {
+    let (raw, cut) = read_for_view(path);
+    let printable: String = raw.chars().map(|c| if c.is_control() && c != '\n' && c != '\r' && c != '\t' { ' ' } else { c }).collect();
+    (format!("PDF source inspection (embedded text may be compressed):\n\n{printable}"), cut)
+}
+
+/// The name egui keeps a picture of the code view under. egui keeps a picture by this name
+/// and draws the kept one when the name comes again, so it carries the file's whole path and
+/// its size and time: two pages' `assets/a.png` are two pictures, and a picture that changed
+/// is drawn anew. Named by its file name alone, the last page's picture was shown for the
+/// next page's (issue #135).
+fn picture_uri(path: &Path) -> String {
+    let meta = std::fs::metadata(path).ok();
+    let bytes = meta.as_ref().map_or(0, std::fs::Metadata::len);
+    // The browser build's file shim has no modification time; there the size alone tells.
+    #[cfg(not(target_arch = "wasm32"))]
+    let nanos = meta.and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
+    #[cfg(target_arch = "wasm32")]
+    let nanos = 0u128;
+    format!("bytes://source-view/{}#{bytes}-{nanos}", path.display())
+}
+
+fn attachment_icon_name(name: &str) -> String {
+    #[cfg(target_os = "windows")]
+    let extension = ".png";
+    #[cfg(not(target_os = "windows"))]
+    let extension = ".svg";
+    format!("{name}{extension}")
+}
+
+/// The first `want` bytes of a file as text, for looking at a head without reading a
+/// drawing that may be megabytes.
+fn head_of(path: &Path, want: usize) -> Option<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buffer = vec![0u8; want];
+    let read = file.read(&mut buffer).ok()?;
+    buffer.truncate(read);
+    Some(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+/// Reads a file for the viewer, cut to [`MAX_SHOWN`]. Returns the text and whether it was
+/// cut, so the view can say so rather than pretending that is the whole file.
+pub fn read_for_view(path: &Path) -> (String, bool) {
+    match head_of(path, MAX_SHOWN + 1) {
+        Some(text) if text.len() > MAX_SHOWN => (text.chars().take(MAX_SHOWN).collect(), true),
+        Some(text) => (text, false),
+        None => (String::new(), false),
+    }
+}
+
+/// How large a file is, in words a person reads rather than a number of bytes.
+pub fn size_text(bytes: u64) -> String {
+    match bytes {
+        0..=1023 => format!("{bytes} B"),
+        1024..=1_048_575 => format!("{} KB", bytes.div_ceil(1024)),
+        _ => format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0)),
+    }
+}
+
+/// Draws the view.
+pub fn show(ui: &mut Ui, state: &mut State, entries: &[Entry], dir: &Path, t: &Tokens, height: f32) -> Out {
+    let mut out = Out::default();
+    if state.dir.as_deref() != Some(dir) {
+        // Every page's file is `index.md` or `index.html`, so the name alone cannot say that
+        // the text in hand is from this page.
+        let width = if state.list_width > 0.0 { state.list_width } else { DEFAULT_LIST_WIDTH };
+        *state = State { dir: Some(dir.to_path_buf()), list_width: width, ..State::default() };
+    }
+    let page_file = entries.first().filter(|e| e.kind == Kind::PageFile).map(|e| e.name.clone());
+    if state.picked.is_none() || !entries.iter().any(|e| Some(&e.name) == state.picked.as_ref()) {
+        state.picked = page_file.clone().or_else(|| entries.first().map(|e| e.name.clone()));
+        state.loaded = None;
+    }
+
+    ui.horizontal_top(|ui| {
+        // ---- the list ----
+        let available = ui.available_width();
+        state.list_width = clamp_list_width(state.list_width.max(DEFAULT_LIST_WIDTH), available);
+        let list_width = state.list_width;
+        ui.allocate_ui_with_layout(vec2(list_width, height), egui::Layout::top_down(egui::Align::LEFT), |ui| {
+            let list_surface = ui.interact(ui.max_rect(), ui.id().with("file-list-surface"), egui::Sense::click());
+            list_surface.context_menu(|ui| {
+                if floating::menu_row(ui, Some(Glyph::Icon(Icon::Attach)), crate::tl_id!("ui.add_file"), t).clicked() {
+                    log::debug!("source file-list add file requested");
+                    out.file_action = Some(FileAction::AddFile);
+                    ui.close();
+                }
+            });
+            ui.set_min_width(list_width);
+            ui.set_max_width(list_width);
+            ui.label(egui::RichText::new(crate::tl_id!("ui.files_in_this_page")).small().color(t.muted));
+            ui.add_space(2.0);
+            egui::ScrollArea::vertical().id_salt("code-files").max_height(height - 24.0).show(ui, |ui| {
+                for entry in entries {
+                    let picked = state.picked.as_deref() == Some(entry.name.as_str());
+                    let row = row(ui, entry, picked, t, &mut out.file_action, dir);
+                    if row.clicked() {
+                        state.picked = Some(entry.name.clone());
+                        state.loaded = None;
+                        state.as_code = false;
+                    }
+                }
+            });
+        });
+        let divider =
+            ui.allocate_rect(Rect::from_min_size(ui.cursor().min, vec2(8.0, height)), Sense::drag()).on_hover_cursor(CursorIcon::ResizeHorizontal);
+        ui.painter().rect_filled(divider.rect.shrink2(vec2(3.0, 0.0)), 1.0, if divider.hovered() || divider.dragged() { t.accent } else { t.faint });
+        if divider.dragged() {
+            state.list_width = clamp_list_width(state.list_width + divider.drag_delta().x, available);
+        }
+
+        // ---- the file that is picked ----
+        let Some(name) = state.picked.clone() else { return };
+        let Some(entry) = entries.iter().find(|e| e.name == name) else { return };
+        // Delete belongs to the selected asset row in the source view, not to the
+        // source editor. Never consume it while a text editor has keyboard focus.
+        if entry.kind != Kind::PageFile
+            && !ui.ctx().egui_wants_keyboard_input()
+            && ui.input(|input| input.key_pressed(Key::Delete) || input.key_pressed(Key::Backspace))
+        {
+            out.file_action = delete_action(entry);
+        }
+        let width = ui.available_width();
+        ui.allocate_ui_with_layout(vec2(width, height), egui::Layout::top_down(egui::Align::LEFT), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(&entry.name).monospace().strong());
+                ui.label(egui::RichText::new(size_text(entry.bytes)).small().color(t.muted));
+                if !entry.used {
+                    ui.label(egui::RichText::new(crate::tl_id!("ui.not_used_by_the_page")).small().color(t.warn));
+                }
+                if !entry.kind.editable() || (state.cut && state.loaded.as_deref() == Some(entry.name.as_str())) {
+                    ui.label(egui::RichText::new(crate::tl_id!("ui.read_only")).small().color(t.muted));
+                }
+                if entry.kind != Kind::PageFile && ui.small_button(crate::tl_id!("ui.delete_file")).clicked() {
+                    log::debug!("source view delete requested from header: file={:?}", entry.name);
+                    out.file_action = delete_action(entry);
+                }
+            });
+            ui.separator();
+            match entry.kind {
+                Kind::Picture => {
+                    let path = dir.join(entry.name.replace('/', std::path::MAIN_SEPARATOR_STR));
+                    match std::fs::read(&path) {
+                        Ok(bytes) => {
+                            egui::ScrollArea::both().id_salt("code-picture").max_height(height - 40.0).show(ui, |ui| {
+                                ui.add(egui::Image::from_bytes(picture_uri(&path), bytes).max_width(ui.available_width()).fit_to_original_size(1.0));
+                            });
+                        }
+                        Err(_) => {
+                            ui.label(egui::RichText::new(crate::tl_id!("ui.this_picture_cannot_be_shown_here")).color(t.muted));
+                        }
+                    }
+                }
+                Kind::Other => {
+                    ui.label(egui::RichText::new(crate::tl_id!("ui.nothing_here_can_show_this_kind_of_file")).color(t.muted));
+                    ui.label(egui::RichText::new(crate::tl_id!("ui.it_is_listed_so_the_page_s_folder_is_not_a_secret")).small().color(t.muted));
+                }
+                Kind::Office | Kind::Pdf => {
+                    let path = dir.join(entry.name.replace('/', std::path::MAIN_SEPARATOR_STR));
+                    ui.label(egui::RichText::new(crate::tl_id!("ui.document_renderer_coming_soon")).small().color(t.muted));
+                    let icon = attachment_icon_name(&entry.name);
+                    let icon_path = dir.join(icon.replace('/', std::path::MAIN_SEPARATOR_STR));
+                    let fallback_path = dir.join(format!("{}.svg", entry.name).replace('/', std::path::MAIN_SEPARATOR_STR));
+                    if let Ok((uri, bytes)) = std::fs::read(&icon_path)
+                        .map(|bytes| (picture_uri(&icon_path), bytes))
+                        .or_else(|_| std::fs::read(&fallback_path).map(|bytes| (picture_uri(&fallback_path), bytes)))
+                    {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Image::from_bytes(uri, bytes).fit_to_exact_size(vec2(72.0, 84.0)));
+                            ui.vertical(|ui| {
+                                ui.label(egui::RichText::new(&entry.name).strong());
+                                ui.label(
+                                    egui::RichText::new(if entry.kind == Kind::Pdf {
+                                        crate::tl_id!("ui.pdf_document")
+                                    } else {
+                                        crate::tl_id!("ui.office_document")
+                                    })
+                                    .color(t.muted),
+                                );
+                                ui.label(egui::RichText::new(crate::tl_id!("ui.text_inspection_is_shown_below")).small().color(t.muted));
+                            });
+                        });
+                    } else {
+                        ui.label(egui::RichText::new(crate::tl_id!("ui.no_generated_preview_icon_is_available")).color(t.warn));
+                    }
+                    ui.separator();
+                    if state.loaded.as_deref() != Some(entry.name.as_str()) {
+                        let (text, cut) = if entry.kind == Kind::Office { office_text(&path) } else { pdf_text(&path) };
+                        state.text = text;
+                        state.loaded = Some(entry.name.clone());
+                        state.dirty = false;
+                        state.cut = cut;
+                        if cut {
+                            state.text.push_str("\n\n... the rest of this file is not shown here.");
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(if entry.kind == Kind::Pdf {
+                                crate::tl_id!("ui.pdf_text_inspection")
+                            } else {
+                                crate::tl_id!("ui.office_text_inspection")
+                            })
+                            .strong(),
+                        );
+                        if ui.button(crate::tl_id!("ui.open_with_associated_app")).clicked() {
+                            log::info!("source viewer opening associated application: file={:?}", path);
+                            let _ = crate::app::open_file_for_viewer(&path);
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(crate::tl_id!("ui.read_only_text_extraction_full_document_rendering_is_coming_soon"))
+                            .small()
+                            .color(t.muted),
+                    );
+                    egui::ScrollArea::vertical().id_salt("code-binary-text").show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut state.text)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY)
+                                .interactive(false),
+                        );
+                    });
+                }
+                // A drawing is drawn, with its code one click away: a wall of numbers
+                // says nothing about what is on the page.
+                Kind::Ink if !state.as_code => {
+                    ui.horizontal(|ui| {
+                        if ui.small_button(crate::tl_id!("ui.show_the_code")).clicked() {
+                            state.as_code = true;
+                        }
+                        let strokes = read_for_view(&dir.join(&entry.name)).0.matches("<path").count();
+                        ui.label(egui::RichText::new(crate::i18n::format_count_id("ui.n_stroke_n_strokes", strokes as u64)).small().color(t.muted));
+                    });
+                    let room = egui::vec2(ui.available_width(), (height - 70.0).max(80.0));
+                    let (rect, _) = ui.allocate_exact_size(room, Sense::hover());
+                    ui.painter().rect_filled(rect, 2.0, t.editor);
+                    match std::fs::read_to_string(dir.join(&entry.name)).ok().and_then(|text| nocturne_ink::svg::read(&text).ok()) {
+                        Some((drawing, _)) => {
+                            // Drawn to fit, so a sheet the size of a page can be seen in
+                            // the room the view has.
+                            let scale = (rect.width() / drawing.width.max(1.0)).min(rect.height() / drawing.height.max(1.0)).min(1.0);
+                            let painter = ui.painter().with_clip_rect(rect);
+                            for stroke in &drawing.strokes {
+                                let scaled = scale_stroke(stroke, scale);
+                                crate::inkpad::paint_stroke(&painter, rect.min, &scaled);
+                            }
+                        }
+                        None => {
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "This drawing cannot be read",
+                                egui::FontId::proportional(13.0),
+                                t.muted,
+                            );
+                        }
+                    }
+                }
+                Kind::PageFile | Kind::Ink | Kind::Svg | Kind::Text | Kind::Diagram => {
+                    if state.loaded.as_deref() != Some(entry.name.as_str()) {
+                        let (text, cut) = read_for_view(&dir.join(entry.name.replace('/', std::path::MAIN_SEPARATOR_STR)));
+                        state.text = text;
+                        state.loaded = Some(entry.name.clone());
+                        state.dirty = false;
+                        state.cut = cut;
+                        if cut {
+                            state.text.push_str("\n\n... the rest of this file is not shown here.");
+                        }
+                    }
+                    if entry.kind == Kind::Ink && ui.small_button(crate::tl_id!("ui.show_the_strokes")).clicked() {
+                        state.as_code = false;
+                    }
+                    if entry.kind == Kind::Svg {
+                        ui.label(egui::RichText::new(crate::tl_id!("ui.rendered_svg_preview")).small().color(t.muted));
+                        let preview_height = (ui.available_height() * 0.34).clamp(150.0, 320.0);
+                        let preview_room = egui::vec2(ui.available_width(), preview_height);
+                        egui::Frame::new().fill(t.editor).inner_margin(6.0).show(ui, |ui| {
+                            if let Some(uri) = crate::preview::image_uri(dir, &entry.name) {
+                                egui::ScrollArea::both().id_salt("code-svg-preview").max_height(preview_height - 12.0).show(ui, |ui| {
+                                    ui.add(egui::Image::new(uri).max_width(ui.available_width()).fit_to_original_size(1.0));
+                                });
+                            } else {
+                                ui.allocate_ui(preview_room, |ui| {
+                                    ui.centered_and_justified(|ui| {
+                                        ui.label(egui::RichText::new(crate::tl_id!("ui.this_svg_cannot_be_rendered_here")).color(t.muted));
+                                    });
+                                });
+                            }
+                        });
+                        ui.separator();
+                        ui.label(egui::RichText::new(crate::tl_id!("ui.svg_source")).small().color(t.muted));
+                    }
+                    let warning = match entry.kind {
+                        Kind::PageFile => Some("The whole file, head and all. The page is read again when the view closes."),
+                        Kind::Ink => Some("The pen's own readings are in this file. An edit that breaks them cannot be undone by the pen."),
+                        _ => None,
+                    };
+                    if let Some(words) = warning {
+                        ui.label(egui::RichText::new(words).small().color(t.muted));
+                    }
+                    let lang = Lang::of_file(&entry.name);
+                    let text_id = egui::Id::new(("code-text-edit", entry.name.as_str()));
+                    let find_id = egui::Id::new("code-find-query");
+                    // Keys for the Find bar, taken before any box sees them.
+                    if ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F)) {
+                        state.find.open = true;
+                        state.find.focus = true;
+                    }
+                    // Escape closes the bar from anywhere in the view, not only from its own box: a click
+                    // on one of its buttons has already taken the caret out of the box.
+                    if state.find.open && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                        state.find.open = false;
+                        state.find.select = !state.find.matches.is_empty();
+                    }
+                    if state.find.open {
+                        let (next, prev) = ui.input_mut(|i| {
+                            let prev = i.consume_key(Modifiers::SHIFT, Key::F3);
+                            (i.consume_key(Modifiers::NONE, Key::F3), prev)
+                        });
+                        if next && !state.find.matches.is_empty() {
+                            state.find.current = (state.find.current + 1) % state.find.matches.len();
+                            state.find.jump = true;
+                        }
+                        if prev && !state.find.matches.is_empty() {
+                            state.find.current = (state.find.current + state.find.matches.len() - 1) % state.find.matches.len();
+                            state.find.jump = true;
+                        }
+                    }
+                    // Colours and matches are found again only when the text, the format or the query changed.
+                    let colours_for = fingerprint(&[&state.text, lang.label()], false);
+                    if state.coloured_for != colours_for {
+                        state.coloured = highlight::spans(lang, &state.text);
+                        state.coloured_for = colours_for;
+                    }
+                    let found_in = fingerprint(&[&state.text, &state.find.query], state.find.case);
+                    if state.find.open && state.find.found_in != found_in {
+                        let before = state.find.matches.get(state.find.current).map(|m| m.0);
+                        state.find.matches = find_matches(&state.text, &state.find.query, state.find.case);
+                        state.find.found_in = found_in;
+                        // Stay on the match that was current if it is still there; else the first at or after the caret.
+                        let caret =
+                            egui::TextEdit::load_state(ui.ctx(), text_id).and_then(|s| s.cursor.char_range()).map_or(0, |r| r.primary.index.0);
+                        state.find.current = before
+                            .and_then(|b| state.find.matches.iter().position(|m| m.0 == b))
+                            .or_else(|| state.find.matches.iter().position(|m| m.0 >= caret))
+                            .unwrap_or(0);
+                        if !state.find.query.is_empty() {
+                            state.find.jump = true;
+                        }
+                    }
+                    let bar_room = if state.find.open { 34.0 } else { 0.0 };
+                    let font = egui::TextStyle::Monospace.resolve(ui.style());
+                    let base = ui.visuals().text_color();
+                    let shown: Vec<(usize, usize)> = if state.find.open { state.find.matches.clone() } else { Vec::new() };
+                    let current = (state.find.open && !shown.is_empty()).then_some(state.find.current);
+                    let spans = &state.coloured;
+                    let mut layouter = |ui: &Ui, text: &dyn egui::TextBuffer, wrap: f32| {
+                        ui.fonts_mut(|f| f.layout_job(colour_job(text.as_str(), spans, &shown, current, t, font.clone(), base, wrap)))
+                    };
+                    let jump = std::mem::take(&mut state.find.jump);
+                    let select = std::mem::take(&mut state.find.select);
+                    let target = state.find.matches.get(state.find.current).copied();
+                    let editable = entry.kind.editable() && !state.cut;
+                    egui::ScrollArea::vertical().id_salt("code-text").max_height((ui.available_height() - 6.0 - bar_room).max(120.0)).show(
+                        ui,
+                        |ui| {
+                            // Read only is a text box that cannot be typed in, not a disabled one: a disabled
+                            // box fades every colour, which is the opposite of what colouring a file is for.
+                            let edit = egui::TextEdit::multiline(&mut state.text)
+                                .id(text_id)
+                                .code_editor()
+                                .interactive(editable)
+                                .layouter(&mut layouter)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(26)
+                                .show(ui);
+                            if edit.response.changed() {
+                                state.dirty = true;
+                                out.wrote = Some((entry.name.clone(), state.text.clone()));
+                            }
+                            if let Some((from, to)) = target {
+                                if jump {
+                                    let r = edit.galley.pos_from_cursor(CCursor::new(from)).translate(edit.galley_pos.to_vec2());
+                                    ui.scroll_to_rect(r.expand2(vec2(0.0, 24.0)), Some(egui::Align::Center));
+                                }
+                                if select {
+                                    let mut st = egui::TextEdit::load_state(ui.ctx(), text_id).unwrap_or_default();
+                                    st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(from), CCursor::new(to))));
+                                    st.store(ui.ctx(), text_id);
+                                    ui.memory_mut(|m| m.request_focus(text_id));
+                                }
+                            }
+                        },
+                    );
+                    if state.find.open {
+                        match find_bar(ui, &mut state.find, find_id, t) {
+                            FindAct::Next if !state.find.matches.is_empty() => {
+                                state.find.current = (state.find.current + 1) % state.find.matches.len();
+                                state.find.jump = true;
+                            }
+                            FindAct::Previous if !state.find.matches.is_empty() => {
+                                state.find.current = (state.find.current + state.find.matches.len() - 1) % state.find.matches.len();
+                                state.find.jump = true;
+                            }
+                            FindAct::Close => {
+                                state.find.open = false;
+                                state.find.select = !state.find.matches.is_empty();
+                            }
+                            FindAct::Edited => state.find.found_in = 0,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
+    });
+    out
+}
+
+/// The same stroke at a different size, for drawing a whole sheet in a small space.
+fn scale_stroke(stroke: &nocturne_ink::Stroke, scale: f32) -> nocturne_ink::Stroke {
+    let mut out = nocturne_ink::Stroke::with_gain(stroke.tool, stroke.colour, (stroke.width * scale).max(0.4), stroke.gain);
+    for dab in &stroke.dabs {
+        out.add(nocturne_ink::Dab { x: dab.x * scale, y: dab.y * scale, pressure: dab.pressure });
+    }
+    out
+}
+
+/// One row of the list: the name, and what the file is.
+fn row(ui: &mut Ui, entry: &Entry, picked: bool, t: &Tokens, action: &mut Option<FileAction>, page_dir: &Path) -> egui::Response {
+    let height = 20.0;
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
+    if picked || resp.hovered() {
+        ui.painter().rect_filled(rect, 3.0, if picked { t.row_selected } else { t.row_hover });
+    }
+    let colour = if entry.used { t.text } else { t.muted };
+    let at = egui::pos2(rect.min.x + 6.0, rect.center().y);
+    ui.painter().text(at, egui::Align2::LEFT_CENTER, &entry.name, egui::FontId::monospace(12.0), colour);
+    let right = egui::pos2(rect.max.x - 6.0, rect.center().y);
+    ui.painter().text(right, egui::Align2::RIGHT_CENTER, size_text(entry.bytes), egui::FontId::proportional(10.0), t.muted);
+    let enabled = ui.is_enabled();
+    let label = format!("{} ({})", entry.name, size_text(entry.bytes));
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, picked, label.as_str()));
+    let full = page_dir.join(entry.name.replace('/', std::path::MAIN_SEPARATOR_STR));
+    let name = entry.name.clone();
+    resp.context_menu(|ui| {
+        if floating::menu_row(ui, Some(Glyph::Icon(Icon::Link)), crate::tl_id!("ui.copy_full_path"), t).clicked() {
+            *action = Some(FileAction::CopyPath(full.to_string_lossy().into_owned()));
+            ui.close();
+        }
+        if floating::menu_row(ui, Some(Glyph::Icon(Icon::Folder)), crate::tl_id!("ui.open_in_folder"), t).clicked() {
+            *action = Some(FileAction::OpenFolder(full.parent().unwrap_or(page_dir).to_path_buf()));
+            ui.close();
+        }
+        if floating::menu_row(ui, Some(Glyph::Icon(Icon::Attach)), crate::tl_id!("ui.open_using_shell"), t).clicked() {
+            *action = Some(FileAction::OpenShell(full.clone()));
+            ui.close();
+        }
+        if entry.kind != Kind::PageFile {
+            floating::menu_separator(ui, t);
+            if floating::menu_row(ui, Some(Glyph::Mark(Mark::Delete)), crate::tl_id!("ui.delete"), t).clicked() {
+                *action = Some(FileAction::Delete(name.strip_prefix("assets/").unwrap_or(&name).to_string()));
+                ui.close();
+            }
+        }
+    });
+    resp.on_hover_text(if entry.used {
+        entry.name.clone()
+    } else {
+        crate::i18n::format_message_id("ui.name_not_used_by_the_page", &[("name", &entry.name)])
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #125: the text of a Word document with a character across the shown limit is
+    /// cut before that character and said to be cut, rather than panicking.
+    #[test]
+    fn office_text_is_cut_at_a_characters_edge() {
+        use std::io::Write;
+        let t = nocturne_store::testing::TempDir::new("codeview-office-unicode");
+        let path = t.path().join("long.docx");
+        let words = "a".repeat(MAX_SHOWN - 1) + "\u{e9}";
+        let xml = format!(
+            "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body><w:p><w:r><w:t>{words}</w:t></w:r></w:p></w:body></w:document>"
+        );
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).expect("docx"));
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("word/document.xml", options).expect("part");
+        zip.write_all(xml.as_bytes()).expect("write");
+        zip.finish().expect("finish");
+
+        let (text, cut) = office_text(&path);
+        assert!(cut, "the view says the text was cut");
+        assert!(text.contains(&"a".repeat(1000)), "and shows the start of it");
+        assert!(!text.contains('\u{e9}'), "the character across the limit is left out whole");
+    }
+
+    /// Shows the code view for the page file `index.md` in `dir`, types `typed` into its editor,
+    /// and gives what the view asked to be written.
+    fn type_into_page_file(dir: &Path, typed: &str) -> (State, Option<(String, String)>) {
+        let ctx = egui::Context::default();
+        let tokens = crate::theme::Theme::DEFAULT.tokens();
+        let entries = files(dir, "index.md", &[]);
+        let mut state = State::default();
+        let mut wrote = None;
+        let text_id = egui::Id::new(("code-text-edit", "index.md"));
+        for frame in 0..4 {
+            let mut input =
+                egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1200.0, 900.0))), ..Default::default() };
+            if frame == 2 {
+                input.events.push(egui::Event::Text(typed.to_string()));
+            }
+            if frame == 1 {
+                ctx.memory_mut(|m| m.request_focus(text_id));
+            }
+            let mut output = ctx.run_ui(input, |ui| {
+                let out = show(ui, &mut state, &entries, dir, &tokens, 800.0);
+                if out.wrote.is_some() {
+                    wrote = out.wrote;
+                }
+            });
+            output.textures_delta.clear();
+        }
+        (state, wrote)
+    }
+
+    /// Issue #124: a file longer than the view shows is read-only. Typing in its cut text used to
+    /// write that text over the whole file, losing everything after the cut, notice and all.
+    #[test]
+    fn a_file_cut_for_the_view_is_not_written_back() {
+        let t = nocturne_store::testing::TempDir::new("codeview-cut-read-only");
+        let dir = t.path().join("page");
+        std::fs::create_dir_all(&dir).expect("page folder");
+        let whole = format!("# Long\n\n{}\n\nEND_SENTINEL\n", "words ".repeat(MAX_SHOWN / 5));
+        std::fs::write(dir.join("index.md"), &whole).expect("page file");
+        let (state, wrote) = type_into_page_file(&dir, "Z");
+        assert!(state.cut, "the file is longer than the view shows");
+        assert_eq!(wrote, None, "nothing typed in a cut file is written");
+        assert_eq!(std::fs::read_to_string(dir.join("index.md")).expect("page file"), whole, "the file is whole");
+
+        // The same steps on a file that fits do type into it, so the steps themselves work.
+        std::fs::write(dir.join("index.md"), "# Short\n").expect("page file");
+        let (state, wrote) = type_into_page_file(&dir, "Z");
+        assert!(!state.cut);
+        assert!(wrote.is_some_and(|(name, text)| name == "index.md" && text.contains('Z')), "a whole file can be typed in");
+    }
+
+    /// Issue #135: two pages' pictures of the same name are kept as two pictures, and a
+    /// picture that is replaced is drawn anew. The code view named each picture by its file
+    /// name alone, so egui drew the first page's `assets/a.png` for the second page's.
+    #[test]
+    fn pictures_of_the_same_name_on_two_pages_are_two_pictures() {
+        let t = nocturne_store::testing::TempDir::new("codeview-picture-names");
+        let red = t.path().join("red").join("assets").join("a.png");
+        let lime = t.path().join("lime").join("assets").join("a.png");
+        for (path, bytes) in [(&red, b"red picture".as_slice()), (&lime, b"lime picture".as_slice())] {
+            std::fs::create_dir_all(path.parent().expect("assets")).expect("folders");
+            std::fs::write(path, bytes).expect("picture");
+        }
+        assert_ne!(picture_uri(&red), picture_uri(&lime), "the page's folder is part of the name");
+        assert_eq!(picture_uri(&red), picture_uri(&red), "the same picture keeps its name between frames");
+
+        let before = picture_uri(&red);
+        std::fs::write(&red, b"a replaced, longer picture").expect("replace");
+        assert_ne!(picture_uri(&red), before, "a replaced picture is a new one");
+    }
+
+    #[test]
+    fn sizes_read_like_words_not_bytes() {
+        assert_eq!(size_text(0), "0 B");
+        assert_eq!(size_text(999), "999 B");
+        assert_eq!(size_text(2048), "2 KB");
+        assert_eq!(size_text(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    #[test]
+    fn the_page_file_comes_first_and_an_unnamed_file_is_an_orphan() {
+        let t = nocturne_store::testing::TempDir::new("codeview-files");
+        let dir = t.path().join("page");
+        std::fs::create_dir_all(dir.join("assets")).expect("folders");
+        std::fs::write(dir.join("index.html"), "<html></html>").expect("page file");
+        std::fs::write(dir.join("_node.toml"), "title = \"P\"").expect("node");
+        std::fs::write(dir.join("ink.svg"), "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:nc=\"https://nocturne.org/ns/ink\"></svg>")
+            .expect("ink");
+        std::fs::write(dir.join("assets").join("nocturne.png"), [0u8; 10]).expect("picture");
+
+        let named = vec!["ink.svg".to_string()];
+        let rows = files(&dir, "index.html", &named);
+        let names: Vec<&str> = rows.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["index.html", "_node.toml", "ink.svg", "assets/nocturne.png"], "the page file first, then beside it, then assets");
+
+        let by = |name: &str| rows.iter().find(|e| e.name == name).cloned().expect("row");
+        assert_eq!(by("index.html").kind, Kind::PageFile);
+        assert_eq!(by("ink.svg").kind, Kind::Ink, "ours by its namespace");
+        assert_eq!(by("assets/nocturne.png").kind, Kind::Picture);
+        assert_eq!(by("_node.toml").kind, Kind::Text);
+        assert!(by("ink.svg").used, "the page names the drawing");
+        assert!(!by("assets/nocturne.png").used, "nothing names the picture: an orphan");
+        assert!(by("index.html").used, "the page file is never an orphan");
+
+        assert!(Kind::PageFile.editable() && Kind::Ink.editable(), "ours can be typed in");
+        assert!(!Kind::Picture.editable() && !Kind::Text.editable() && !Kind::Other.editable());
+    }
+
+    use crate::theme::Theme;
+
+    /// The text one section of a job covers.
+    fn piece<'a>(job: &'a LayoutJob, s: &egui::text::LayoutSection) -> &'a str {
+        &job.text[s.byte_range.start.0..s.byte_range.end.0]
+    }
+
+    #[test]
+    fn matches_are_found_by_character_position_in_order_and_do_not_overlap() {
+        assert_eq!(find_matches("one two one", "one", false), vec![(0, 3), (8, 11)]);
+        assert_eq!(find_matches("aaaa", "aa", false), vec![(0, 2), (2, 4)], "not overlapping");
+        assert_eq!(find_matches("abc", "", false), Vec::<(usize, usize)>::new(), "an empty query finds nothing");
+        assert_eq!(find_matches("ab", "abc", false), Vec::<(usize, usize)>::new());
+        // Positions are characters, which is how the text box counts: 'é' is one.
+        assert_eq!(find_matches("é-é", "é", false), vec![(0, 1), (2, 3)]);
+        assert_eq!(find_matches("日本語 日本語", "日本", false), vec![(0, 2), (4, 6)]);
+    }
+
+    #[test]
+    fn case_matters_only_when_asked() {
+        assert_eq!(find_matches("Diagram diagram DIAGRAM", "diagram", false).len(), 3);
+        assert_eq!(find_matches("Diagram diagram DIAGRAM", "diagram", true), vec![(8, 15)]);
+        assert_eq!(find_matches("ÉCOLE école", "école", false).len(), 2, "accented letters fold too");
+    }
+
+    #[test]
+    fn a_search_for_one_letter_in_a_big_file_is_cut_short() {
+        let text = "a".repeat(MAX_MATCHES * 3);
+        assert_eq!(find_matches(&text, "a", false).len(), MAX_MATCHES);
+    }
+
+    #[test]
+    fn byte_ranges_follow_the_characters_across_multibyte_letters() {
+        let text = "añb日c";
+        // characters: a=0 ñ=1 b=2 日=3 c=4
+        assert_eq!(byte_ranges(text, &[(0, 1), (1, 2), (3, 4)]), vec![(0, 1), (1, 3), (4, 7)]);
+        for (a, b) in byte_ranges(text, &[(0, 5), (2, 3)]) {
+            assert!(text.is_char_boundary(a) && text.is_char_boundary(b), "{a} {b}");
+        }
+        assert_eq!(byte_ranges(text, &[(0, 5)]), vec![(0, text.len())]);
+    }
+
+    #[test]
+    fn the_coloured_text_is_the_same_text_and_marks_the_matches() {
+        let t = Theme::DEFAULT.tokens();
+        let text = "<p class=\"nc\">héllo hé</p>";
+        let spans = highlight::spans(Lang::Html, text);
+        let found = find_matches(text, "hé", false);
+        let job = colour_job(text, &spans, &found, Some(1), &t, egui::FontId::monospace(13.0), Color32::BLACK, 500.0);
+        assert_eq!(job.text, text, "nothing is added or lost by colouring");
+        let (all, here) = match_colours(&t);
+        let marked: Vec<(&str, Color32)> =
+            job.sections.iter().filter(|s| s.format.background != Color32::TRANSPARENT).map(|s| (piece(&job, s), s.format.background)).collect();
+        assert_eq!(marked, vec![("hé", all), ("hé", here)], "two matches, the second the current one");
+        assert!(job.sections.iter().any(|s| piece(&job, s) == "class" && s.format.color == class_colour(Class::Attr, &t)));
+    }
+
+    #[test]
+    fn colouring_plain_text_and_empty_text_makes_a_valid_job() {
+        let t = Theme::DEFAULT.tokens();
+        let job = colour_job("", &[], &[], None, &t, egui::FontId::monospace(13.0), Color32::BLACK, 100.0);
+        assert!(job.text.is_empty());
+        let job = colour_job("plain words", &[], &[], None, &t, egui::FontId::monospace(13.0), Color32::BLACK, 100.0);
+        assert_eq!(job.text, "plain words");
+    }
+
+    #[test]
+    fn every_syntax_colour_and_match_background_reads_in_every_theme() {
+        use crate::theme::contrast;
+        let classes = [
+            Class::Tag,
+            Class::Attr,
+            Class::Str,
+            Class::Comment,
+            Class::Number,
+            Class::Keyword,
+            Class::Punct,
+            Class::Heading,
+            Class::Emphasis,
+            Class::Code,
+            Class::Link,
+            Class::Meta,
+        ];
+        for theme in Theme::all() {
+            let t = theme.tokens();
+            for c in classes {
+                let got = contrast(class_colour(c, &t), t.editor);
+                assert!(got >= 3.0, "{}: {c:?} on the editor is {got:.2}", theme.label());
+            }
+            let (all, here) = match_colours(&t);
+            for (name, bg) in [("a match", all), ("the current match", here)] {
+                assert!(contrast(t.text, bg) >= 4.5, "{}: the text on {name} is {:.2}", theme.label(), contrast(t.text, bg));
+            }
+        }
+    }
+}

@@ -1,0 +1,629 @@
+# Known gaps and risks
+
+Last reviewed: 2026-11-17. An honest list of what is missing or unproven. Remove an item when
+it is fixed and tested, not when it is promised.
+
+## Browser demo storage
+
+The standalone demo and invitation sessions keep notebook files only in the current tab.
+They show a session-only notice and use **Kept in this tab**, rather than **Saved**.
+Reloading or closing the tab still discards those files; this is not durable notebook storage.
+Standalone preferences can be retained separately in browser local storage.
+
+After note edits or notebook-file changes, the demo requests the browser's normal close/reload
+confirmation. Autosaving into the virtual file system does not clear that warning. Changing
+preferences alone does not arm it. Browser dialogs require user interaction and are not reliable
+for every mobile shutdown path, so copy any notes you want to keep before leaving the demo.
+Playground hosts with the Files API continue using their existing persistence path.
+
+## Android
+
+The Android app (`android/`, from 2026-11-13) runs the same window as the desktop in an APK
+built by the Packaging workflow. What it does not do yet, each said in the window where it shows:
+
+- **Not run on a device by the change that added it.** The APK is built, signed and checked
+  (`android/test.sh`), and the platform-neutral parts are tested on every CI run, but no emulator
+  or phone was available to that change. Startup, drawing, the soft keyboard and the stylus need a
+  device check before the first release that claims Android.
+- **No file pickers.** Open a notebook folder, Import, Add file or picture, Print out and Export
+  telemetry say "Android cannot show this file dialog yet". Android's pickers (the Storage Access
+  Framework) need a Java shell, which the APK does not have.
+- **No system clipboard.** Copy and paste work inside Nocturne (egui's own clipboard), not with
+  other apps. Android's clipboard is a Java service.
+- **Notebooks live in the app's own storage**, `Android/data/io.github.antimajorana.nocturne/files/Nocturne`.
+  Android removes that folder with the app; Android 10 and later ask whether to keep it. Folders
+  elsewhere (synced Drive, OneDrive or Syncthing folders) cannot be opened yet.
+- **Typing is key by key.** The soft keyboard's keys reach the page, but composing (Chinese,
+  Japanese, Korean input, swipe typing, autocorrect) needs GameActivity text input, which winit
+  0.30 does not deliver yet.
+- **No screen reader.** egui's accessibility bridge needs GameActivity on Android.
+- **arm64 only.** No 32-bit ARM or x86_64 (emulator, Chromebook) build.
+- **Until the repository has a release key**, each nightly APK is signed with its own key and
+  cannot update another night's in place (`docs/releasing.md`, Android signing).
+
+The phone-width layout (`crates/ui-egui/src/compact.rs`, issue #12) applies to any window
+narrower than 600 points, on Android, a narrow desktop window or the browser build on a phone.
+
+## iPadOS / iOS
+
+The iPadOS / iOS crate (`ios/`, added 2026-11-16) hosts the same `NocturneApp` window over
+`eframe` + `wgpu` (Metal), stores notebooks under the app's Documents folder (`Files > On My
+iPad > Nocturne`), bridges the system clipboard via `UIPasteboard` (`NocturneApp::with_clipboard`),
+imports shared documents placed in `Documents/Inbox/` (Share > Nocturne), and receives Apple Pencil
+/ touch pressure forwarded by `egui-winit`. What is missing or unproven:
+
+- **Native UIKit bridges are built but not yet run on physical hardware.** `ios/src/app.rs`
+  attaches four bridges to the eframe view at launch: finger-only `UIPanGestureRecognizer` and
+  `UIPinchGestureRecognizer` (`gestures.rs`, `allowedTouchTypes` direct, so the Pencil bypasses
+  them and draws), `UIPencilInteraction` double-tap and iPadOS 17.5+ squeeze calling
+  `ink.toggle_eraser` (`pencil.rs`), a `UITextInput` / `UIKeyInput` responder with
+  `UIIndirectScribbleInteraction` (`text_input.rs`), and `UIEditMenuInteraction` with a
+  `UIMenuController` fallback for Cut, Copy, Paste, Select All and Delete (`edit_menu.rs`). The
+  shared tablet state machines (`Stylus`, scroll-vs-draw, `ink.toggle_eraser`,
+  `ink.finger_drawing`, the docked formatting bar) and the bridges' pure-Rust state pass the
+  automated tests, and the `iOS IPA` workflow builds the `.ipa` and runs a Simulator smoke test.
+  What only the device can show is still unchecked: palm rejection, Pencil double-tap and
+  squeeze, Scribble, the soft keyboard and edit menu, Share-sheet import and Magic Keyboard
+  input on a physical iPad (`iPad13,16`, iPadOS 26.4.1).
+- **Known bridge gaps from the 2026-11-18 review, left for the device.** A review of the branch
+  found these and they were not changed blind, because only an iPad can show whether a change
+  helps:
+  - Moving the caret from UIKit (arrow keys on a Magic Keyboard, the trackpad, a tap that
+    UIKit's text system handles) updates only the bridge's own text model:
+    `setSelectedTextRange:` in `text_input.rs` does not move the app's caret. The bridge's text
+    window is also not reset when the app's caret moves, a paste lands, or input switches
+    between the page and an egui field.
+  - `gestures.rs` mixes UIKit points with egui points, which differ when the Interface size
+    setting is not 100%.
+  - A resting palm can start the native one-finger pan while the Pencil draws, and the Pencil
+    cannot start a stroke while a finger or palm that touched first is still down
+    (`inkpad.rs`, Write mode switching inks at the palm's position).
+  - The pinch-zoom anchor treats the page column's origin as fixed, but it moves with zoom.
+  - The first-responder request is made only when focus is first wanted and is not retried.
+  - The edit menu's anchor rect is given in egui points where UIKit expects view points, and
+    its titles (Cut, Copy, Paste, Select All, Delete) are English strings, not i18n ids.
+- **No desktop folder or file picker.** Open a notebook folder, Import, Add file or picture, Print
+  out, Save picture as, and Export telemetry use the `filepicker.ios.rs` stand-in, returning no
+  selection and posting a status notice pointing to `Files > On My iPad > Nocturne` or
+  `Share > Nocturne`.
+- **No external folder reveal or attachment launcher.** Revealing a folder or opening a linked
+  attachment in an external viewer returns `Unsupported` instead of spawning a desktop file
+  manager (`open_folder` and `open_file_for_viewer`); manage notebooks in the Files app instead.
+- **No desktop font catalog or in-app self-updater.** System font discovery and GitHub release
+  downloads remain desktop-only (`linux`, `windows`, `macos`).
+- **Apple keyboard shortcuts and narrow screens.** External Magic Keyboard / Bluetooth shortcuts
+  (`Cmd+N`, `Cmd+Alt+M`, `Cmd+Alt+[`, `Cmd+Alt+]`) match `macos` and `ios`, while narrow iPhone
+  screens use the same < 600-point compact layout as Android.
+
+## Product
+
+- **Ctrl+A, Ctrl+C, Ctrl+X and Ctrl+V reach the words**, from 2026-10-19. None of them was
+  bound anywhere in the window before that: a left-to-right paragraph is an egui text box
+  and egui answered them by itself, so the gap only showed where egui was not drawing. That
+  is a lot of places. In a right-to-left paragraph, which Nocturne draws itself, Ctrl+C did
+  nothing and Ctrl+A selected nothing. A selection spanning paragraphs belongs to no text
+  box, so neither did it. And nothing at all answered paste: boxes answer Ctrl+C and Ctrl+X
+  in `containers.rs`, no key answered Ctrl+V, so a box that had been copied could not be
+  pasted into an empty one and the ribbon's Paste button was the only way in. The keys are
+  read once a frame in `app::clipboard_keys` and sent to the same handlers the ribbon uses.
+  Nothing is done while an egui text box holds the keyboard, or the words would be pasted
+  twice. **Not built:** Ctrl+A widening from the paragraph to the box and then to the page,
+  the way OneNote does; here it takes the paragraph and stops.
+
+- **Import is not finished.** It is a requirement, and the scope is import only
+  (owner's decision, 2026-10-17). `nocturne-cli import onenote` turns a folder of `.one`
+  section files into notebooks, section groups, sections, pages and sub-pages, with pictures
+  and attachments, in HTML or CommonMark + GFM. It was run on 443 real backup files (see
+  `docs/research/onenote-file-format/real-files.md`). Notebook and section colors are read from
+  `.onetoc2` when available and section colors from `.one` metadata; arbitrary source colors
+  map lossily to Nocturne's named palette. A `.onepkg` package, given on its own or found in
+  the folder, is unpacked (LZX or MSZIP cabinet) into a temporary folder named after it and
+  imported as a notebook of that name; the window's Import File does the same through the
+  OfficeIMO bridge. A package's names are checked so nothing is written outside that folder.
+  Still missing: section order, ink, tags, page dates, password-protected sections, and an
+  import command in the window for the built-in importer.
+  Underline and equation structure have nowhere to go in the page formats.
+- **Equations are KaTeX's TeX, not all of LaTeX.** No packages, no chemistry (`\ce`), no TikZ, and
+  no visual formula editor. The engine (RaTeX) is young and has one main author; it is pinned to
+  one version, and a smaller engine of our own is the fallback. Arabic, Hebrew and Chinese inside
+  `\text{}` are drawn in the page's font; how they line up with the maths is judged by eye only.
+- **Mermaid diagrams are drawn in the page.** The code view shows their source as text, and a diagram kept as a file of its own (`.mmd`) is listed there and is not drawn by the page. Saving the drawn picture beside the page
+  is not built, nor are zoom and pan, nor a double click: a single click opens the source. The renderer (`mermaid-rs-renderer`) is young, with one
+  main author, and pinned to one version. Large graphs are refused (150 lines), its pie, Gantt and
+  chart styling is plainer than Mermaid's own, and only what it can read is drawn. Vega-Lite charts
+  from data are not built.
+- **The page editor has edges.** Both formats are written on in their finished look, block by
+  block, and written back to the page's own format. But a page whose markup the writer cannot
+  reproduce exactly is opened read-only rather than risking it, and a table, a picture or a
+  horizontal rule cannot be edited in place: only the blocks around it.
+- **No bold or italic font.** egui bundles none; the preview uses colour and slant for emphasis.
+  A bundled font family is the fix and needs a licence check.
+- **Installed font selection is in progress.** The desktop font catalog can discover and load
+  regular installed faces. Fonts named by a page are registered for the editor and preview;
+  missing fonts are reported and fall back. The desktop ribbon can apply a family to a whole
+  selected line, selected container, safely mapped partial selection, or text typed at the
+  caret, including safely mapped selections across paragraphs. Selections that cannot be
+  mapped without losing formatting are refused.
+  Bold and italic faces are not loaded. Windows and macOS discovery have not been tested on
+  those platforms. Browser local-font permission and access are not implemented.
+- **Font size is in progress.** The ribbon can size a selected line, text in a selected
+  container, safely mapped selections within or across paragraphs, or text typed at a plain
+  caret. Ambiguous selections are not supported and are reported rather than changed.
+  The font controls show the current explicit value, `Default` for inherited defaults, and
+  `Mixed` when a selection has different values. Ambiguous selections show the control name.
+- **Underline, subscript and superscript are in progress.** The ribbon can toggle them on
+  an entire selected line or container, with undo, and can format newly typed text at a plain
+  caret, and safely mapped partial selections. Table cells, selections across lines, some
+  selections that cross markup, and turning off a mark inherited at the caret are not supported yet; the
+  controls report this rather than changing the page.
+- **Bold, italic and strikethrough are in progress.** Safely mapped partial selections and
+  newly typed text at a plain caret can use these marks. Across-line selections and turning
+  off a mark inherited at the caret are not supported yet; the controls report this rather
+  than changing the wrong text. Ctrl+B, Ctrl+I and Ctrl+U invoke the existing Bold, Italic
+  and Underline actions from focused page text (Command on macOS). Their selection limits
+  are the same as the ribbon actions.
+- **Links follow by relative path only.** A click on a link opens the page or folder it
+  names, a file in the program the system has for it, or a web address in the browser; the
+  target is a path as written, so a renamed page breaks the links to it. Links by id are not
+  defined (`folder-format.md` section 10). Not clickable yet: a link inside a table cell, and
+  one in a line that mixes left-to-right and right-to-left text.
+- **One weight per bundled script.** Arabic, Hebrew, Devanagari, Chinese, Japanese and
+  Korean draw from bundled Noto faces (the CJK one is 16 MB, most of the app's size), but in
+  one weight each and with Simplified Chinese forms for characters the CJK scripts share; a
+  Japanese or Korean reader may see a few unfamiliar shapes. Scripts outside these six still
+  draw as boxes.
+- **The Welcome notebook is in thirteen languages, and twelve are machine translated.**
+  `docs/demo/DemoNotebook`, built by `cargo xtask demo` and carried inside the app, appears in an
+  empty notebooks folder on the first start and comes back from the File screen. English is the
+  source. The other twelve (four of them right to left) were translated by an AI model, and each
+  translated page says so at its foot and asks for corrections. Every language has the same pages in
+  the same order, including the one on the code view.
+- **No icons of the user's own** on a notebook or section. Colours are there (nine of them,
+  on notebooks, section groups and sections); a chosen icon or picture is not.
+- **Rule lines are a window setting, not a page setting.** View, Rule Lines draws none, lines
+  or squares behind every page, and the choice is remembered; the page itself carries no
+  setting, so it does not travel with the notebook.
+- **The ribbon is a first pass.** Home, Insert, Draw, History and View with Office-style
+  groups, a Styles gallery, a Tags gallery and a File screen. Page Versions now keeps and
+  restores snapshots of a page's main file; assets beside the page are not versioned. The
+  notebook recycle bin can restore or permanently remove pages, sections and groups; deleting
+  an entire notebook is not supported. The Unread and Authors controls remain disabled. Missing tabs:
+  Review and Help. Other controls that are not built say so rather than doing nothing.
+  Ctrl+F1, or the chevron at the end of the tab names, folds the ribbon to its tab names and
+  gives the page its room; a tab clicked while it is folded shows its commands over the page
+  until one is used, the page is clicked or Escape is pressed. The choice is kept.
+- **Find Tags is a first pass.** Home > Find Tags opens a Tags Summary beside the page. It lists the
+  tagged lines of this page, this section, this notebook or every open notebook, grouped by tag, can
+  keep only the To Do items not yet ticked, and takes the caret to a line when it is clicked. It lists
+  what the pages said when it last looked; Refresh looks again. OneNote's other groupings (by section,
+  title or date), its search box and Create Summary Page are not built.
+- **Page zoom scales the document.** The View tab has large Zoom Out and Zoom In buttons,
+  a percentage selector, 100% reset and Page Width; Ctrl+mouse wheel and two-finger pinch adjust
+  the same unified `50%..=250%` zoom range. Text, pictures, diagrams, equations, handwriting,
+  tables, container outlines and rule spacing scale together. Container move handles sit above
+  the outline so they do not cover its border. Wide zoom levels can extend beyond the reading
+  column and can be panned via `canvas_pan`, the page horizontal scrollbar, middle-drag, or
+  touch panning.
+- **Right-to-left text works; the window around it does not know yet.** Arabic and the other
+  right-to-left scripts draw, joined and in the right order; a page, a paragraph or a run can
+  be given a direction; a right-to-left line hangs from the right edge with its bullet, box
+  and tag mark on that side; and a line that mixes the two directions is laid out by the
+  Unicode algorithm, so `السعر 123 ريال` keeps the number as `123`. **Fixed on 2026-10-19:
+  the page's direction now reaches the paragraphs on it.** It was read from the file and
+  carried into the painter, but the rule that used it asked the paragraph's own first letter
+  first, so every line with a letter in it answered for itself and the page was consulted
+  only for a line of digits or an empty one: setting a page of English to right to left
+  moved nothing, and setting a page of Arabic to left to right moved nothing either. The
+  order is now the paragraph's own mark, then the page, then the paragraph's first strong
+  letter, which is what `dir` on a containing element does in a browser and what a section
+  direction does in Word. `nocturne_model::direction_in` is the rule and
+  `crates/ui-egui/tests/rtl_quality.rs` measures it through the page painter. What is still
+  missing: the window is not mirrored (the tree stays on the left whatever the page says),
+  and the isolates the Run buttons write are kept in the file but not yet honoured when the
+  line is drawn. Selecting inside a right-to-left line does work; see the caret entry below.
+- **Two faults a writer of Arabic hit at once, both fixed on 2026-10-19.** The owner typed a
+  numbered list in Arabic and dragged across a sentence, and found both. (1) **Enter split
+  the line in the wrong place.** A caret arriving in a right-to-left line was left at
+  character nought instead of at the end of the words, so Enter cut in front of the first
+  letter: the whole sentence moved down into the new paragraph, an empty one was left above
+  it, and the next thing typed ran on to the end of the sentence rather than starting a
+  line. Three numbered lines came out crammed into one paragraph. A line with no
+  right-to-left text in it never showed this, because egui's own text box puts an arriving
+  caret at the end; `write_rtl` does the same now. (2) **A selection hid the words it
+  covered.** The fill is opaque and was painted after the glyphs, so a drag across an
+  Arabic sentence left a row of blank boxes where the sentence had been - which reads as a
+  selection that does not work, and is what was reported. It is painted into a place kept
+  for it behind the words now, the same way the shading behind a container is. **And a
+  third thing had to be right before any of that could be seen:** the wash was drawn in
+  `row_selected`, which is tinted from the panel because a selected row of the tree sits on
+  the panel, while the page is drawn on `editor`. In a theme that keeps those two colours
+  apart the band landed on the page in a colour the page already was, so the words were
+  selected, the band was painted and nothing could be seen. The page has its own
+  `selection` token now, tinted from `editor`, and the contrast test checks for all 14
+  themes that it can be seen against the page and that the words on it stay readable. Both are
+  measured in `crates/ui-egui/tests/ui.rs`, the second by counting the glyph pixels that
+  survive under the selection. **A third, found the same evening and fixed with them:** a
+  drag that began on a paragraph the caret was not already in did nothing whatever - no
+  caret, no selection - because a finished block answered a click and nothing answered a
+  press that moved. That is how a reader selects words, so the first drag on any paragraph
+  was inert. The drag is now read from the pointer itself at both ends rather than sensed on
+  a widget: a widget laid over the words to watch for it takes the pointer away from the
+  words underneath, links included, which five tests said twice.
+- **Paragraph direction is in two places on the Home tab**, as of 2026-10-19: in the
+  alignment menu, where Word and OneNote keep it, and in the Direction group beside the
+  page's own, because a writer who has gone looking for the direction controls should find
+  all of them together rather than be sent back to a menu under an alignment button. Both
+  carry the pilcrow with an arrow that Word, LibreOffice and the Office web apps use for it;
+  the lines-with-an-arrow pair stays for the whole page. Not built: a keyboard shortcut for
+  either. Word's are Ctrl with the left or the right Shift, which tells the two Shift keys
+  apart, and egui reports one modifier for both.
+- **A right-to-left page title is drawn, not typed into, until it is clicked.** The title
+  is an egui text box, which lays the letters of an Arabic word out the right way and then
+  puts the next word to the right of it, so every Arabic page showed its own name with the
+  words backwards. A right-to-left title is drawn by the bidi painter now and becomes a
+  text box when it is clicked. **Not built:** the words are still backwards while the title
+  is being typed in, which needs the page's own caret in the title box.
+- **The demo has a page with right-to-left in every element** - كل عنصر في العربية, under
+  the Arabic How to - which is the corpus to look at after any change to text drawing.
+  **Known from it, and not fixed:** a numbered item is written `1.` with the full stop on
+  the right of the number, as in a left-to-right line; a browser writes it on the left,
+  `.1`, in a right-to-left list. The number itself does sit on the right of the line, beside
+  the words, in both formats: measured through the page painter on 2026-10-29.
+  **Fixed on 2026-10-29:** a line on a right-to-left page that starts with a Latin word,
+  such as `TODO: راجع هذه الصفحة`, hung from the right edge but read left to right inside
+  it, so `TODO` was drawn at the far left end of the line. parley takes a paragraph's base
+  direction from its first strong letter and cannot be told otherwise, so the bidi painter
+  now lays such a line out with the page's direction mark in front; the drawing, a click,
+  the caret and the arrow keys all use that layout. `crates/ui-egui/tests/rtl_quality.rs`
+  measures it.
+  **Found there and fixed:** a picture low on a long page was drawn nothing at all tall,
+  because egui fits a picture into the height the layout has left and a page that scrolls
+  has none once the blocks above have filled the view. It was not a right-to-left fault -
+  it hit every language - and it stayed hidden because every other picture in the demo sits
+  near the top of its page.
+- **An arrow key moves the caret the way it points**, through a line that mixes Arabic and
+  Latin, since 2026-10-19. It did not before: the caret is kept as a byte offset and nothing
+  else, parley's own visual step is sensitive to affinity, meaning which side of a direction
+  boundary the caret sits on, and a byte offset cannot carry that, so the step read the
+  wrong side back. Holding the right arrow in `السعر 123 ريال` cycled bytes 12, 13 and 14
+  for ever and the caret never left the digits. A step is now taken by where the caret is
+  drawn - the nearest place to stand further along the line the way the arrow points - which
+  cannot cycle and needs no affinity; a step off the end of a line is still parley's, and
+  affinity does not arise there. `crates/ui-egui/tests/rtl_quality.rs` walks four lines both
+  ways and checks the caret never goes backwards and reaches the far end.
+- **The caret keeps off the vowels.** A letter with a haraka on it is two shaped clusters,
+  so the arrow keys used to stop inside it and a click could land there: a caret in a place
+  the eye cannot see, and a Backspace that takes the vowel off a letter that looks
+  untouched. `bidi::step` and `bidi::hit` carry on past a mark now, for Arabic, Hebrew,
+  Syriac, Thaana, Thai, Cyrillic and the Latin combining accents. A general answer is
+  Unicode grapheme breaking, which would want a crate of its own.
+  `crates/ui-egui/tests/rtl_quality.rs` measures this and five other things a writer of
+  Arabic would notice. **Not built:** a triple click that takes the line, and sorting names
+  by Arabic collation rather than by code point.
+- **Each word of a right-to-left line is placed by Nocturne.** egui lays the letters of an
+  Arabic or Hebrew word out the right way, but puts the next word to the right of the one
+  before it, so a line of them came out with its words backwards; the owner read one on
+  2026-10-19 and said so. `bidi.rs` draws each word on its own and places them from the
+  right edge of the run leftwards, with the gaps measured rather than left in a galley.
+  **That now covers the window as well as the page**, from 2026-10-19: every row of the
+  notebook tree and the window's title band draw their label through `bidi::line_at`, so a
+  section called `الصور والملفات` is no longer listed as `والملفات الصور`. The tree was the
+  most visible instance left, because it is on screen all the time. Anywhere else that hands
+  a whole string to `Painter::text` still has the fault; `line_at` is the fix, and
+  `crates/ui-egui/tests/rtl_quality.rs` measures both halves of it.
+- **The caret in a right-to-left line is Nocturne's own, and it is new.** egui cannot place
+  one there (`crates/ui-egui/tests/arabic_layout.rs` measures why: it counts glyphs where it
+  means characters), so a line with Arabic in it is drawn by `crates/ui-egui/src/bidi.rs` and
+  written in with a caret of ours: parley says which character a click landed on and which
+  way a step moves, egui still draws. Selecting works there too, by dragging, with Shift and
+  the arrows, and a double click takes the word under the pointer. **The selection is drawn
+  as one unbroken band to a line** since 2026-10-19: a right-to-left line is drawn word by
+  word with the gaps left empty, so the selection began life as a rectangle per word and
+  showed the page through every space. A gap no wider than a space is closed now; a wider
+  one is left, because on a line of two directions the selected text really is in two
+  places. **A selection spans paragraphs** since 2026-10-19, which is the
+  difference the owner saw beside OneNote that day: a drag that leaves the paragraph it
+  began in keeps going, every paragraph it covers is drawn with a band behind it, and Copy,
+  Cut and Delete act on the whole of it. A caret belongs to one block, so a selection that
+  leaves it is kept beside the caret as `pageedit::Across` and reported by `ui.inspect` as
+  `across`; while one is open no block is a text box, because a text box would hold a
+  selection of its own and fight with it. Cross-block paste (`Paste` and `insert_platform_text`)
+  replaces an active `Across` selection in a single Undo/Redo step. What it does not do yet:
+  typing arbitrary non-space characters over such a selection (keys other than Delete, Backspace,
+  Copy, Cut, and Paste are ignored while it is open), dragging past the top or bottom of the
+  page does not scroll, and Ctrl with the arrows to step by word is still missing.
+- **The caret is egui's, not ours.** Each block is an egui text box, so there is no caret of
+  our own across blocks: no caret movement by visible step in mixed text. A selection may
+  span blocks now (see above), but it is kept beside the caret rather than by it, and while
+  one is open the page stops being text boxes altogether. The sibling WordCraft owns its whole text pipeline (shaping, line boxes,
+  hit testing) and gets this right; matching a mature editor means a text crate of our own
+  over parley or the same house stack. Decision pending.
+- **A dropped file can be copied in, linked, or inserted as a printout.** PDF rasterization is
+  native Rust (`hayro`), and dark mode adapts rasterized printout pages (`*.printout-NNN.png`)
+  with hue-preserving lightness inversion in memory so dark-mode ink remains legible against
+  printouts without modifying files on disk or inverting regular photos. Still missing: PDF text-layer
+  selection, copy, and search, plus a continuous multi-page PDF annotation layer (ink stays in
+  page coordinates over printout blocks). LibreOffice (`soffice`) is still needed on desktop to
+  convert Office documents and is unavailable inside the iPadOS sandbox; without a renderer, the
+  printout action reports an error rather than creating an incomplete page.
+- **The clipboard carries text, HTML and pictures, through one boundary.** A copied selection
+  is one logical clipboard item: rich-text clients receive HTML with headings, marks, links,
+  lists and tables; plain-text clients receive readable text without Markdown syntax. Nocturne
+  reads HTML before falling back to plain text, and a picture on the clipboard is pasted as a
+  file beside the page. The shared `arboard` writer keeps clipboard ownership alive on X11 and
+  Wayland, and enables Wayland data-control. Not built yet: RTF output and paste, Nocturne's own
+  page format on the clipboard, URL and other registered formats, copy-as-image for selected
+  visual blocks, and paste of copied file lists. Those need the Windows clipboard API; see
+  [ADR 0001](adr/0001-clipboard-boundary.md).
+- **A box's right-click menu is short.** It has Cut, Copy and Delete, then the page's entries. OneNote's also has
+  Paste Options, Copy Link to Paragraph, Select, Order, Move and Resize, and a small formatting
+  toolbar above it; none of those are here yet, and no entry is shown that does nothing. Move and
+  resize are the bar and the right edge. A box is deleted without asking, as OneNote does, and
+  Ctrl+Z brings it back: the page's history holds whole states of the page, boxes included.
+- **A blank box goes only when the caret leaves it on the page.** A box with nothing written in it
+  is taken away when the caret leaves it for another box, for open paper, for a picture, or with
+  Escape, as OneNote does (issue #21). Opening another page, or a caret moved from outside the
+  page (a search result, the control channel), leaves the blank box where it is, and it is saved
+  with the page. A to-do box with no words beside it is kept.
+- **Block numbers on the metadata line follow only some edits.** The widths of a table and the
+  justified paragraphs are kept against block numbers (next entry). They are moved when an empty
+  box is given its first line and when a blank box goes, but not yet when Enter splits a line,
+  when Backspace joins two, when a box is deleted or pasted, or when Ctrl+Z undoes any of these.
+  After those, a width or a justification can sit on the block next to the one it was given to.
+- **Table column widths and justification are still on a metadata line.** The boxes of a page are
+  elements in its text, but the widths a table's columns were dragged to (and the alignment and
+  shading its cells were given) are kept in the head
+  (`nocturne:columns`) or the front matter (`columns:`), and which paragraphs are justified in the
+  same way (`nocturne:justify`, `justify:`), so the same disconnect remains for both: another
+  program does not see them, and a page whose blocks are rearranged outside Nocturne may find a
+  number against the wrong block. The code view does show them, because it shows the page file's
+  head. The reasoning, and what the alternatives cost, is in
+  [page-model.md](dom_serialization/page-model.md) section 2.
+- **Justification: three things it does not do yet.** A justified paragraph is stretched when it is
+  drawn, which is what keeps the page file the writer's own words
+  (`crates/ui-egui/src/bidi.rs`, measured in `crates/ui-egui/tests/rtl_quality.rs`). Three edges
+  come with that. (1) A click inside a justified paragraph is placed against the unstretched
+  words, so it drifts towards the far end of a long line; the caret is put a letter or two off
+  where the eye expects. (2) A paragraph that mixes the two directions and reads left to right is
+  drawn ragged: kashida has nothing to stretch in Latin words, and the bidi painter has no way to
+  widen the spaces between them. A paragraph of one direction is justified either way. (3) The
+  stretching is measured in the paragraph's own type, so a line with a run of code or maths in it
+  may stop a little short of the column. A kashida also comes only in whole tatweels, because the
+  bundled face has no `JSTF` table or elongation axis; `crates/text/src/kashida.rs` says so.
+- **A drawing in the code view** is drawn, not shown as a wall of numbers: Nocturne's own
+  painter draws the strokes to fit the room, says how many there are, and Show the code puts
+  the SVG one click away.
+- **The code view** is the page's folder as it is: every file of the page down the left, the one
+  that is picked on the right. The page file is picked when the view opens, and the whole of
+  it can be typed in, head included - the owner asked for that on 2026-10-19, against the earlier
+  line that only the body could be edited; the page is read again when the view closes, so a
+  change to the title or any other metadata line takes effect then. A drawing's SVG can be typed in too - the owner asked for that on 2026-10-19, against the earlier line
+  that every file but the page's own is read-only; the view says what the risk is, because the pen's
+  readings are in that file. Pictures are shown as pictures, other text is read-only, and a file
+  nothing on the page names is marked as not used. The live page is not drawn while the view is
+  open, so there is only ever one editable copy of the page on screen. **Not built:** drawing an ink
+  file as strokes in the viewer (it shows the SVG as text), and opening a file with the system.
+- **Writing a page's text without boxes makes it one column.** The boxes are part of the text, so
+  `page.save` with a plain body drops them. An agent that wants to keep an arrangement writes the box
+  elements, or calls `page.containers` afterwards.
+- **The Quick Access Toolbar is part of OneNote's.** It has Back, Forward, Undo and Redo, a menu to
+  choose which show, to put it under the ribbon or to hide it, and the choices are kept. OneNote's
+  menu also lists Print, Print Preview, Touch/Mouse Mode and More Commands: none exist here, so they
+  are not listed. Back and Forward are also Alt+Left and Alt+Right and the mouse's side buttons.
+  Ctrl+Page Up and Ctrl+Page Down open the page above or below in the page list, subpages included
+  when their page is expanded, and stop at the first and last page. Undo
+  covers the page's words and boxes (a typing burst is one step); ink keeps its own undo and redo
+  (`Undo stroke` and `Redo stroke`), and Ctrl+Z / Ctrl+Y step whichever changed most recently.
+  In a text box Ctrl+Z is still the text box's own. When the
+  strip is hidden a small arrow stays, so it can be brought back: OneNote hides it completely.
+- **The mini toolbar and docked mobile formatting bar.** `crates/ui-egui/src/floating.rs` draws
+  floating menus and the mini toolbar with `>= 36pt` touch targets when touch/stylus interaction
+  is active; on right-click or touch long-press on text, it floats over the page's text menu
+  with Bold, Italic, Strikethrough, Code, lists, indents, Quote, To Do, Important, Clear Formatting,
+  and Font family/size boxes. When a software keyboard inset is active, a docked mobile formatting
+  bar sits above the keyboard with `>= 36pt` Indent, Outdent, Undo, Redo, Bold, and To Do buttons.
+  In touch mode, selected containers and images show a compact quick-action pill (`Cut`/`Copy`/`Delete`
+  or `Rotate`/`Delete`). Deferred: automatic floating text-selection toolbars and touch drag-selection
+  loupes/handles (kept off until post-M3 `UIEditMenuInteraction` coordination so native iPadOS edit
+  menus and Nocturne formatting pills do not collide), plus font colour, highlighter, Styles, and
+  Format Painter on the mini toolbar.
+- **Menu entries.** Rows carry OneNote's pictures. Still missing from a box's menu: Paste Options with
+  its pictures, Copy Link to Paragraph, Select, Order, Move and Resize.
+- **Containers are a first pass.** A page can hold several boxes, each with its own place,
+  width and blocks; a box is moved by the bar along its top and resized by its right edge,
+  and the arrangement is kept in the page's own file. When touch or stylus interaction is active,
+  oversized (`>= 32-36pt`) selection/resize handles and grab pills appear on selected containers,
+  images, and held ink without altering desktop mouse geometry, and finger drags on active handles
+  resize or move them without scrolling the canvas. Clicking open paper starts a new box
+  where clicked. What is missing: moving blocks from one box to another, boxes that know
+  how tall they are (the room under them is guessed), and a picture as a box of its own. The
+  blocks themselves stay in reading order in the file, so a page read anywhere else is
+  unchanged; if the counts and the blocks ever disagree, everything goes back into one box
+  rather than losing a word.
+- **Paper and page colour are the page's own.** Format Background on Draw or View gives
+  the open page its rule lines or squares and a pale colour behind the words. View's
+  Page colour opens the same colour palette directly, including No colour. Both choices are
+  written into that page's head (`nocturne:paper`, `nocturne:page-color`), so a page
+  keeps them and another page is not touched. The window's own rule-lines setting stays as
+  what a page with none of its own is drawn on. **Not built:** a rule line colour, and
+  "always create pages with rule lines".
+- **Copy link to page** is on a page's menu in the tree, as it is in OneNote. The link
+  names the page from the notebooks folder down (`nocturne:/book/section/page`), because
+  a relative link would depend on the page it is pasted into, which nobody knows when the
+  link is copied. It is copied as a Markdown link with the page's name, so pasting it into
+  a page gives words to click, and clicking opens the page. A link of this kind cannot
+  climb out of the notebooks folder, and a link to a page that has gone says so.
+- **One title, not two.** A page carries its title in its head, and the window draws it in
+  the title area above the words. A new page's body no longer repeats it. A page from
+  before this, or one written by hand, may still open with that title as a heading; the
+  live view leaves that heading out rather than showing the name twice, and the file is
+  left exactly as it is, so the code view still shows it and another program still sees a
+  page with a heading. Renaming moves both, as it did before.
+- **The demo notebook** ships pictures and handwriting: every language's welcome page opens with
+  the Nocturne banner in that language, and the page about pictures and files carries a real
+  `ink.svg`, drawn by the demo builder with the same crate the pen uses. The banner's words are in
+  the picture only where the script needs no shaping; Arabic, Persian, Urdu, Hindi and Hebrew get
+  the wordmark, and every language carries the line as words under it, which reads correctly and
+  can be searched. Baking those five into the picture needs a text shaping library, which is not
+  installed here. Three pages show paper and page colour: the one about writing is college
+  ruled, the one about tags is squared and warm, the one about making it yours is teal.
+- **Pen and drawing.** The pen writes anywhere on the page, as OneNote's does. The ink of a
+  page is `ink.svg` in the page's own folder; a page never drawn on has no such file, and a
+  page rubbed clean loses it. The folder is what decides: the page's own text names every
+  ink file beside it and names none that is gone, checked when the page opens and after
+  every change to it, so a drawing cannot be left unnamed by deleting the line that named
+  it. An SVG counts as ink because it carries Nocturne's namespace, not because of its
+  name, so a picture of your own in the page's folder is never adopted as a drawing. The folder is what decides: the page's own text names every
+  ink file beside it and names none that is gone, checked when the page opens and after
+  every change to it, so a drawing cannot be left unnamed by deleting the line that named
+  it. An SVG counts as ink because it carries Nocturne's namespace, not because of its
+  name, so a picture of your own in the page's folder is never adopted as a drawing. It is SVG that also carries the pen's own readings in our
+  namespace, so Nocturne can change a stroke later while anything else sees the picture.
+  Built: the Draw tab; five nibs (pen, pencil, fountain pen, brush pen, highlighter); a
+  rack the owner arranges, with Add, a right-click menu, a Modify Tool editor for colour
+  and thickness, and the whole rack remembered between runs; a pressure sensitivity wedge;
+  an eraser; undo; Save picture; picking ink up with Select or a lasso to move, stretch
+  or delete it; and ten regular shapes - line, arrow, rectangle, rounded rectangle, square,
+  ellipse, circle, diamond, triangle and star - drawn by dragging out the two corners they
+  sit between. A drawn shape is ink like any other stroke, so the eraser, Select and Undo
+  Stroke all work on it; it is not kept as a shape that can be turned back into a perfect
+  circle later, and the file does not say which shape it was.
+  The window also switches by itself, as OneNote does: a pen that touches the page while the
+  caret is the pointer picks up the pen last in hand, colour and thickness and all, and draws
+  with it from that touch on; typing while an ink tool is in hand goes back to the caret, the
+  words landing where it was. Per-`TouchId` contact tracking (`stylus.rs`) isolates concurrent
+  palm/finger touches from stylus input. By default, 1-finger touch scrolls/pans and 2-finger
+  pinch zooms while a stylus draws immediately; the Draw tab's `Finger drawing` toggle
+  (`ink.finger_drawing`) switches 1-finger touches to drawing, `ink.toggle_eraser` (`Alt+E`)
+  switches between the eraser and the active/previous writing tool, and tapping into text blocks
+  enters writing mode. Monotonic cubic Bezier pressure-response curves (`Linear`, `Soft`, `Firm`,
+  `S-curve`, saved in `pen_pressure_curve` and optional `nc:curve` without altering raw `Dab`
+  readings) and bounded velocity-based lookahead stroke prediction preview (`predict_tail`, render-only
+  and never saved to `ink.svg`) are built. Neutral dark ink (`#202020`, dark greys) is inverted
+  at render time on dark pages while preserving `#202020` in `ink.svg`; dark chromatic palette inks
+  (such as dark blue `#1b2a6b`) are kept unchanged on dark pages to preserve colour fidelity.
+  Draw > Collect All gathers boxes and strokes that drifted apart on the open canvas: every
+  empty stretch of the page wider than a small gap, across or down, is closed to that gap, so
+  things keep their order and nothing ends up on anything it was not already on. Ink over a
+  box moves with the box. One Undo puts the boxes and the ink back.
+  Alt+1 to Alt+9 pick up the
+  pen in that place on the rack, from anywhere, so a tablet's express keys can be bound to
+  pens; Alt+0 puts the pen down and goes back to typing. OneNote has no such keys.
+  **Not built:** automatic shapes; the ruler and other stencils;
+  ink replay; ink to text and ink to math; the eyedropper in the tool editor; and custom UI
+  sliders for arbitrary Bezier curve control points. Pressure is real and measured on Windows
+  (hardest 0.930 over 1223 readings, 2026-10-18); on macOS, Linux and Wayland winit drops the
+  tablet fields, so a pen there draws at full pressure like a mouse, and tilt and the eraser end
+  are on no platform via `winit`. `cargo run -p nocturne --example pen_check` shows what a pen reports.
+- **Tables are edited cell by cell**: click a cell to write in it, Tab walks along the row
+  and on to the next and grows a row off the end, Escape leaves. While the caret is in a
+  table the ribbon offers a Table tab, as Office does for the thing in hand: rows and
+  columns can be added either side of the caret and taken out, and the heading row and the
+  last column stay. A drag across cells picks the block between them, which Delete empties
+  and the tab's Select Table, Select Rows and Select Columns pick the same way; deleting
+  rows or columns with a block picked takes all of them. A table is drawn with lines round
+  its cells, which the tab's Hide Borders turns off and on for the table the caret is in, and
+  only that one; the page keeps the choice with the column widths (below). A column is a fixed width and
+  stays that width when the box around it is resized, the way OneNote's does; a border
+  dragged sideways changes the column to its left, and the page keeps the widths beside
+  the arrangement of its boxes (`nocturne:columns`), because neither CommonMark nor an
+  HTML table that must match it has anywhere to put them. The Insert
+  tab's Table button opens OneNote's size picker, where the pointer runs over a grid and
+  names the size it would make. The Alignment group lines up the words of the caret's cell,
+  or of every picked cell, left, centre or right; the column keeps its width, the page keeps the
+  alignment on the same line as the widths (`block@row.column=c`), and it moves with its row or
+  column when one goes in or out and with its row when the table is sorted. It is drawn where
+  the page is written in; a page drawn for the pen (the Draw tab) still shows its cells aligned
+  left, as it shows its columns at the usual width. Shading puts one of the named colours a
+  section can carry behind the caret's cell or every picked cell (`block@row.column=~yellow`, or
+  `=c~yellow` beside an alignment), washed so the words keep their contrast in light and dark
+  themes, and No Colour takes it away; it follows its cell the way alignment does, and the pen's
+  view does not draw it yet either. Not built, and greyed where a OneNote user looks for them:
+  merging and splitting cells; and the Insert Table dialog. Sort Ascending
+  and Sort Descending reorder whole rows by the caret's column (only the picked rows when a
+  block of cells spans several), numbers as numbers, empty cells last, the heading on top.
+  A row has no height of its own on purpose: OneNote sizes a row by the text in it and
+  offers no handle for one, which Microsoft's own help for OneNote for the web says in so
+  many words, so a row here grows and shrinks with its words too. Word's Table Properties
+  can set a height; if Nocturne ever does, it should be Word's "at least" rule, where
+  content taller than the height still pushes the row down rather than being cut off.
+- **A spreadsheet goes to GridCraft**, the open spreadsheet from the same workshop, where
+  OneNote converts a table to Excel. The Table tab writes the table out as a CSV file
+  beside the page and opens it; the Insert tab starts an empty one and links it from the
+  page. Both are greyed when GridCraft is not installed, which is looked for on the PATH
+  and in the folder its installer uses (`%ProgramFiles%\GridCraft` on Windows). Checked
+  against GridCraft 0.8.0 on 2026-10-19: a table with a comma and a quote in it opens in
+  the right cells. The table goes out and comes back: Read back
+  from it, beside Convert, puts what the spreadsheet holds into the table it came from,
+  quotes and commas undone. Nothing watches the file, because a page would be a strange
+  thing to write in if its tables changed under the writer's hands; the way back is a
+  button, as the way out is.
+- **Undo** takes back changes to the page: Ctrl+Z, Ctrl+Y or Ctrl+Shift+Z, and the two
+  buttons at the left of the Home tab. A step is the whole page as it stood - its text,
+  its blocks, the boxes they sit in and where the caret was - so anything that changes the
+  page can be taken back, including a row deleted from a table or a box deleted whole. A
+  run of letters into one block folds into one step, as it does in Word. The history is
+  the open page's: it starts when the page opens and goes when another is opened, and at
+  most 200 steps or 16 MB are kept. Ink is not in it; a stroke is taken back with Undo
+  Stroke on the Draw tab, because a drawing is its own file beside the page.
+- **A file in a page's folder** is listed under the page, and each row has a Delete that
+  asks before it removes the file from disk. Undo does not bring a file back: the page's
+  history holds the page, not the files beside it. A line that linked to the file is left
+  as it was written, and shows as a link to something no longer there.
+- **Pasting** puts a picture on the page as a file beside it, which egui alone cannot do:
+  the clipboard is read through the app's clipboard boundary, because egui hands a window text
+  only (see [ADR 0001](adr/0001-clipboard-boundary.md)). The page also has
+  its own menu under the right button, with paste, cut, copy and the things the Insert tab
+  can put there.
+- **The Insert tab** carries OneNote's groups. Working: tables, a file attachment, a
+  picture, a link, the three time stamps, an equation, a symbol picker, insert space, and
+  Nocturne's own Mermaid diagram. File printout, screen clipping, online video,
+  transcription, recording and stickers remain unbuilt. Page Templates opens a pane
+  of templates by category (Academic, Blank, Business, Planners and the user's own); a click
+  adds a page to the open section from one, and the open page can be saved as a template.
+  **Not built:** previews of the templates, a default template for new pages, and removing a
+  saved template from the pane (`page.remove_template` does it). Spreadsheet is
+  available through the existing GridCraft integration when installed.
+  Insert Space is
+  OneNote's tool: with it in hand, a drag down the page moves every box and every stroke of
+  ink that starts below where the drag began down by as far as it went, and a drag up moves
+  them up, never past the top of the page; a guide shows the line and the band of room, Esc
+  puts the tool down, and one drag is one step of Undo. It moves boxes, as OneNote moves its
+  containers: it does not open a gap between two lines inside one box.
+- **Unread and author history** are not built. Page version
+  history stores snapshots of the page's main file; changes to attached files and drawings
+  are not captured by those snapshots. (Tags are: to-do boxes and the other familiar marks,
+  stored as plain text in the page.)
+- **Sync conflicts** are only detected by name by the checker; there is no merge or resolve UI.
+
+## Engineering
+
+- **Windows only so far.** The code avoids OS features, but nothing has been built or run on
+  macOS or Linux. Treat cross-platform as an unproven claim.
+- **Coverage is 87.8% of lines** (measured 2026-10-17); window start-up and `app.rs` are the weakest.
+- **Control key file permissions on Windows** rely on the user folder's access rules.
+- **Large pages and attachments** are capped but not load tested.
+- **Crashes on one Windows PC are unexplained.** A release build was reported to crash several
+  times on a Windows machine with AMD graphics. It was not reproduced: about fifteen runs under
+  a debugger (empty folders, a restored session, real use) ended in clean exits, and no panic was
+  logged. One lead, assumed and not confirmed: Nocturne takes the graphics library's default
+  backends (Vulkan, DirectX 12 and OpenGL), and WordCraft's README documents that also creating
+  an OpenGL instance can crash AMD's driver before the window appears. WordCraft's answer is
+  DirectX 12 only by default; Nocturne has not made that change. To rule it in or out, set
+  `WGPU_BACKEND` to `dx12` or `vulkan` before starting (the library reads it; checked in its
+  source, not tested here). `nocturne.log` in `%APPDATA%\Nocturne` records a panic with its
+  backtrace and the last step reached; see [the README](../README.md#logs).
+- **The installer is built but not yet installed, upgraded or removed on a clean machine.** The
+  MSI's contents and properties were checked by unpacking it. The Start menu shortcut, the
+  finish-page launch box and an uninstall that leaves notebooks alone are unchecked. Builds are
+  unsigned, so Windows SmartScreen warns. The release workflow has not run on GitHub.
+
+## Legal and provenance
+
+- **The Nocturne brand artwork** (banners, icons, and social assets under `assets/brand/` and
+  `assets/demo/`) was created for the project; see `ATTRIBUTION.md` for third-party library
+  and licence notices.
+- **The licence is MIT OR Apache-2.0** for the code (the siblings' choice, taken 2026-10-17).
+  The artwork above is outside it, and no audit of the dependencies' licences has been run.
+- **Clean room:** the `.one` format work uses only Microsoft's published specifications and
+  files the owner owns. No Microsoft code or text is copied.

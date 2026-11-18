@@ -1,0 +1,115 @@
+# Write a page
+
+Click a page in the tree and it opens. Click anywhere on the page and the caret lands where you
+clicked. Type.
+
+The page is shown the way it will be read: headings in heading type, bold and links in their own
+colours, lists with their bullets. The marks that make them (`**`, `#`, `-`) stay in the text but
+are dimmed, so the words come first.
+
+## Links
+
+A link is the words in square brackets, then the target in round brackets:
+
+```text
+Read [the plan](../plan/) first.
+```
+
+The target is a web address, a file beside the page
+(`assets/notes.pdf`), or another page or folder of the notebook by relative path:
+`../other-page/` is the page next door, `../../` is the section group above. Click a link to
+follow it: a page opens in the window, a file opens in the program your system has for it, a
+web address opens in the browser. While the caret is in the line, hold Ctrl (Cmd on a Mac)
+and click, so a plain click can still place the caret. A link never reaches outside the
+notebooks folder.
+
+## Keys
+
+| Key | What it does |
+|---|---|
+| Enter | Splits the line at the caret. At the start of a line it pushes the line down. At the end of a heading it starts an ordinary paragraph. On an empty list item it ends the list |
+| Backspace at the start of a line | Joins the line to the one above |
+| Tab, Shift+Tab | More or less indent on a list item |
+| Up, Down | Move to the line above or below |
+| Escape | Leave the line |
+| Ctrl+S | Save now (the page saves itself about a second after you stop typing anyway) |
+
+## The ribbon
+
+**Home** has the marks and the blocks: bold, italic, strikethrough, code, a link, bullets,
+numbering, indent, quote and clear formatting; a Styles gallery for Heading 1 to 6, Page Title,
+Citation, Quote, Code and Normal; and the Tags gallery ([tag a line](tag-a-line.md)).
+
+**Insert** has tables, pictures, files, links, equations, diagrams and today's date.
+
+**View** has full page, search, rule lines, zoom, the theme and the page source.
+
+A style or a tag you ask for twice turns itself off again, as it does elsewhere.
+
+## Font controls
+
+Select the words first, then use the Home font name or size box. A selection can contain
+different sizes and other marks. Changing its size keeps its words, bold/italic marks and
+unselected text. Safely mapped text selections across paragraphs are supported too.
+At a plain caret, a chosen size applies to the next text you type.
+
+The size box accepts the same whole-point values as its list: 8, 9, 10, 11, 12, 14, 16,
+18, 20, 22, 24, 26, 28, 36, 48 and 72. Type one and press Enter, or leave the box to apply
+it. Escape cancels an entry. Unsupported entries, including fractional sizes and whole
+sizes outside this list, revert without changing the page.
+
+The controls show the explicit value, **Default** for an inherited value, or **Mixed**
+for different values in one selection. HTML and CommonMark pages keep the same font
+formatting when saved and reopened. Undo and Redo include these changes.
+
+Font families use regular installed desktop faces. Missing families fall back and are
+reported. Loading bold/italic faces and browser access to local fonts are not supported.
+Some table-cell, raw-markup and ambiguous selections also remain unsupported; see
+[known limits](../gaps.md). Font colour, highlighting and emphasis are separate controls.
+
+## Equations
+
+Insert, then **Equation**, or type TeX between dollar signs: `$E = mc^2$` inline, or a block
+between `$$` lines. Nocturne draws it itself, in real maths fonts: fractions, roots, sums,
+integrals, matrices, cases, accents and the rest. Anything it cannot read stays visible as text
+rather than disappearing. See [Write equations](write-equations.md).
+
+## The page source
+
+The page's files are one click away: the **`< >`** button beside the page, or **View**, then
+**Source**. The code view lists every file the page owns and shows the one you pick. The page file's
+body can be typed in, and the page is drawn again from it when you close the view. See
+[Look inside a page](look-inside-a-page.md).
+
+Use it for anything the editor does not do yet: raw HTML, a Mermaid diagram, a table you would
+rather type than click.
+
+## What a page is on disk
+
+An HTML page:
+
+```html
+<h1>Project X</h1>
+<p>Kickoff notes for the <b>first release</b>.</p>
+<ul><li>Ship the folder format</li></ul>
+```
+
+The same page as CommonMark:
+
+```markdown
+# Project X
+
+Kickoff notes for the **first release**.
+
+- Ship the folder format
+```
+
+Both carry their metadata with them: the Markdown page in front matter, the HTML page in
+`<meta name="nocturne:...">` tags. [Choose the page format](choose-the-page-format.md) explains
+which one a new page gets.
+
+## One limit worth knowing
+
+A page whose HTML holds markup the editor cannot model yet (a `<div>` from a paste, say) is
+shown but not written on, and says so, so that editing it cannot quietly throw that markup away.
+Open its source and the whole file is yours.

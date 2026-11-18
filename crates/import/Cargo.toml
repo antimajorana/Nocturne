@@ -1,0 +1,21 @@
+[package]
+name = "nocturne-import"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Nocturne importer: turns a folder of OneNote section files into a Nocturne notebook tree, in HTML or CommonMark + GFM pages. Read only on the source"
+
+[lints]
+workspace = true
+
+[dependencies]
+nocturne-model = { workspace = true }
+nocturne-formats = { workspace = true }
+nocturne-onenote = { workspace = true }
+nocturne-store = { workspace = true }
+cab = { workspace = true }
+
+[dev-dependencies]
+nocturne-onenote = { workspace = true, features = ["testing"] }

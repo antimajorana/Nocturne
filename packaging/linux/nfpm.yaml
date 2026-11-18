@@ -1,0 +1,64 @@
+name: nocturne
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${VERSION}
+version_schema: semver
+release: 1
+section: utils
+priority: optional
+maintainer: Nocturne maintainers <nocturne@example.invalid>
+homepage: https://github.com/antimajorana/Nocturne
+license: MIT OR Apache-2.0
+description: |-
+  Nocturne is a clean-room note taking app.
+  Notes live as plain files in plain folders.
+contents:
+  - src: ${STAGE}/usr/bin/nocturne
+    dst: /usr/bin/nocturne
+    file_info: { mode: 0755 }
+  - src: ${STAGE}/usr/share/applications/io.github.antimajorana.nocturne.desktop
+    dst: /usr/share/applications/io.github.antimajorana.nocturne.desktop
+  - src: ${STAGE}/usr/share/icons/hicolor/32x32/apps/io.github.antimajorana.nocturne.png
+    dst: /usr/share/icons/hicolor/32x32/apps/io.github.antimajorana.nocturne.png
+  - src: ${STAGE}/usr/share/icons/hicolor/64x64/apps/io.github.antimajorana.nocturne.png
+    dst: /usr/share/icons/hicolor/64x64/apps/io.github.antimajorana.nocturne.png
+  - src: ${STAGE}/usr/share/icons/hicolor/128x128/apps/io.github.antimajorana.nocturne.png
+    dst: /usr/share/icons/hicolor/128x128/apps/io.github.antimajorana.nocturne.png
+  - src: ${STAGE}/usr/share/icons/hicolor/256x256/apps/io.github.antimajorana.nocturne.png
+    dst: /usr/share/icons/hicolor/256x256/apps/io.github.antimajorana.nocturne.png
+  - src: ${STAGE}/usr/share/icons/hicolor/512x512/apps/io.github.antimajorana.nocturne.png
+    dst: /usr/share/icons/hicolor/512x512/apps/io.github.antimajorana.nocturne.png
+  - src: ${STAGE}/usr/share/doc/nocturne/LICENSE-MIT
+    dst: /usr/share/doc/nocturne/LICENSE-MIT
+  - src: ${STAGE}/usr/share/doc/nocturne/LICENSE-APACHE
+    dst: /usr/share/doc/nocturne/LICENSE-APACHE
+  - src: ${STAGE}/usr/share/doc/nocturne/NOTICE
+    dst: /usr/share/doc/nocturne/NOTICE
+  - src: ${STAGE}/usr/share/nocturne/demo/
+    dst: /usr/share/nocturne/demo/
+    type: tree
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.35)
+      - libgcc-s1
+      - libxkbcommon0
+      - libxkbcommon-x11-0
+      - libwayland-client0
+      - libx11-6
+      - libxcursor1
+      - libxi6
+      - libvulkan1 | libegl1
+    recommends:
+      - mesa-vulkan-drivers
+      - libegl-mesa0
+      - xdg-desktop-portal
+  rpm:
+    depends:
+      - libxkbcommon.so.0()(64bit)
+      - libxkbcommon-x11.so.0()(64bit)
+      - libwayland-client.so.0()(64bit)
+      - libX11.so.6()(64bit)
+      - libXcursor.so.1()(64bit)
+      - libXi.so.6()(64bit)
+      - (libvulkan.so.1()(64bit) or libEGL.so.1()(64bit))

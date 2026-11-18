@@ -1,0 +1,18 @@
+[package]
+name = "nocturne-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Nocturne store: notebooks as plain folders. Reading and writing the tree, pages, attachments, settings and search"
+
+[lints]
+workspace = true
+
+[dependencies]
+nocturne-model = { workspace = true }
+nocturne-formats = { workspace = true }
+# Only to tell an ink file from an ordinary picture by its namespace.
+nocturne-ink = { workspace = true }
+log = { workspace = true }

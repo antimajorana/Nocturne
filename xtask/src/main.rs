@@ -1,0 +1,819 @@
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+//! Repository tasks, run as `cargo xtask <task>`.
+//!
+//! ```text
+//! ci        fmt check, clippy -D warnings, tests, i18n-audit, layers, assets, docs, text
+//! fmt       cargo fmt --check
+//! clippy    cargo clippy --workspace --all-targets -- -D warnings
+//! test      cargo test --workspace
+//! layers    check that crates only depend on lower layers, and that nothing below the UI uses egui
+//! assets    check that every file under assets/ has a row in ATTRIBUTION.md
+//! docs      check that relative links in the Markdown files point at files that exist
+//! text      check text files: no byte order mark in source, manifests or Markdown, and plain
+//!           punctuation (no em or en dashes, no curly quotes) in Markdown, per .agents/TONE.md;
+//!           add `--fix` to rewrite those issues
+//! i18n-audit check UI string IDs, hard-coded text, and locale catalog coverage
+//! screenshots  regenerate docs/images from the real window with the headless runner
+//! coverage  coverage with cargo-llvm-cov, compared with docs/coverage.json (warns, never fails);
+//!           `--update` writes this run as the new baseline
+//! check-branch [--push]  the branch and history checks of quality levels L1 and L2
+//! commit-msg FILE        the commit message check, for the commit-msg hook
+//! version   print the workspace version; `version set X.Y.Z[-pre]` changes it
+//! demo [html|cmgfm|both]            build one or both official demo formats (default: both)
+//! demo-copy [html|cmgfm] [--replace]  copy one bundled demo format; --replace approves overwriting a changed scratch copy
+//! ```
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
+
+mod coverage;
+mod i18n_audit;
+mod quality;
+mod version;
+
+/// The layer of each workspace crate. A crate may depend only on crates in lower layers.
+const LAYERS: &[(&str, u8)] = &[
+    ("nocturne-model", 0),
+    ("nocturne-math", 1),
+    ("nocturne-diagram", 1),
+    ("nocturne-ink", 1),
+    ("nocturne-input-language", 1),
+    ("nocturne-onenote", 1),
+    ("nocturne-formats", 1),
+    ("nocturne-text", 1),
+    ("nocturne-store", 2),
+    ("nocturne-import", 3),
+    ("nocturne-engine", 4),
+    ("nocturne-mcp", 5),
+    ("nocturne-ui-egui", 6),
+    ("nocturne-setup", 6),
+    ("nocturne", 7),
+    ("nocturne-web", 7),
+    ("nocturne-cli", 7),
+    ("nocturne-android", 7),
+    ("nocturne-ios", 7),
+    ("xtask", 7),
+    ("nocturne-demo", 7),
+];
+
+/// Crates that nothing below the UI layer (6) may depend on.
+const UI_ONLY: &[&str] = &["egui", "eframe", "egui_extras", "egui_kittest", "winit", "rfd"];
+
+fn root() -> PathBuf {
+    // xtask lives at <root>/xtask, and cargo sets this to its directory.
+    let here = std::env::var("CARGO_MANIFEST_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("xtask"));
+    here.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn cargo(root: &Path, args: &[&str]) -> Result<(), String> {
+    println!("$ cargo {}", args.join(" "));
+    let status = Command::new("cargo").args(args).current_dir(root).status().map_err(|e| format!("cannot run cargo: {e}"))?;
+    if status.success() { Ok(()) } else { Err(format!("cargo {} failed", args.first().copied().unwrap_or(""))) }
+}
+
+/// The dependency names listed in the `[dependencies]` table of a Cargo.toml (not dev or build).
+fn dependencies(toml: &str) -> Vec<String> {
+    let toml = toml.trim_start_matches('\u{feff}');
+    let mut in_deps = false;
+    let mut out = Vec::new();
+    for line in toml.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_deps = t == "[dependencies]";
+            continue;
+        }
+        if in_deps
+            && !t.is_empty()
+            && !t.starts_with('#')
+            && let Some((name, _)) = t.split_once('=')
+        {
+            out.push(name.trim().to_string());
+        }
+    }
+    out
+}
+
+fn package_name(toml: &str) -> Option<String> {
+    let toml = toml.trim_start_matches('\u{feff}');
+    let mut in_pkg = false;
+    for line in toml.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_pkg = t == "[package]";
+            continue;
+        }
+        if in_pkg && let Some(v) = t.strip_prefix("name") {
+            return v.split_once('=').map(|(_, v)| v.trim().trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
+fn layer_of(name: &str) -> Option<u8> {
+    LAYERS.iter().find(|(n, _)| *n == name).map(|(_, l)| *l)
+}
+
+/// Problems with the dependencies of one crate, given its manifest text.
+fn layer_problems(toml: &str) -> Vec<String> {
+    let Some(name) = package_name(toml) else {
+        return vec!["a Cargo.toml has no [package] name".into()];
+    };
+    let Some(mine) = layer_of(&name) else {
+        return vec![format!("{name}: not listed in xtask LAYERS (add it)")];
+    };
+    let mut problems = Vec::new();
+    for dep in dependencies(toml) {
+        if let Some(theirs) = layer_of(&dep) {
+            if theirs >= mine {
+                problems.push(format!("{name} (layer {mine}) depends on {dep} (layer {theirs}); dependencies must point to lower layers"));
+            }
+        } else if mine < 6 && UI_ONLY.contains(&dep.as_str()) {
+            problems.push(format!("{name} (layer {mine}) depends on {dep}; only the UI layer and apps may use it"));
+        }
+    }
+    problems
+}
+
+fn layers(root: &Path) -> Result<(), String> {
+    let mut problems = Vec::new();
+    let mut manifests: Vec<PathBuf> = Vec::new();
+    for dir in ["crates", "apps"] {
+        if let Ok(rd) = fs::read_dir(root.join(dir)) {
+            manifests.extend(rd.filter_map(|e| e.ok()).map(|e| e.path().join("Cargo.toml")).filter(|p| p.is_file()));
+        }
+    }
+    manifests.push(root.join("xtask").join("Cargo.toml"));
+    manifests.push(root.join("docs").join("demo").join("scripts").join("Cargo.toml"));
+    // The Android and iOS app shells: one crate at the top of each folder (AGENTS.md, platforms).
+    manifests.push(root.join("android").join("Cargo.toml"));
+    manifests.push(root.join("ios").join("Cargo.toml"));
+    for m in &manifests {
+        let text = fs::read_to_string(m).map_err(|e| format!("{}: {e}", m.display()))?;
+        problems.extend(layer_problems(&text));
+    }
+    println!("layers: checked {} crates", manifests.len());
+    if problems.is_empty() { Ok(()) } else { Err(problems.join("\n")) }
+}
+
+fn generated_root_entry(root: &Path, path: &Path) -> bool {
+    if path.parent() != Some(root) {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    matches!(name, ".git" | ".phase1" | "dist" | "target" | "out" | "prototypes" | "snapshots" | "my-notebooks")
+        || name.starts_with(".work-officeimo-")
+}
+
+fn files_under(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let meta = fs::symlink_metadata(dir).map_err(|e| format!("inspect {}: {e}", dir.display()))?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return Err(format!("not a regular source directory: {}", dir.display()));
+    }
+    let entries = fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read an entry in {}: {e}", dir.display()))?;
+        let path = entry.path();
+        let kind = entry.file_type().map_err(|e| format!("inspect {}: {e}", path.display()))?;
+        // Skip generated root directories before inspecting their contents (such as DMG links).
+        // A worktree's .git is a file. Other regular files with these names are still source.
+        if generated_root_entry(root, &path) && (kind.is_dir() || path.file_name().is_some_and(|name| name == ".git")) {
+            continue;
+        }
+        if kind.is_dir() {
+            files_under(root, &path, out)?;
+        } else if kind.is_file() {
+            out.push(path);
+        } else {
+            return Err(format!("cannot validate a source symlink or special file: {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+/// Collect every regular file for an exact directory comparison. Reject links and special files.
+fn comparison_files_under(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read an entry in {}: {e}", dir.display()))?;
+        let path = entry.path();
+        let kind = entry.file_type().map_err(|e| format!("inspect {}: {e}", path.display()))?;
+        if kind.is_dir() {
+            comparison_files_under(&path, out)?;
+        } else if kind.is_file() {
+            out.push(path);
+        } else {
+            return Err(format!("cannot compare a symlink or special file: {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+/// Relative paths (with `/`) of asset files that ATTRIBUTION.md does not mention in backticks.
+fn unattributed(attribution: &str, assets: &[String]) -> Vec<String> {
+    assets.iter().filter(|a| !attribution.contains(&format!("`{a}`"))).cloned().collect()
+}
+
+fn assets(root: &Path) -> Result<(), String> {
+    let attribution = fs::read_to_string(root.join("ATTRIBUTION.md")).map_err(|e| format!("ATTRIBUTION.md: {e}"))?;
+    let mut files = Vec::new();
+    files_under(root, &root.join("assets"), &mut files)?;
+    files_under(root, &root.join("docs").join("images"), &mut files)?;
+    let rel: Vec<String> = files
+        .iter()
+        .filter_map(|f| f.strip_prefix(root).ok())
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .filter(|p| !p.ends_with(".gitkeep"))
+        .collect();
+    let missing = unattributed(&attribution, &rel);
+    println!("assets: {} files, {} without an ATTRIBUTION.md row", rel.len(), missing.len());
+    if missing.is_empty() { Ok(()) } else { Err(format!("add a row to ATTRIBUTION.md for:\n  {}", missing.join("\n  "))) }
+}
+
+/// Relative link targets in Markdown text: `[text](target)` where the target is not a web
+/// address, an anchor, or a mail link. The `#anchor` part is dropped.
+fn relative_links(markdown: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    for line in markdown.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let mut rest = line;
+        while let Some(i) = rest.find("](") {
+            let after = &rest[i + 2..];
+            let Some(end) = after.find(')') else { break };
+            let target = after[..end].trim();
+            rest = &after[end..];
+            let target = target.split_whitespace().next().unwrap_or("");
+            if target.is_empty() || target.starts_with('#') || target.contains("://") || target.starts_with("mailto:") {
+                continue;
+            }
+            out.push(target.split('#').next().unwrap_or("").to_string());
+        }
+    }
+    out.retain(|t| !t.is_empty());
+    out
+}
+
+fn docs(root: &Path) -> Result<(), String> {
+    let mut files = Vec::new();
+    files_under(root, &root.join("docs"), &mut files)?;
+    // The Welcome notebook's content files are laid out by `cargo xtask demo`; their links
+    // are relative to the pages they become, and the generator checks every one against the
+    // built notebook. The built notebook under docs/demo/DemoNotebook is checked here.
+    let content = root.join("docs").join("demo").join("scripts").join("content");
+    files.retain(|f| !f.starts_with(&content));
+    for name in ["README.md", "AGENTS.md", "CLAUDE.md", "ROADMAP.md", "ATTRIBUTION.md"] {
+        files.push(root.join(name));
+    }
+    let mut problems = BTreeMap::new();
+    let mut checked = 0;
+    for f in files.iter().filter(|f| f.extension().is_some_and(|e| e == "md") && f.is_file()) {
+        let text = fs::read_to_string(f).map_err(|e| format!("{}: {e}", f.display()))?;
+        let dir = f.parent().unwrap_or(root);
+        for link in relative_links(&text) {
+            checked += 1;
+            if !dir.join(&link).exists() {
+                problems.insert(format!("{} -> {link}", f.strip_prefix(root).unwrap_or(f).display()), ());
+            }
+        }
+    }
+    println!("docs: {checked} relative links checked, {} broken", problems.len());
+    if problems.is_empty() { Ok(()) } else { Err(format!("broken links:\n  {}", problems.keys().cloned().collect::<Vec<_>>().join("\n  "))) }
+}
+
+/// Problems in one text file, given its name and bytes.
+fn text_problems(name: &str, bytes: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        out.push(format!("{name}: starts with a byte order mark (save as UTF-8 without BOM)"));
+    }
+    if name.ends_with(".md") {
+        let text = String::from_utf8_lossy(bytes);
+        for (c, what) in [
+            ('\u{2014}', "an em dash"),
+            ('\u{2013}', "an en dash"),
+            ('\u{2018}', "a curly quote"),
+            ('\u{2019}', "a curly quote"),
+            ('\u{201c}', "a curly quote"),
+            ('\u{201d}', "a curly quote"),
+        ] {
+            if text.contains(c) {
+                out.push(format!("{name}: contains {what}; use plain ASCII punctuation"));
+            }
+        }
+    }
+    out
+}
+
+fn fixed_text(name: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut text = String::from_utf8(bytes.to_vec()).map_err(|_| format!("{name}: invalid UTF-8; cannot fix automatically"))?;
+    if text.starts_with('\u{FEFF}') {
+        text = text.trim_start_matches('\u{FEFF}').to_string();
+    }
+    if name.ends_with(".md") {
+        text = text.replace(['\u{2014}', '\u{2013}'], "-").replace(['\u{2018}', '\u{2019}'], "'").replace(['\u{201C}', '\u{201D}'], "\"");
+    }
+    Ok(text.into_bytes())
+}
+
+fn text(root: &Path, fix: bool) -> Result<(), String> {
+    let mut files = Vec::new();
+    files_under(root, root, &mut files)?;
+    let mut problems = Vec::new();
+    let mut n = 0;
+    for f in files {
+        let rel = f.strip_prefix(root).unwrap_or(&f);
+        let name = rel.to_string_lossy().replace('\\', "/");
+        if !(name.ends_with(".rs") || name.ends_with(".toml") || name.ends_with(".md")) {
+            continue;
+        }
+        n += 1;
+        let bytes = fs::read(&f).map_err(|e| format!("{name}: {e}"))?;
+        if fix {
+            let updated = fixed_text(&name, &bytes)?;
+            if updated != bytes {
+                fs::write(&f, updated).map_err(|e| format!("{name}: {e}"))?;
+            }
+            continue;
+        }
+        problems.extend(text_problems(&name, &bytes));
+    }
+    println!("text: {n} files checked, {} problems", problems.len());
+    if problems.is_empty() { Ok(()) } else { Err(problems.join("\n")) }
+}
+
+/// Regenerates `docs/images` by running scripts/readme-screens.jsonl through the headless
+/// runner (`crates/ui-egui/examples/ui_shot.rs`).
+fn screenshots(root: &Path) -> Result<(), String> {
+    fs::create_dir_all(root.join("docs").join("images")).map_err(|e| e.to_string())?;
+    cargo(root, &["run", "-q", "-p", "nocturne-ui-egui", "--example", "ui_shot", "--", "scripts/readme-screens.jsonl"])
+}
+
+/// Copies one checked-in demo format to the ignored test notebooks folder.
+/// The source is read-only; `--replace` is the explicit approval to replace a changed copy.
+fn demo_copy(root: &Path, args: &[String]) -> Result<(), String> {
+    let mut format: Option<&str> = None;
+    let mut replace = false;
+    for arg in args {
+        match arg.as_str() {
+            "html" | "cmgfm" if format.is_none() => format = Some(arg),
+            "--replace" if !replace => replace = true,
+            _ => return Err(format!("unknown or repeated demo-copy argument '{arg}'. Usage: cargo xtask demo-copy [html|cmgfm] [--replace]")),
+        }
+    }
+    let format = format.unwrap_or("html");
+    let source = root.join("docs").join("demo").join("DemoNotebook").join(format);
+    if !source.is_dir() {
+        return Err(format!("demo source folder is missing: {} (run `cargo xtask demo` first)", source.display()));
+    }
+
+    let notebooks = root.join("my-notebooks");
+    match fs::symlink_metadata(&notebooks) {
+        Ok(meta) if meta.file_type().is_symlink() => return Err(format!("refusing to copy through a symlink: {}", notebooks.display())),
+        Ok(meta) if !meta.is_dir() => return Err(format!("not a folder: {}", notebooks.display())),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&notebooks).map_err(|e| format!("create {}: {e}", notebooks.display()))?
+        }
+        Err(e) => return Err(format!("inspect {}: {e}", notebooks.display())),
+    }
+
+    let target = notebooks.join("welcome-notebook");
+    match fs::symlink_metadata(&target) {
+        Ok(meta) if meta.file_type().is_symlink() => return Err(format!("refusing to replace a symlink: {}", target.display())),
+        Ok(meta) if !meta.is_dir() => return Err(format!("not a folder: {}", target.display())),
+        Ok(_) if same_directory(&source, &target)? => {
+            println!("{} is already current; scratch copy unchanged", target.display());
+            return Ok(());
+        }
+        Ok(_) if !replace => {
+            return Err(format!(
+                "scratch demo differs from the official demo at {}; review it, then approve replacement with `cargo xtask demo-copy {format} --replace`",
+                target.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("inspect {}: {e}", target.display())),
+    }
+
+    let staging = notebooks.join(format!(".demo-copy-{}", std::process::id()));
+    if staging.exists() {
+        return Err(format!("temporary copy folder already exists: {}", staging.display()));
+    }
+    fs::create_dir(&staging).map_err(|e| format!("create {}: {e}", staging.display()))?;
+    let staged_notebook = staging.join("welcome-notebook");
+    if let Err(e) = copy_directory(&source, &staged_notebook) {
+        return Err(match fs::remove_dir_all(&staging) {
+            Ok(()) => e,
+            Err(cleanup) => format!("{e}; partial copy remains at {} because cleanup failed: {cleanup}", staging.display()),
+        });
+    }
+
+    let backup = staging.join("previous-copy");
+    if target.exists()
+        && let Err(e) = fs::rename(&target, &backup)
+    {
+        return Err(match fs::remove_dir_all(&staging) {
+            Ok(()) => format!("move existing test copy to staging: {e}"),
+            Err(cleanup) => format!(
+                "move existing test copy to staging: {e}; temporary folder remains at {} because cleanup failed: {cleanup}",
+                staging.display()
+            ),
+        });
+    }
+    if let Err(e) = fs::rename(&staged_notebook, &target) {
+        if backup.exists()
+            && let Err(restore) = fs::rename(&backup, &target)
+        {
+            return Err(format!(
+                "install new test copy failed ({e}); restoring the previous copy also failed ({restore}); it remains at {}",
+                backup.display()
+            ));
+        }
+        return Err(match fs::remove_dir_all(&staging) {
+            Ok(()) => format!("install new test copy: {e}"),
+            Err(cleanup) => {
+                format!("install new test copy: {e}; temporary folder remains at {} because cleanup failed: {cleanup}", staging.display())
+            }
+        });
+    }
+    fs::remove_dir_all(&staging)
+        .map_err(|e| format!("copy is ready at {}, but temporary cleanup failed at {}: {e}", target.display(), staging.display()))?;
+    println!("copied {} to {} (source unchanged)", source.display(), target.display());
+    Ok(())
+}
+
+/// Compares regular directory trees without following symlinks.
+fn same_directory(left: &Path, right: &Path) -> Result<bool, String> {
+    let mut left_files = Vec::new();
+    let mut right_files = Vec::new();
+    comparison_files_under(left, &mut left_files)?;
+    comparison_files_under(right, &mut right_files)?;
+    let relative = |root: &Path, files: &mut Vec<PathBuf>| -> Result<(), String> {
+        for file in files.iter_mut() {
+            *file = file.strip_prefix(root).map_err(|e| format!("compare {}: {e}", file.display()))?.to_path_buf();
+        }
+        files.sort();
+        Ok(())
+    };
+    relative(left, &mut left_files)?;
+    relative(right, &mut right_files)?;
+    if left_files != right_files {
+        return Ok(false);
+    }
+    for rel in left_files {
+        let a = fs::read(left.join(&rel)).map_err(|e| format!("read {}: {e}", left.join(&rel).display()))?;
+        let b = fs::read(right.join(&rel)).map_err(|e| format!("read {}: {e}", right.join(&rel).display()))?;
+        if a != b {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Copies a directory tree without following or reproducing symlinks.
+fn copy_directory(source: &Path, target: &Path) -> Result<(), String> {
+    let meta = fs::symlink_metadata(source).map_err(|e| format!("inspect {}: {e}", source.display()))?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return Err(format!("not a regular directory: {}", source.display()));
+    }
+    fs::create_dir(target).map_err(|e| format!("create {}: {e}", target.display()))?;
+    let entries = fs::read_dir(source).map_err(|e| format!("read {}: {e}", source.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read an entry in {}: {e}", source.display()))?;
+        let from = entry.path();
+        let to = target.join(entry.file_name());
+        let kind = entry.file_type().map_err(|e| format!("inspect {}: {e}", from.display()))?;
+        if kind.is_dir() {
+            copy_directory(&from, &to)?;
+        } else if kind.is_file() {
+            fs::copy(&from, &to).map_err(|e| format!("copy {} to {}: {e}", from.display(), to.display()))?;
+        } else {
+            return Err(format!("refusing to copy a special file: {}", from.display()));
+        }
+    }
+    Ok(())
+}
+
+fn run(task: &str, options: &[String]) -> Result<(), String> {
+    let root = root();
+    match task {
+        "fmt" => cargo(&root, &["fmt", "--all", "--", "--check"]),
+        "clippy" => cargo(&root, &["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]),
+        // The UI tests share a single offscreen wgpu device; concurrent rendering and texture
+        // readback collide on Windows. They run one test at a time, while the other crates run
+        // in parallel.
+        "test" => {
+            cargo(&root, &["test", "--workspace", "--exclude", "nocturne-ui-egui"])?;
+            cargo(&root, &["test", "-p", "nocturne-ui-egui", "--", "--test-threads=1"])
+        }
+        "i18n-audit" => {
+            if !options.is_empty() {
+                return Err("usage: cargo xtask i18n-audit".into());
+            }
+            i18n_audit::run(&root)
+        }
+        "layers" => layers(&root),
+        "assets" => assets(&root),
+        "docs" => docs(&root),
+        "text" => {
+            let fix = options == ["--fix"];
+            if !fix && !options.is_empty() {
+                return Err("usage: cargo xtask text [--fix]".into());
+            }
+            text(&root, fix)
+        }
+        "screenshots" => screenshots(&root),
+        "coverage" => coverage::run(&root, options),
+        "check-branch" => quality::check_branch(&root, options),
+        "commit-msg" => match options {
+            [file] => quality::commit_msg(Path::new(file)),
+            _ => Err("usage: cargo xtask commit-msg FILE".into()),
+        },
+        // The Welcome notebook (docs/demo/DemoNotebook) from its content, and the check that
+        // the checked-in copy is current.
+        "demo" => {
+            let selection = match options {
+                [] => "both".to_string(),
+                [format] if ["html", "cmgfm", "both"].contains(&format.as_str()) => format.clone(),
+                _ => return Err("usage: cargo xtask demo [html|cmgfm|both] (default: both)".into()),
+            };
+            cargo(&root, &["run", "--quiet", "-p", "nocturne-demo", "--", "build", &selection])?;
+            // The scratch copy is always replaced from docs/demo: the source is the one truth.
+            if selection == "both" {
+                demo_copy(&root, &["html".into(), "--replace".into()])?;
+                demo_copy(&root, &["cmgfm".into(), "--replace".into()])
+            } else {
+                demo_copy(&root, &[selection, "--replace".into()])
+            }
+        }
+        "demo-check" => cargo(&root, &["run", "--quiet", "-p", "nocturne-demo", "--", "check"]),
+        "demo-copy" => Err("demo-copy accepts options; use `cargo xtask demo-copy [html|cmgfm] [--replace]`".into()),
+        "ci" => {
+            for t in ["fmt", "clippy", "test", "i18n-audit", "layers", "assets", "docs", "text", "demo-check"] {
+                println!("\n== {t} ==");
+                run(t, &[]).map_err(|e| format!("{t}: {e}"))?;
+            }
+            println!("\nci: all checks passed");
+            Ok(())
+        }
+        other => Err(format!(
+            "unknown task '{other}'. Tasks: ci fmt clippy test i18n-audit layers assets docs text screenshots coverage check-branch commit-msg version demo demo-check demo-copy"
+        )),
+    }
+}
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let task = args.first().cloned().unwrap_or_else(|| "ci".into());
+    let result = match task.as_str() {
+        "version" => version::run(&root(), &args[1..]),
+        "demo-copy" => demo_copy(&root(), &args[1..]),
+        _ => run(&task, &args[1..]),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_TREE_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn create_test_tree(parent: &Path, mut next_name: impl FnMut() -> String) -> std::io::Result<PathBuf> {
+        loop {
+            let path = parent.join(next_name());
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    struct TestTree(PathBuf);
+
+    impl TestTree {
+        fn new() -> Self {
+            let path = create_test_tree(&std::env::temp_dir(), || {
+                let id = NEXT_TEST_TREE_ID.fetch_add(1, Ordering::Relaxed);
+                format!("nocturne-xtask-{}-{id}", std::process::id())
+            })
+            .expect("create test tree");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestTree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const MODEL: &str = "[package]\nname = \"nocturne-model\"\n\n[dependencies]\n";
+    const GOOD_STORE: &str = "[package]\nname = \"nocturne-store\"\n[dependencies]\nnocturne-model = { workspace = true }\nnocturne-formats = { workspace = true }\n[dev-dependencies]\negui_kittest = { workspace = true }\n";
+
+    #[test]
+    fn test_tree_creation_retries_a_name_collision() {
+        let parent = TestTree::new();
+        fs::create_dir(parent.0.join("occupied")).expect("reserve first test tree name");
+        let mut names = ["occupied", "available"].into_iter();
+
+        let created = create_test_tree(&parent.0, || names.next().expect("test name").to_owned()).expect("create a tree after collision");
+
+        assert_eq!(created, parent.0.join("available"));
+    }
+
+    #[test]
+    fn generated_exclusions_apply_only_at_repository_root() {
+        let tree = TestTree::new();
+        for name in ["dist", "out", "target", "snapshots", ".phase1"] {
+            assert!(generated_root_entry(&tree.0, &tree.0.join(name)));
+            assert!(!generated_root_entry(&tree.0, &tree.0.join("docs").join(name)));
+            assert!(!generated_root_entry(&tree.0, &tree.0.join("assets").join(name)));
+        }
+        assert!(!generated_root_entry(&tree.0, &tree.0.join("docs")));
+    }
+
+    #[test]
+    fn walker_includes_nested_source_directories_with_generated_names() {
+        let tree = TestTree::new();
+        let nested = tree.0.join("docs/out");
+        fs::create_dir_all(&nested).expect("nested docs");
+        fs::write(nested.join("page.md"), "[link](missing.md)").expect("page");
+        let mut files = Vec::new();
+        files_under(&tree.0, &tree.0, &mut files).expect("walk source");
+        assert_eq!(files, vec![nested.join("page.md")]);
+        assert!(text(&tree.0, false).is_ok());
+        fs::write(nested.join("page.md"), "bad \u{2014} punctuation").expect("bad text");
+        assert!(text(&tree.0, false).is_err(), "nested generated names must not bypass text checks");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walker_rejects_source_file_symlinks() {
+        let tree = TestTree::new();
+        fs::write(tree.0.join("source.md"), "source").expect("source");
+        std::os::unix::fs::symlink("source.md", tree.0.join("linked.md")).expect("file link");
+        assert!(files_under(&tree.0, &tree.0, &mut Vec::new()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walker_rejects_source_directory_symlinks() {
+        let tree = TestTree::new();
+        fs::create_dir(tree.0.join("docs")).expect("docs");
+        std::os::unix::fs::symlink("docs", tree.0.join("linked")).expect("directory link");
+        assert!(files_under(&tree.0, &tree.0, &mut Vec::new()).is_err());
+        assert!(files_under(&tree.0, &tree.0.join("linked"), &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn walker_excludes_generated_root_directories() {
+        let tree = TestTree::new();
+        for name in [".git", ".phase1", "dist", "target", "out", "prototypes", "snapshots", "my-notebooks", ".work-officeimo-test"] {
+            let generated = tree.0.join(name);
+            fs::create_dir(&generated).expect("generated directory");
+            fs::write(generated.join("not-source.md"), "generated").expect("generated file");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink("/Applications", generated.join("Applications")).expect("DMG link");
+        }
+        let mut files = Vec::new();
+        files_under(&tree.0, &tree.0, &mut files).expect("skip generated trees");
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn walker_preserves_regular_files_with_generated_names() {
+        let tree = TestTree::new();
+        let source = tree.0.join("out");
+        fs::write(&source, "source").expect("source file");
+        let mut files = Vec::new();
+        files_under(&tree.0, &tree.0, &mut files).expect("walk regular file");
+        assert_eq!(files, vec![source]);
+    }
+
+    #[test]
+    fn directory_comparison_sees_nested_files_even_with_generated_names() {
+        let tree = TestTree::new();
+        let left = tree.0.join("left");
+        let right = tree.0.join("right");
+        fs::create_dir_all(left.join("snapshots")).expect("left");
+        fs::create_dir_all(right.join("snapshots")).expect("right");
+        fs::write(left.join("snapshots/page.md"), "original").expect("source file");
+        fs::write(right.join("snapshots/page.md"), "changed").expect("target file");
+        assert_eq!(same_directory(&left, &right), Ok(false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_comparison_rejects_an_extra_symlink() {
+        let tree = TestTree::new();
+        let left = tree.0.join("left");
+        let right = tree.0.join("right");
+        fs::create_dir(&left).expect("left");
+        fs::create_dir(&right).expect("right");
+        fs::write(left.join("page.md"), "same").expect("left page");
+        fs::write(right.join("page.md"), "same").expect("right page");
+        std::os::unix::fs::symlink("page.md", right.join("extra.md")).expect("extra link");
+        assert!(same_directory(&left, &right).is_err());
+    }
+
+    #[test]
+    fn reads_package_and_dependencies() {
+        assert_eq!(package_name(MODEL).as_deref(), Some("nocturne-model"));
+        assert_eq!(dependencies(GOOD_STORE), vec!["nocturne-model", "nocturne-formats"], "dev-dependencies are not layer dependencies");
+    }
+
+    #[test]
+    fn an_upward_dependency_is_a_problem() {
+        let bad = "[package]\nname = \"nocturne-model\"\n[dependencies]\nnocturne-store = { workspace = true }\n";
+        assert_eq!(layer_problems(bad).len(), 1);
+        let same = "[package]\nname = \"nocturne-store\"\n[dependencies]\nnocturne-store = { workspace = true }\n";
+        assert_eq!(layer_problems(same).len(), 1, "a crate may not depend on its own layer");
+        assert!(layer_problems(GOOD_STORE).is_empty());
+    }
+
+    #[test]
+    fn egui_below_the_ui_layer_is_a_problem() {
+        let bad = "[package]\nname = \"nocturne-engine\"\n[dependencies]\negui = { workspace = true }\n";
+        assert_eq!(layer_problems(bad).len(), 1);
+        let ok = "[package]\nname = \"nocturne-ui-egui\"\n[dependencies]\negui = { workspace = true }\nnocturne-engine = { workspace = true }\n";
+        assert!(layer_problems(ok).is_empty());
+    }
+
+    #[test]
+    fn an_unlisted_crate_is_reported() {
+        assert_eq!(layer_problems("[package]\nname = \"mystery\"\n").len(), 1);
+        assert_eq!(layer_problems("no package here").len(), 1);
+    }
+
+    #[test]
+    fn attribution_rows_are_matched_by_path() {
+        let a = "| `assets/brand/a.png` | x |\n";
+        assert_eq!(unattributed(a, &["assets/brand/a.png".into(), "assets/brand/b.png".into()]), vec!["assets/brand/b.png"]);
+    }
+
+    #[test]
+    fn finds_relative_links_only() {
+        let md = "See [a](docs/a.md), [b](https://x.test), [c](#top), [d](../e.md#sec \"title\") and ![i](img/x.png).\n```\n[no](not/a/link.md)\n```\n[mail](mailto:a@b.c)\n";
+        assert_eq!(relative_links(md), vec!["docs/a.md", "../e.md", "img/x.png"]);
+    }
+
+    #[test]
+    fn text_rules() {
+        assert!(text_problems("a.rs", b"fn main() {}").is_empty());
+        assert_eq!(text_problems("a.toml", &[0xEF, 0xBB, 0xBF, b'x']).len(), 1);
+        assert_eq!(text_problems("a.md", "a \u{2014} b".as_bytes()).len(), 1);
+        assert_eq!(text_problems("a.md", "\u{201c}quoted\u{201d}".as_bytes()).len(), 2);
+        assert!(text_problems("a.rs", "// \u{2014} allowed in source".as_bytes()).is_empty(), "only Markdown is held to plain punctuation");
+    }
+
+    #[test]
+    fn text_fix_rewrites_bom_and_markdown_punctuation() {
+        let fixed = fixed_text("a.md", "\u{FEFF}a \u{2014} \u{2018}quote\u{2019}".as_bytes()).expect("valid UTF-8");
+        assert_eq!(fixed, b"a - 'quote'");
+        let source = fixed_text("a.rs", "// \u{2014}".as_bytes()).expect("valid UTF-8");
+        assert_eq!(source, "// \u{2014}".as_bytes());
+    }
+
+    #[test]
+    fn the_layer_table_covers_every_crate_of_this_repo() {
+        let root = root();
+        let mut manifests = Vec::new();
+        for dir in ["crates", "apps"] {
+            if let Ok(rd) = fs::read_dir(root.join(dir)) {
+                manifests.extend(rd.filter_map(|e| e.ok()).map(|e| e.path().join("Cargo.toml")).filter(|p| p.is_file()));
+            }
+        }
+        assert!(manifests.len() >= 8, "found {} crates", manifests.len());
+        manifests.push(root.join("android").join("Cargo.toml"));
+        for m in manifests {
+            let text = fs::read_to_string(&m).expect("manifest");
+            let name = package_name(&text).expect("name");
+            assert!(layer_of(&name).is_some(), "{name} is missing from LAYERS");
+        }
+    }
+
+    #[test]
+    fn this_repository_passes_its_own_layer_check() {
+        assert_eq!(layers(&root()), Ok(()));
+    }
+}

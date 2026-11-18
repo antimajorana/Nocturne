@@ -1,0 +1,270 @@
+name: Packaging
+
+# Packaging builds and verifies release artifacts across all 5 platforms (Linux, Windows, macOS,
+# Android, iPadOS/iOS). Called automatically by Release on new version pushes to main, by Nightly
+# release, or manually via workflow_dispatch.
+#
+# Android: the APK is signed with the release key when the ANDROID_KEYSTORE_BASE64 and
+# ANDROID_KEYSTORE_PASSWORD secrets exist (ANDROID_KEY_ALIAS and ANDROID_KEY_PASSWORD are
+# optional), and otherwise with a key made for that one build; the android-signing output says
+# which ("release" or "throwaway"), so the release notes can say so. docs/releasing.md has more.
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit, tag or branch to package (empty: the caller's commit)"
+        type: string
+        required: false
+        default: ""
+    outputs:
+      android-signing:
+        description: "How the APK was signed: release or throwaway"
+        value: ${{ jobs.android.outputs.signing }}
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: packaging-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_JOBS: "2"
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.arch }} packages
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            nfpm: Linux_x86_64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            nfpm: Linux_arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      # appimagetool is itself an AppImage. The runners have no FUSE, so it unpacks itself instead.
+      APPIMAGE_EXTRACT_AND_RUN: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgtk-3-dev libfontconfig1-dev libfreetype-dev libvulkan1 mesa-vulkan-drivers file
+      - name: Install nfpm and appimagetool
+        run: |
+          set -eu
+          curl -sSfL "https://github.com/goreleaser/nfpm/releases/download/v2.47.0/nfpm_2.47.0_${{ matrix.nfpm }}.tar.gz" | sudo tar -xz -C /usr/local/bin nfpm
+          sudo curl -sSfL -o /usr/local/bin/appimagetool "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-${{ matrix.arch }}.AppImage"
+          sudo chmod +x /usr/local/bin/appimagetool
+          nfpm --version
+          appimagetool --version
+      - name: Install Rust
+        run: rustup install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: false
+      - name: Build the tarball, AppImage, deb and rpm
+        run: packaging/linux/package.sh --formats "tar appimage deb rpm"
+      - name: Verify the package
+        run: packaging/linux/test.sh
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/linux/*.tar.gz
+            dist/linux/*.AppImage
+            dist/linux/*.deb
+            dist/linux/*.rpm
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nocturne-linux-${{ matrix.arch }}
+          path: |
+            dist/linux/*.tar.gz
+            dist/linux/*.AppImage
+            dist/linux/*.deb
+            dist/linux/*.rpm
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64 package
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Install Rust
+        shell: bash
+        run: rustup install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: false
+      - name: Install WiX
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+          wix extension add -g WixToolset.Util.wixext/5.0.2
+      - name: Build the installer and portable zip
+        shell: pwsh
+        run: ./packaging/windows/package.ps1
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/release/*.msi
+            dist/release/*.zip
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nocturne-windows-x64
+          path: dist/release/*
+          if-no-files-found: error
+
+  macos:
+    name: macOS ${{ matrix.arch }} package
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            runner: macos-15
+          - arch: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+      - name: Install Rust
+        run: rustup install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: false
+      - name: Build app, DMG and CLI archive
+        run: packaging/OSX/package.sh --arch "${{ matrix.arch }}"
+      - name: Reject stale or changed binaries
+        run: packaging/OSX/test-stale.sh "${{ matrix.arch }}"
+      - name: Reject mismatched source provenance
+        run: bash packaging/OSX/test-provenance.sh
+      - name: Verify package contents and mounted DMG
+        run: packaging/OSX/verify.sh "${{ matrix.arch }}"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/macos/*.dmg
+            dist/macos/*.zip
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nocturne-macos-${{ matrix.arch }}
+          path: |
+            dist/macos/*.dmg
+            dist/macos/*.zip
+          if-no-files-found: error
+
+  android:
+    name: Android arm64 APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      signing: ${{ steps.key.outputs.signing }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Install the Android SDK packages, the Rust target and cargo-ndk
+        run: bash android/ci-setup.sh
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: android
+          save-if: false
+      - name: Write the release key, when there is one
+        id: key
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ] && [ -n "$ANDROID_KEYSTORE_PASSWORD" ]; then
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/nocturne-release.keystore"
+            echo "ANDROID_KEYSTORE=$RUNNER_TEMP/nocturne-release.keystore" >> "$GITHUB_ENV"
+            echo "signing=release" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No ANDROID_KEYSTORE_BASE64 secret: the APK is signed with a key made for this build only, so it cannot update an earlier APK in place."
+            echo "signing=throwaway" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build the APK
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: bash android/build.sh
+      - name: Verify the APK
+        run: bash android/test.sh
+      - name: Remove the release key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/nocturne-release.keystore"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/android/*.apk
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nocturne-android-arm64
+          path: dist/android/*.apk
+          if-no-files-found: error
+
+  ios:
+    name: iPadOS / iOS arm64 IPA
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Install Rust toolchain and iOS targets
+        run: |
+          rustup install
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ios
+          save-if: false
+      - name: Install Pillow
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ios-venv"
+          "$RUNNER_TEMP/ios-venv/bin/python" -m pip install --upgrade pip pillow
+          echo "$RUNNER_TEMP/ios-venv/bin" >> "$GITHUB_PATH"
+      - name: Build iOS IPA
+        run: bash ios/build.sh
+      - name: Verify iOS IPA
+        run: bash ios/test.sh
+      - name: Smoke-test Nocturne in iPadOS Simulator
+        run: bash ios/sim_smoke.sh
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/ios/*.ipa
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nocturne-ios-arm64
+          path: dist/ios/*.ipa
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: failure()
+        with:
+          name: ios-simulator-diagnostics
+          path: |
+            dist/ios/*.log
+            dist/ios/*.png
+          if-no-files-found: ignore

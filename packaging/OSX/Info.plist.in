@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <key>CFBundleDisplayName</key><string>Nocturne</string>
+  <key>CFBundleName</key><string>Nocturne</string>
+  <key>CFBundleExecutable</key><string>nocturne</string>
+  <key>CFBundleIdentifier</key><string>io.github.antimajorana.nocturne</string>
+  <key>CFBundleIconFile</key><string>nocturne.icns</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>@VERSION@</string>
+  <key>CFBundleVersion</key><string>@BUILD@</string>
+  <key>NocturneVersion</key><string>@FULL_VERSION@</string>
+  <key>NocturneBuildCommit</key><string>@BUILD_SHA@</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+  <key>NSHumanReadableCopyright</key><string>Nocturne contributors. MIT or Apache-2.0.</string>
+</dict>
+</plist>

@@ -1,0 +1,733 @@
+//! What writing Arabic in Nocturne actually does, measured.
+//!
+//! The owner's bar is that the caret and the right-to-left experience are the best of any
+//! note taking application (`work/rtl-and-caret-bar.md` in the planning repo). A claim
+//! like that is only worth making if each part of it is measured, so every test here
+//! records what the app does today - whether that is the bar or a gap - and says which it
+//! is. A test that fails after a change is an answer that moved, not necessarily a
+//! regression: read the comment and decide.
+//!
+//! What it has found so far, in the order the tests sit below: the caret keeps off the
+//! vowels and Home and End go to the visual ends of the line; a bracket reaches egui as it
+//! was typed and is mirrored there; a line, and then a whole paragraph, is justified by
+//! stretching the letters rather than the spaces, which is the line of the bar no other
+//! note taking application answers at all; and the words of an Arabic name are drawn in
+//! reading order in the window around the page - the notebook tree and the title band -
+//! and not only inside the page. Still gaps: a triple click that takes the line, and
+//! sorting names by Arabic collation rather than by code point.
+
+use egui_kittest::Harness;
+use nocturne_ui_egui::{bidi, fonts, theme::Theme};
+
+/// One sentence of plain Arabic: "what you can do here".
+const LINE: &str = "ما الذي يمكنك فعله هنا";
+/// The same with harakat on the first word, and a word with a bracket in it.
+const VOWELLED: &str = "كِتَاب";
+const BRACKETED: &str = "النص (مثال) هنا";
+/// A page of the demo notebook, as the tree lists it: "pictures and files". The two words
+/// have a letter each that is in neither of the others, which is how a glyph is found again
+/// after shaping: `ص` in the first word, `ف` in the second.
+const NAME: &str = "الصور والملفات";
+
+fn harness() -> Harness<'static> {
+    let mut h = Harness::builder().with_size(egui::vec2(600.0, 200.0)).build_ui(|ui| fonts::install_once(ui.ctx()));
+    h.run();
+    h
+}
+
+/// Runs `f` inside a frame that has our fonts, and gives back what it returns.
+fn in_frame<T: Default>(mut f: impl FnMut(&egui::Ui) -> T) -> T {
+    let h = harness();
+    let mut out = T::default();
+    let mut frame = h.ctx.run_ui(egui::RawInput::default(), |ui| {
+        fonts::install_once(ui.ctx());
+        out = f(ui);
+    });
+    frame.textures_delta.clear();
+    out
+}
+
+/// 2.4 of the bar. Home and End move to the ends of the line's text. In a line that reads
+/// right to left that puts the caret at the right edge for Home and the left edge for End,
+/// which is what Word and a browser do: the key means the start of the line, and where
+/// that is on screen follows the direction.
+///
+/// Measured: **the bar**. The caret is further right after Home than after End.
+#[test]
+fn home_and_end_go_to_the_visual_ends_of_a_right_to_left_line() {
+    let t = Theme::DEFAULT.tokens();
+    let (home, end) = in_frame(|ui| {
+        let pieces = bidi::plain(LINE, 16.0, &t);
+        let home = bidi::caret(ui, LINE, &pieces, 0, 16.0, 400.0, None).map(|r| r.min.x).unwrap_or(0.0);
+        let end = bidi::caret(ui, LINE, &pieces, LINE.len(), 16.0, 400.0, None).map(|r| r.min.x).unwrap_or(0.0);
+        (home, end)
+    });
+    assert!(home > end + 50.0, "Home is at the right edge and End at the left: home {home}, end {end}");
+    assert!(home > 380.0, "and the line hangs from the right edge it was given: {home}");
+}
+
+/// 2.9 of the bar. A step never lands between a letter and the diacritic on it: a caret
+/// there would be between two things that are drawn as one, and the next keystroke would
+/// split the letter from its vowel.
+///
+/// Measured: **the bar**. parley moves by grapheme, so `كِتَاب` is four stops, not six.
+#[test]
+fn a_step_never_lands_between_a_letter_and_its_diacritic() {
+    let marks: Vec<usize> = VOWELLED.char_indices().filter(|(_, c)| matches!(c, '\u{64b}'..='\u{65f}' | '\u{670}')).map(|(i, _)| i).collect();
+    assert_eq!(marks.len(), 2, "the word has two harakat in it: {marks:?}");
+
+    // Every stop the caret makes walking the word. In a right-to-left word the left
+    // arrow is the one that goes forward through the letters, which is itself worth
+    // saying: at the start of the word the right arrow has nowhere to go.
+    assert_eq!(bidi::step(VOWELLED, 0, true, 16.0, 400.0, None), 0, "the right arrow is already at the start of a right-to-left word");
+    let mut stops = vec![0usize];
+    let mut at = 0usize;
+    for _ in 0..12 {
+        let next = bidi::step(VOWELLED, at, false, 16.0, 400.0, None);
+        if next == at {
+            break;
+        }
+        at = next;
+        stops.push(at);
+    }
+    assert_eq!(*stops.last().unwrap_or(&0), VOWELLED.len(), "the steps reach the end: {stops:?}");
+    for mark in &marks {
+        assert!(!stops.contains(mark), "no stop sits on the diacritic at {mark}: {stops:?}");
+    }
+    assert_eq!(stops.len(), 5, "four letters, four stops and the end: {stops:?}");
+}
+
+/// 2.9 again, from the other side: a click near a vowelled letter puts the caret beside
+/// the letter, not between it and its vowel.
+///
+/// Measured: **the bar**, once the step was fixed on 2026-10-19.
+#[test]
+fn a_click_inside_a_vowelled_letter_lands_beside_it() {
+    let marks: Vec<usize> = VOWELLED.char_indices().filter(|(_, c)| matches!(c, '\u{64b}'..='\u{65f}' | '\u{670}')).map(|(i, _)| i).collect();
+    // Points across the word, from its left edge to its right.
+    for step in 0..40 {
+        let x = step as f32 * 3.0;
+        let at = bidi::hit(VOWELLED, egui::vec2(x, 8.0), 16.0, 400.0, None);
+        assert!(!marks.contains(&at), "a click at x={x} landed on the mark at {at}");
+    }
+}
+
+/// 2.7 of the bar. A triple click takes the line.
+///
+/// Measured: **a gap**. The page editor answers a double click, which takes the word, and
+/// nothing answers a third. Written as what it does today so that building it fails here.
+#[test]
+fn a_triple_click_does_not_take_the_line_yet() {
+    let source = include_str!("../src/pageedit.rs");
+    assert!(source.contains("double_clicked()"), "a double click takes the word");
+    assert!(!source.contains("triple_clicked()"), "a triple click is not answered yet: when it is, this test should say what it takes instead");
+}
+
+/// 1.5 of the bar. In a right-to-left line a bracket is mirrored when it is drawn, and
+/// sits on the side the Unicode algorithm puts it (UAX #9, L4): an opening bracket typed
+/// before a word appears to the right of that word, drawn as `)`.
+///
+/// Measured: **the bar**, and not by reading the characters - they say nothing about which
+/// glyph is drawn. The page `النص (مثال` was rendered, then the same with a closing
+/// bracket, and the two pictures differ in exactly one 9 by 28 patch: the bracket. In the
+/// first, the glyph drawn is `)`, to the right of `مثال` and left of `النص`, which is
+/// where and how it belongs. egui mirrors it; nothing in Nocturne has to.
+///
+/// What is asserted here is the part a test can hold: the characters reach egui as they
+/// were typed, so the mirroring is egui's and would be lost if a run were ever handed over
+/// pre-reversed. The picture is in the journal.
+#[test]
+fn a_bracket_in_a_right_to_left_line_reaches_egui_as_it_was_typed() {
+    let t = Theme::DEFAULT.tokens();
+    let drawn: Vec<char> = in_frame(|ui| {
+        let pieces = bidi::plain(BRACKETED, 16.0, &t);
+        let (runs, _) = bidi::runs(ui, BRACKETED, &pieces, 16.0, 400.0, None);
+        runs.iter().flat_map(|d| d.galley.text().chars().collect::<Vec<_>>()).collect()
+    });
+    assert!(drawn.contains(&'('), "the opening bracket is handed over as itself: {drawn:?}");
+    assert!(drawn.contains(&')'), "and so is the closing one");
+}
+
+/// 1.8 of the bar: justification by kashida, the one line on it that no other note taking
+/// application answers at all. OneNote, Obsidian and Notion all justify Arabic the Latin
+/// way, by pulling the words apart, which is what leaves the rivers of white down a
+/// justified Arabic page.
+///
+/// Measured: **it works**, in the face the page is drawn with. `nocturne_text::kashida`
+/// picks the joins to stretch and egui shapes the tatweels into the words, so the line
+/// reaches the column within one tatweel of the target with every space exactly as wide as
+/// it was. Set `NOCTURNE_UI_VISUAL_DIR` to look at it.
+///
+/// Wired into the window on 2026-10-19: the Home tab's alignment menu has a Justify
+/// entry, the page records which paragraphs are justified on a line in its head
+/// (`nocturne_model::justify`), and the painter stretches them. This test is the engine
+/// on one line; the next one is the paragraph as the page draws it.
+#[test]
+fn a_line_is_justified_by_stretching_the_letters_not_the_spaces() {
+    const COLUMN: f32 = 520.0;
+    const SENTENCE: &str = "الملاحظات تعيش أطول من البرنامج";
+    let t = Theme::DEFAULT.tokens();
+    let (natural, filled, step, out) = in_frame(|ui| {
+        // Measured the way the line is actually drawn, and in the column it is drawn in:
+        // the bidi painter places each word itself and decides its own wrapping, so its
+        // answer is the one that counts. Measuring the string on its own instead is off by
+        // the spaces, and the line then wraps one word past the column. A stretch that
+        // wraps the line is no width at all, which is how the search knows to stop.
+        let line_height = {
+            let pieces = bidi::plain(SENTENCE, 18.0, &t);
+            bidi::runs(ui, SENTENCE, &pieces, 18.0, COLUMN, None).1.y
+        };
+        let mut width = |s: &str| {
+            let pieces = bidi::plain(s, 18.0, &t);
+            // Laid out in the column, the painter reports the column's own width, so the
+            // height is what says whether the line still fits; the ink width comes from
+            // laying the same line out with nothing to wrap against.
+            if bidi::runs(ui, s, &pieces, 18.0, COLUMN, None).1.y > line_height + 1.0 {
+                return f32::INFINITY;
+            }
+            bidi::runs(ui, s, &pieces, 18.0, f32::INFINITY, None).1.x
+        };
+        let natural = width(SENTENCE);
+        // The strongest of Word's three: this test is about whether kashida can fill a
+        // line at all, and Low and Medium are deliberate ceilings that may leave one
+        // short. Which setting leaves what is measured in the test below.
+        let out = nocturne_text::kashida::justify(SENTENCE, COLUMN, nocturne_model::justify::Strength::High, &mut width);
+        let step = width("ـ");
+        (natural, width(&out), step, out)
+    });
+    assert!(natural < COLUMN, "the sentence starts short of the column: {natural}");
+    assert!(filled.is_finite(), "the justified line still fits on one line");
+    assert!(filled <= COLUMN, "it does not run past the column: {filled}");
+    assert!(COLUMN - filled <= step + 0.5, "and it gets there: {natural} to {filled} of {COLUMN}, one step is {step}");
+    // Only tatweels were added: every word, and every space between them, is untouched.
+    let stripped: String = out.chars().filter(|c| *c != nocturne_text::kashida::TATWEEL).collect();
+    assert_eq!(stripped, SENTENCE);
+    assert_eq!(out.matches(' ').count(), SENTENCE.matches(' ').count(), "no space was widened or added");
+    assert!(out.contains(nocturne_text::kashida::TATWEEL), "something was stretched");
+    picture(SENTENCE, &out, COLUMN);
+}
+
+/// 1.8 of the bar, as a page draws it: a whole paragraph of Arabic, several lines long,
+/// with every line but the last reaching the column and the last one left as it fell.
+///
+/// Measured: **it works**. `bidi::stretched` is what the painter calls for a paragraph the
+/// page has marked justified. It walks the paragraph's lines, stretches each but the last,
+/// and leaves the words alone: what comes back is the same sentences with tatweels in the
+/// joins. Set `NOCTURNE_UI_VISUAL_DIR` to look at it.
+///
+/// The last line is the part worth saying out loud. A justified paragraph whose closing
+/// half-sentence is pulled out to the margin is the mark of a bad typesetter, and every
+/// word processor that gets Arabic justification wrong gets this wrong too.
+#[test]
+fn a_whole_paragraph_is_justified_except_its_last_line() {
+    const COLUMN: f32 = 420.0;
+    const SIZE: f32 = 16.0;
+    // Four sentences, long enough to wrap several times in a column of that width.
+    const PARAGRAPH: &str = "الملاحظات يجب أن تعيش أطول من البرنامج الذي كتبها، ولهذا تحفظ نوكتورن كل صفحة في مجلد من ملفات نصية عادية يقرؤها أي محرر. الدفتر مجلد، والقسم مجلد، والصفحة مجلد فيه ملف واحد وصوره ومرفقاته.";
+
+    let t = Theme::DEFAULT.tokens();
+    let (lines, stretched, tatweels) = in_frame(|ui| {
+        let pieces = bidi::plain(PARAGRAPH, SIZE, &t);
+        let (out, moved) = bidi::stretched(ui, PARAGRAPH, &pieces, SIZE, COLUMN, nocturne_model::justify::Strength::High);
+        // Every line as it is drawn: its left edge and its right edge in the column.
+        let (drawn, _) = bidi::runs(ui, &out, &moved, SIZE, COLUMN, None);
+        let mut rows: Vec<(f32, f32, f32)> = Vec::new();
+        for d in &drawn {
+            let (left, right) = (d.at.x, d.at.x + d.galley.rect.width());
+            match rows.iter_mut().find(|(y, _, _)| (*y - d.at.y).abs() < 1.0) {
+                Some((_, l, r)) => {
+                    *l = l.min(left);
+                    *r = r.max(right);
+                }
+                None => rows.push((d.at.y, left, right)),
+            }
+        }
+        rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let count = out.chars().filter(|c| *c == nocturne_text::kashida::TATWEEL).count();
+        (rows, out, count)
+    });
+
+    assert!(lines.len() >= 3, "the paragraph wraps to several lines: {}", lines.len());
+    // One tatweel is the smallest step a plain face has, so a line is as full as it can be
+    // when it is within a few points of the column. A little over is the search landing on
+    // the nearer side of the target, which is what `kashida::justify` is asked to do.
+    // The paragraph reads right to left, so every line hangs from the right edge of the
+    // column and it is the left edge that says whether a line was filled.
+    let (_, last_left, _) = lines.last().copied().unwrap_or_default();
+    for (n, (_, left, right)) in lines.iter().enumerate().take(lines.len() - 1) {
+        assert!(*left < 14.0, "line {n} was stretched all the way to the far edge: it starts at {left}");
+        assert!((COLUMN - *right).abs() < 14.0, "line {n} still hangs from the near edge: {left} to {right} of {COLUMN}");
+    }
+    assert!(last_left > 20.0, "the last line is left where it fell, not pulled out: it starts at {last_left} of {COLUMN}");
+
+    // Nothing but tatweels was added, and no space was widened or taken away.
+    assert!(tatweels > 0, "something was stretched");
+    let stripped: String = stretched.chars().filter(|c| *c != nocturne_text::kashida::TATWEEL).collect();
+    assert_eq!(stripped, PARAGRAPH, "the words are the writer's own");
+    assert_eq!(stretched.matches(' ').count(), PARAGRAPH.matches(' ').count(), "no space was widened or added");
+    paragraph_picture(PARAGRAPH, &stretched, COLUMN, SIZE);
+}
+
+/// Draws the ragged paragraph above the justified one.
+fn paragraph_picture(plain: &str, justified: &str, column: f32, size: f32) {
+    let Some(dir) = std::env::var_os("NOCTURNE_UI_VISUAL_DIR") else { return };
+    let dir = std::path::PathBuf::from(dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let t = Theme { mode: nocturne_ui_egui::theme::Mode::Light, accent: nocturne_ui_egui::theme::Accent::Default }.tokens();
+    let (plain, justified) = (plain.to_string(), justified.to_string());
+    let mut h = Harness::builder().with_size(egui::vec2(column + 48.0, 320.0)).with_pixels_per_point(2.0).wgpu().build_ui(move |ui| {
+        fonts::install_once(ui.ctx());
+        ui.painter().rect_filled(ui.max_rect(), 0.0, t.editor);
+        ui.add_space(16.0);
+        for text in [plain.as_str(), justified.as_str()] {
+            let pieces = bidi::plain(text, size, &t);
+            let (drawn, used) = bidi::runs(ui, text, &pieces, size, column, None);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(column, used.y.max(24.0)), egui::Sense::hover());
+            bidi::paint(ui, rect.min, &drawn);
+            ui.painter().rect_stroke(
+                egui::Rect::from_min_size(rect.min, egui::vec2(column, used.y.max(24.0))),
+                0.0,
+                egui::Stroke::new(1.0, t.muted),
+                egui::StrokeKind::Outside,
+            );
+            ui.add_space(22.0);
+        }
+    });
+    h.run();
+    if let Ok(img) = h.render() {
+        let _ = img.save(dir.join("kashida-paragraph.png"));
+    }
+}
+
+/// Draws the ragged line above the justified one, so the difference can be looked at
+/// rather than argued about. Only when `NOCTURNE_UI_VISUAL_DIR` says where to put it.
+fn picture(plain: &str, justified: &str, column: f32) {
+    let Some(dir) = std::env::var_os("NOCTURNE_UI_VISUAL_DIR") else { return };
+    let dir = std::path::PathBuf::from(dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let t = Theme { mode: nocturne_ui_egui::theme::Mode::Light, accent: nocturne_ui_egui::theme::Accent::Default }.tokens();
+    let (plain, justified) = (plain.to_string(), justified.to_string());
+    let mut h = Harness::builder().with_size(egui::vec2(column + 40.0, 150.0)).with_pixels_per_point(2.0).wgpu().build_ui(move |ui| {
+        fonts::install_once(ui.ctx());
+        ui.painter().rect_filled(ui.max_rect(), 0.0, t.editor);
+        ui.add_space(20.0);
+        for line in [plain.as_str(), justified.as_str()] {
+            let pieces = bidi::plain(line, 18.0, &t);
+            let (drawn, size) = bidi::runs(ui, line, &pieces, 18.0, column, None);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(column, size.y.max(24.0)), egui::Sense::hover());
+            bidi::paint(ui, rect.min, &drawn);
+            // The column the line is being justified into, so the eye can see which
+            // one reaches it.
+            ui.painter().rect_stroke(
+                egui::Rect::from_min_size(rect.min, egui::vec2(column, size.y.max(24.0))),
+                0.0,
+                egui::Stroke::new(1.0, t.muted),
+                egui::StrokeKind::Outside,
+            );
+            ui.add_space(24.0);
+        }
+    });
+    h.run();
+    if let Ok(img) = h.render() {
+        let _ = img.save(dir.join("kashida.png"));
+    }
+}
+
+/// 1.2 of the bar, in the window rather than in the page. Every label the window draws
+/// around the page - a row of the notebook tree, the title band above it - puts the words
+/// of an Arabic name in the order they are read.
+///
+/// Measured: **the bar**, from 2026-10-19. Before that day it was a gap, and the most
+/// visible one left in the app: `Painter::text` shapes the letters of each word correctly
+/// and then puts the next word to the right of the one before it, so the demo notebook's
+/// Arabic section listed `الصور والملفات` as `والملفات الصور` in a tree that is on screen
+/// all the time. `bidi::line_at` is what the window now draws a label with, and the second
+/// half of this test is the fault it was built for, still there in egui underneath.
+#[test]
+fn the_words_of_an_arabic_name_are_drawn_in_reading_order_in_the_window() {
+    let first = 'ص'; // in الصور, the word that is read first
+    let second = 'ف'; // in والملفات, the word that is read second
+    assert_eq!(NAME.matches(first).count(), 1, "the letter is in one word only");
+    assert_eq!(NAME.matches(second).count(), 1);
+
+    // What the window now draws: one galley per word, each placed where it belongs.
+    let h = harness();
+    let mut frame = h.ctx.run_ui(egui::RawInput::default(), |ui| {
+        fonts::install_once(ui.ctx());
+        let painter = ui.painter().clone();
+        bidi::line_at(
+            ui,
+            &painter,
+            egui::pos2(40.0, 40.0),
+            egui::Align2::LEFT_CENTER,
+            NAME,
+            14.0,
+            egui::Color32::BLACK,
+            // A tree row and the window's band have no page to follow: the name decides.
+            None,
+        );
+    });
+    let words: Vec<(f32, String)> = frame
+        .shapes
+        .iter()
+        .filter_map(|c| match &c.shape {
+            egui::Shape::Text(t) => Some((t.pos.x, t.galley.text().to_string())),
+            _ => None,
+        })
+        .collect();
+    frame.textures_delta.clear();
+    assert_eq!(words.len(), 2, "a word to a galley, placed one by one: {words:?}");
+    let x_of = |needle: char| words.iter().find(|(_, t)| t.contains(needle)).map(|(x, _)| *x);
+    let (a, b) = (x_of(first).unwrap_or(0.0), x_of(second).unwrap_or(0.0));
+    assert!(a > b, "the word that is read first is drawn to the right of the second: {a} then {b} in {words:?}");
+
+    // And the fault underneath, so this test says why the helper exists: handed the whole
+    // string, egui draws the first word to the left of the second, which is backwards.
+    let mut frame = h.ctx.run_ui(egui::RawInput::default(), |ui| {
+        fonts::install_once(ui.ctx());
+        ui.painter().text(egui::pos2(40.0, 40.0), egui::Align2::LEFT_CENTER, NAME, egui::FontId::proportional(14.0), egui::Color32::BLACK);
+    });
+    let plain: Vec<(f32, f32)> = frame
+        .shapes
+        .iter()
+        .filter_map(|c| match &c.shape {
+            egui::Shape::Text(t) => {
+                let at = |needle: char| t.galley.rows.first().and_then(|r| r.glyphs.iter().find(|g| g.chr == needle)).map(|g| g.pos.x);
+                Some((at(first)?, at(second)?))
+            }
+            _ => None,
+        })
+        .collect();
+    frame.textures_delta.clear();
+    let (a, b) = plain.first().copied().unwrap_or_default();
+    assert!(a < b, "egui on its own still draws the words the other way round: {a} then {b}");
+}
+
+/// 1.1 of the bar: a page the writer has set to right to left is laid out that way, words
+/// and all, and not only the lines that happen to be in Arabic.
+///
+/// Measured: **the bar**, from 2026-10-19, and **a gap before that day**. The page
+/// direction was read from the file and carried into the painter, but the rule that used it
+/// asked the line's own first letter first, so any line with a letter in it answered for
+/// itself and the page was consulted only for a line of digits or an empty one. Setting a
+/// page of English to right to left moved nothing on the screen; setting a page of Arabic
+/// to left to right moved nothing either. The owner reported it in those words.
+///
+/// What it does now is what `dir` on a containing element does in a browser, and what a
+/// section direction does in Word: the paragraph's own mark wins, then the page, then the
+/// paragraph's first strong letter. `nocturne_model::direction_in` is the rule, and this
+/// test drives the page painter itself rather than the rule, so the wiring is measured too.
+#[test]
+fn a_page_set_right_to_left_lays_out_english_that_way() {
+    const ENGLISH: &str = "Notes outlive the program.";
+    let t = Theme::DEFAULT.tokens();
+    // The left edge of the words as they are drawn, and whether the page painter drew them.
+    let edge_of = |page: Option<nocturne_model::Dir>| -> f32 {
+        let h = harness();
+        let blocks = nocturne_ui_egui::preview::blocks_for(nocturne_model::PageFormat::Cmgfm, ENGLISH);
+        let mut frame = h.ctx.run_ui(egui::RawInput::default(), |ui| {
+            fonts::install_once(ui.ctx());
+            ui.set_width(560.0);
+            nocturne_ui_egui::preview::show(ui, &blocks, std::path::Path::new("."), &t, page, &Default::default());
+        });
+        let left = frame
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Text(text) if text.galley.text().contains("Notes") || text.galley.text().contains("outlive") => Some(text.pos.x),
+                _ => None,
+            })
+            .fold(f32::INFINITY, f32::min);
+        frame.textures_delta.clear();
+        left
+    };
+
+    let loose = edge_of(None);
+    let right_to_left = edge_of(Some(nocturne_model::Dir::Rtl));
+    let left_to_right = edge_of(Some(nocturne_model::Dir::Ltr));
+    assert!(loose.is_finite() && right_to_left.is_finite(), "the words were drawn both ways: {loose} and {right_to_left}");
+    // A page that says nothing leaves English where English goes, and so does a page set
+    // the same way. A page set the other way moves the line across to the far edge.
+    assert!((loose - left_to_right).abs() < 1.0, "a page set left to right draws English where it already was: {loose} then {left_to_right}");
+    assert!(right_to_left > loose + 100.0, "the page carries the paragraph to the right edge: {loose} then {right_to_left}");
+
+    // And the rule underneath, in the three cases that matter.
+    use nocturne_model::{Dir, direction_in, text::set_direction};
+    assert_eq!(direction_in(ENGLISH, Some(Dir::Rtl)), Dir::Rtl, "the page decides for a paragraph with no mark");
+    assert_eq!(direction_in(&set_direction(ENGLISH, Some(Dir::Ltr)), Some(Dir::Rtl)), Dir::Ltr, "the paragraph's own mark wins");
+    assert_eq!(direction_in(ENGLISH, None), Dir::Ltr, "and a page that says nothing leaves it to the words");
+}
+
+/// 1.8 of the bar again, at Word's three strengths. Justify Low, Justify Medium and
+/// Justify High decide how many kashidas a line may take, and Nocturne has all three under
+/// those names (`docs/rtl-in-word-and-onenote.md`).
+///
+/// Measured: **the bar**, drawn through the page painter. Each strength is a ceiling rather
+/// than a target, so a line the weakest setting can already fill looks the same at all
+/// three; the three part company on a hungry line, which is what this paragraph of long
+/// words in a narrow column gives. At every strength only tatweels are added, no space is
+/// touched and the last line is left where it fell. Set `NOCTURNE_UI_VISUAL_DIR` to see
+/// them side by side.
+#[test]
+fn the_three_justify_strengths_differ_on_the_page() {
+    const COLUMN: f32 = 300.0;
+    const SIZE: f32 = 16.0;
+    // Long words, so each line is left well short of the margin when it wraps and the
+    // weaker settings cannot close the gap. A paragraph of short words fills easily and
+    // then all three settings draw the same line, which is the point of a ceiling.
+    const PARAGRAPH: &str = "الاستخدام المعلومات البرمجيات الملاحظات التطبيقات المستندات الاحتياطي الصفحات المرفقات الاستعراض";
+    use nocturne_model::justify::Strength;
+    let t = Theme::DEFAULT.tokens();
+
+    let stretched_at = |strength: Strength| -> String {
+        in_frame(|ui| {
+            let pieces = bidi::plain(PARAGRAPH, SIZE, &t);
+            bidi::stretched(ui, PARAGRAPH, &pieces, SIZE, COLUMN, strength).0
+        })
+    };
+    let counts: Vec<usize> =
+        Strength::ALL.iter().map(|s| stretched_at(*s).chars().filter(|c| *c == nocturne_text::kashida::TATWEEL).count()).collect();
+    let (low, medium, high) = (counts[0], counts[1], counts[2]);
+    assert!(low > 0, "even the weakest setting stretches the lines: {counts:?}");
+    assert!(low < medium && medium < high, "the three are three: {counts:?}");
+
+    for strength in Strength::ALL {
+        let out = stretched_at(strength);
+        // Only tatweels were added, and no space was widened or taken away.
+        let stripped: String = out.chars().filter(|c| *c != nocturne_text::kashida::TATWEEL).collect();
+        assert_eq!(stripped, PARAGRAPH, "{strength:?} added nothing but tatweels");
+        assert_eq!(out.matches(' ').count(), PARAGRAPH.matches(' ').count(), "{strength:?} widened no space");
+
+        let lines = drawn_lines(&out, SIZE, COLUMN, &t);
+        assert!(lines.len() >= 3, "{strength:?}: the paragraph wraps: {}", lines.len());
+        let (_, last_left, _) = lines.last().copied().unwrap_or_default();
+        assert!(last_left > 20.0, "{strength:?}: the last line is left where it fell: {last_left}");
+        for (n, (_, _, right)) in lines.iter().enumerate().take(lines.len() - 1) {
+            assert!((COLUMN - *right).abs() < 14.0, "{strength:?} line {n} still hangs from the near edge: {right}");
+        }
+    }
+
+    // The strongest setting carries every line but the last to the far edge. The weakest is
+    // not asked to: it leaves a join alone rather than stretch one that would look wrong,
+    // and a line it cannot fill stays a little short. That is the difference, measured.
+    let far_edge = |strength: Strength| -> f32 {
+        let out = stretched_at(strength);
+        let lines = drawn_lines(&out, SIZE, COLUMN, &t);
+        lines.iter().take(lines.len().saturating_sub(1)).map(|(_, left, _)| *left).fold(0.0_f32, f32::max)
+    };
+    let ragged = {
+        let lines = drawn_lines(PARAGRAPH, SIZE, COLUMN, &t);
+        lines.iter().take(lines.len().saturating_sub(1)).map(|(_, left, _)| *left).fold(0.0_f32, f32::max)
+    };
+    assert!(far_edge(Strength::High) < 18.0, "high reaches the far edge on every line it justifies: {}", far_edge(Strength::High));
+    assert!(far_edge(Strength::Low) < ragged, "low still closes some of the gap: {} against {ragged} ragged", far_edge(Strength::Low));
+
+    strengths_picture(PARAGRAPH, &Strength::ALL.map(stretched_at), COLUMN, SIZE);
+}
+
+/// Each drawn line of `text` in a column: its top, its left edge and its right edge.
+fn drawn_lines(text: &str, size: f32, column: f32, t: &nocturne_ui_egui::theme::Tokens) -> Vec<(f32, f32, f32)> {
+    in_frame(|ui| {
+        let pieces = bidi::plain(text, size, t);
+        let (drawn, _) = bidi::runs(ui, text, &pieces, size, column, None);
+        let mut rows: Vec<(f32, f32, f32)> = Vec::new();
+        for d in &drawn {
+            let (left, right) = (d.at.x, d.at.x + d.galley.rect.width());
+            match rows.iter_mut().find(|(y, _, _)| (*y - d.at.y).abs() < 1.0) {
+                Some((_, l, r)) => {
+                    *l = l.min(left);
+                    *r = r.max(right);
+                }
+                None => rows.push((d.at.y, left, right)),
+            }
+        }
+        rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+        rows
+    })
+}
+
+/// The ragged paragraph and then the three strengths, one under another.
+fn strengths_picture(plain: &str, stretched: &[String; 3], column: f32, size: f32) {
+    let Some(dir) = std::env::var_os("NOCTURNE_UI_VISUAL_DIR") else { return };
+    let dir = std::path::PathBuf::from(dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let t = Theme { mode: nocturne_ui_egui::theme::Mode::Light, accent: nocturne_ui_egui::theme::Accent::Default }.tokens();
+    let labels = ["ragged", "low", "medium", "high"];
+    let all: Vec<String> = std::iter::once(plain.to_string()).chain(stretched.iter().cloned()).collect();
+    let mut h = Harness::builder().with_size(egui::vec2(column + 90.0, 560.0)).with_pixels_per_point(2.0).wgpu().build_ui(move |ui| {
+        fonts::install_once(ui.ctx());
+        ui.painter().rect_filled(ui.max_rect(), 0.0, t.editor);
+        ui.add_space(14.0);
+        for (label, text) in labels.iter().zip(&all) {
+            let pieces = bidi::plain(text, size, &t);
+            let (drawn, used) = bidi::runs(ui, text, &pieces, size, column, None);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(column + 70.0, used.y.max(24.0)), egui::Sense::hover());
+            bidi::paint(ui, rect.min, &drawn);
+            ui.painter().text(
+                egui::pos2(rect.min.x + column + 8.0, rect.min.y),
+                egui::Align2::LEFT_TOP,
+                label,
+                egui::FontId::proportional(11.0),
+                t.muted,
+            );
+            ui.painter().rect_stroke(
+                egui::Rect::from_min_size(rect.min, egui::vec2(column, used.y.max(24.0))),
+                0.0,
+                egui::Stroke::new(1.0, t.muted),
+                egui::StrokeKind::Outside,
+            );
+            ui.add_space(18.0);
+        }
+    });
+    h.run();
+    if let Ok(img) = h.render() {
+        let _ = img.save(dir.join("kashida-strengths.png"));
+    }
+}
+
+/// 4.3 of the bar. Pages and sections are listed in the order a reader of the script
+/// expects.
+///
+/// Measured: **a gap, in part**. The tree sorts by the `order` in each `_node.toml` first,
+/// and only falls back to the folder name, compared byte by byte. For Arabic that is code
+/// point order, which is the alphabet's order for the plain letters but puts every word
+/// starting with a hamza form (`أ`, `إ`, `آ`) after plain `ا`, and ignores the collation
+/// rules a reader would expect. Pages the owner has ordered are unaffected.
+#[test]
+fn arabic_names_sort_by_code_point_not_by_collation() {
+    let mut names = ["بيت".to_string(), "أحمد".to_string(), "تاج".to_string(), "احمد".to_string()];
+    names.sort();
+    assert_eq!(
+        names,
+        ["أحمد", "احمد", "بيت", "تاج"],
+        "code point order: the hamza form sorts before the plain alef because U+0623 is below U+0627,          and a reader expects the two spellings of the same name to collate together"
+    );
+}
+
+/// 2.1 of the bar. An arrow key moves the caret the way it points, through a line that
+/// mixes Arabic and Latin, and reaches the other end of it.
+///
+/// Measured: **the bar**, from 2026-10-19, and a plain fault before that. The caret is kept
+/// as a byte offset and nothing else, and parley's own visual step is sensitive to
+/// affinity, meaning which side of a direction boundary the caret sits on, so a step built
+/// on it read the wrong side back. Holding the right arrow in `السعر 123 ريال` cycled bytes
+/// 12, 13 and 14 for ever: the caret entered the digits and never left them. The owner
+/// reported it as the caret jumping the wrong way and skipping.
+///
+/// The step is taken by where the caret is drawn now: the nearest stop on the line further
+/// along in the direction asked for. It cannot cycle, because every step moves strictly one
+/// way across the line, and that is the whole of what this test checks - the caret never
+/// goes backwards, and it gets to the far end.
+#[test]
+fn an_arrow_key_walks_a_mixed_line_the_way_it_points() {
+    const W: f32 = 400.0;
+    for line in [LINE, "السعر 123 ريال", "مرحبا hello بك", "price 45 ريال"] {
+        let t = Theme::DEFAULT.tokens();
+        let x_at = |at: usize| -> f32 {
+            in_frame(|ui| {
+                let pieces = bidi::plain(line, 16.0, &t);
+                bidi::caret(ui, line, &pieces, at, 16.0, W, None).map(|r| r.min.x).unwrap_or(f32::NAN)
+            })
+        };
+        for right in [false, true] {
+            // Start at the far end of the line from where the arrow points, which is a
+            // question of where the ends are drawn and not of which byte comes first: in a
+            // left-to-right line byte nought is already the leftmost place to stand.
+            let (first, last) = (0usize, line.len());
+            let mut at = if (x_at(first) < x_at(last)) == right { first } else { last };
+            let mut was = x_at(at);
+            let mut stops = 1;
+            for _ in 0..64 {
+                let next = bidi::step(line, at, right, 16.0, W, None);
+                if next == at {
+                    break;
+                }
+                let x = x_at(next);
+                let name = if right { "right" } else { "left" };
+                assert!(
+                    if right { x > was - 0.5 } else { x < was + 0.5 },
+                    "{line:?}: the {name} arrow carried the caret the other way, from {was} to {x} (byte {at} to {next})"
+                );
+                at = next;
+                was = x;
+                stops += 1;
+            }
+            // It walked the line rather than stopping at the first boundary it met. Every
+            // line here has at least six places to stand.
+            assert!(stops >= 6, "{line:?}: the walk crossed the line: {stops} stops");
+        }
+    }
+
+    // And the two directions are each other's undo: one step and back is where it began.
+    for line in ["السعر 123 ريال", "مرحبا hello بك"] {
+        let mut at = line.len();
+        for _ in 0..6 {
+            let forward = bidi::step(line, at, true, 16.0, W, None);
+            let back = bidi::step(line, forward, false, 16.0, W, None);
+            assert_eq!(back, at, "{line:?}: right then left came back to {at}, not {back}");
+            at = forward;
+        }
+    }
+}
+
+/// 1.4 of the bar. A line whose direction comes from the page reads that way inside, and
+/// not only from that edge.
+///
+/// Measured: **the bar**, from 2026-10-29, and a plain fault before that. parley takes a
+/// paragraph's base direction from its first strong letter and cannot be told otherwise, so
+/// a list item `TODO: راجع هذه الصفحة` on a page set right to left was hung from the right
+/// edge and laid out left to right inside it: `TODO:` was drawn at the far left end of the
+/// line, after the Arabic it comes before, which is what `docs/gaps.md` called the line
+/// that "flips". A browser with `dir="rtl"` on the page puts `TODO:` at the right edge,
+/// where the line starts. The line is laid out with the page's direction mark in front now.
+#[test]
+fn a_line_that_starts_in_latin_reads_the_way_the_page_does() {
+    const TODO: &str = "TODO: راجع هذه الصفحة";
+    let t = Theme::DEFAULT.tokens();
+    // Where `TODO:` and the first Arabic word are drawn, by the page painter.
+    let places = |page: Option<nocturne_model::Dir>| -> (f32, f32) {
+        let h = harness();
+        let blocks = nocturne_ui_egui::preview::blocks_for(nocturne_model::PageFormat::Cmgfm, TODO);
+        let mut frame = h.ctx.run_ui(egui::RawInput::default(), |ui| {
+            fonts::install_once(ui.ctx());
+            ui.set_width(560.0);
+            nocturne_ui_egui::preview::show(ui, &blocks, std::path::Path::new("."), &t, page, &Default::default());
+        });
+        let at = |word: &str| {
+            frame
+                .shapes
+                .iter()
+                .find_map(|c| match &c.shape {
+                    // The colon after `TODO` is neutral, so on a right-to-left page it goes
+                    // with the Arabic and `TODO` is a run of its own; on a left-to-right one
+                    // the two are drawn together.
+                    egui::Shape::Text(text) if text.galley.text().trim_end_matches(':') == word => Some(text.pos.x),
+                    _ => None,
+                })
+                .unwrap_or(f32::NAN)
+        };
+        let out = (at("TODO"), at("راجع"));
+        frame.textures_delta.clear();
+        out
+    };
+
+    let (latin, arabic) = places(Some(nocturne_model::Dir::Rtl));
+    assert!(latin.is_finite() && arabic.is_finite(), "both words were drawn: {latin} and {arabic}");
+    assert!(latin > arabic, "on a right-to-left page the line starts at the right, with TODO there: {latin} and {arabic}");
+    // A page that says nothing leaves the line to its first letter, which is Latin.
+    let (latin, arabic) = places(None);
+    assert!(latin < arabic, "with no page direction the line reads left to right: {latin} and {arabic}");
+
+    // A click and the caret go through the same layout as the drawing, or a click on
+    // `TODO:` would land in the Arabic beside it.
+    let rtl = Some(nocturne_model::Dir::Rtl);
+    let near_right = bidi::hit(TODO, egui::vec2(395.0, 8.0), 16.0, 400.0, rtl);
+    assert!(near_right <= "TODO:".len(), "a click at the right edge lands in TODO: (byte {near_right})");
+    let near_left = bidi::hit(TODO, egui::vec2(5.0, 8.0), 16.0, 400.0, rtl);
+    assert!(near_left > "TODO:".len(), "a click at the left edge lands in the Arabic (byte {near_left})");
+    let start = in_frame(|ui| {
+        let pieces = bidi::plain(TODO, 16.0, &t);
+        bidi::caret(ui, TODO, &pieces, 0, 16.0, 400.0, rtl).map(|r| r.min.x).unwrap_or(f32::NAN)
+    });
+    assert!(start > 300.0, "the start of the line is at the right edge, and so is a caret there: {start}");
+}

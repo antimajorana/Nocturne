@@ -1,0 +1,175 @@
+# Nocturne architecture
+
+Last reviewed: 2026-10-17. How the code is built today. Rules for working in the code are
+in [`AGENTS.md`](../AGENTS.md). The on-disk format is in [`folder-format.md`](folder-format.md).
+
+Nocturne follows the layout of the other Craft apps (WordCraft, PdfCraft and their
+siblings): a Cargo workspace of small crates in layers, one command registry that every front
+end shares, a headless way to look at the UI, and gates that run with one command.
+
+## Layers
+
+`cargo xtask layers` enforces this table: a crate may only depend on crates in a lower layer,
+and nothing below L6 may depend on egui, eframe, winit or rfd.
+
+| Layer | Crate | Job |
+|---|---|---|
+| L0 | `model` | The shared vocabulary: node kinds, page formats, name and folder rules, ids, time, a tiny `key = "value"` reader. No file system, no dependencies. |
+| L1 | `formats` | Text handling for HTML and CommonMark + GFM: front matter, the body of an HTML page, page templates, HTML to Markdown-like text for previews, and a Markdown parser into a block model. |
+| L1 | `math` | TeX maths typeset into drawing items (glyphs, text runs, lines, rectangles, paths) given a way to measure text. RaTeX does it; a small engine of its own is the fallback. No UI dependency. |
+| L1 | `text` | The text layer, started: parley for the runs of a line, their order, their direction and which character a click is on. No egui, no drawing: the UI paints the runs egui's way. |
+| L1 | `onenote` | Reads `.one` section files: the revision store container, its objects and their property sets, and what they mean (pages, text, pictures, tables). Read only, no file system of its own. |
+| L2 | `store` | Notebooks as plain folders: the tree, creating and deleting nodes, page content, attachments, settings, search, and the folder checker. |
+| L3 | `import` | Turns a folder of `.one` files into a notebook tree: finds the files, picks the newest copy of each section, converts pages to blocks, and asks the store to write them. The source is only read. |
+| L4 | `engine` | `Session` and the **command registry**. Every user-visible action is a `CommandSpec`. |
+| L5 | `mcp` | Nocturne as an MCP server: the command registry over the Model Context Protocol, headless or against a running window. |
+| L6 | `ui-egui` | The egui front end: tree with code-drawn icons, the page and how it is written on (`pagetext`), themes, math drawing. Swappable. |
+| apps | `apps/nocturne`, `apps/nocturne-cli` | The desktop window (eframe) and the command line. |
+| tools | `xtask` | `cargo xtask ci` and friends. |
+
+```text
+model  <--  formats  <--  store  <--  engine  <--  ui-egui  <--  apps/nocturne
+  ^  ^                      ^           ^
+  |  +----- math            |           +-----  mcp  <---------  apps/nocturne-cli
+  +------------------------ +
+```
+
+(`math` is used by `ui-egui`; `formats` and `store` use `model`; `engine` uses all three
+lower crates. The picture is a summary; `cargo xtask layers` is the rule.)
+
+## Everything is a command
+
+A user-visible action is a `CommandSpec` in `crates/engine/src/commands.rs`: an id such as
+`node.create`, a label, a documented parameter list, a flag that says whether it changes the
+tree, and a `run` function. The window, `nocturne-cli run`, the control channel and the MCP
+server all dispatch by id. Programmatic calls never open dialogs. The list is in
+[`commands.md`](commands.md), and a test keeps that file in step with the registry.
+
+`Session::run` also catches a panic that escapes a command and turns it into
+`EngineError::Panicked`, so a bug cannot take the app down. It is a safety net: the command
+code itself has no `unwrap`, `expect` or `panic` outside tests.
+
+UI-only state (which rows are expanded, the open page text, the theme) lives in the UI crate.
+When something there should be scriptable, it becomes an engine command.
+
+## Data flow
+
+1. **Open a page.** The UI asks for `page.load`. `store::page::load_page` reads `index.html`
+   or `index.md`, returning the editable part: the inside of the HTML body, or the Markdown
+   after the front matter.
+2. **Edit.** The text lives in the UI's editor. Each change re-parses a preview:
+   `preview::blocks_for` turns HTML into Markdown-like text (`formats::html::to_markdown`) and
+   parses it, or parses Markdown directly, into the same `Block` model.
+3. **Draw.** `preview::show` draws blocks with egui. Inline and display math go through
+   `math::layout`, measured with the UI's fonts and painted with the painter.
+4. **Save.** About 0.9 seconds after the last keystroke, and on Ctrl+S, the UI sends
+   `page.save`. `store::page::save_body` keeps the page's metadata, refreshes `updated`, and
+   writes through a temporary file and a rename.
+5. **Tree changes** (`node.create`, `node.demote`, `node.promote`, `node.move_up`, `node.move_down`, `node.delete`, `node.title`, `notebook.create`) make the
+   session reload the tree from disk, so the UI always shows what is on disk.
+
+## Themes
+
+14 themes: light and dark, each with seven accents (default, red, green, yellow, blue, gray,
+purple). `ui-egui/src/theme.rs` builds a `Tokens` set per theme, and every colour the UI uses
+comes from it. The switcher is on the title band and also offers to follow the system's light or
+dark setting. The choice is saved in the settings file. Every text and accent colour is moved
+until it meets its contrast target when the tokens are built, and a test checks all 14 themes.
+See [`themes.md`](themes.md).
+
+## Control channel
+
+`nocturne --control PORT` opens a loopback JSON-lines channel that can run any engine command
+and drive the window (click, type, theme, screenshot). The same methods run against an
+off-screen window in `ui_shot` and in the tests. See [`control-protocol.md`](control-protocol.md).
+
+## Pages, files and the two views
+
+A page is a folder, the page file names everything the page owns, and the live view and the code view are two ways of looking at the same files. The rules, the code view's design and the open questions are in [page-model.md](dom_serialization/page-model.md).
+
+## Writing on the page
+
+The page area is the page, not a code box. `ui-egui/src/pagetext.rs` lays the text out the
+way it will be read: headings in heading type, bold, links, quotes and code in their own
+styles, and the Markdown marks themselves dimmed so the words come first. It is a pure
+function from text to styled ranges, so it is tested without a window.
+
+The code view opens with the Code button and takes the page's place. It shows the page's folder:
+a list of its files and a viewer, with the page file's body as the one editable copy, so two
+editable copies of a page never exist at once. Closing it reads the text again and draws the
+page. See [`page-model.md`](dom_serialization/page-model.md) and [`gaps.md`](gaps.md).
+
+## Reading `.one` files
+
+`crates/onenote` reads a `.one` section file into objects and property sets:
+
+1. The header (1024 bytes) names the file type and points at the root file node list.
+2. The file node lists are walked, honouring the transaction log, so an unfinished write is
+   ignored.
+3. Each object space collects its objects; a later declaration of the same object wins, which
+   is how a revision store states the current version.
+4. An object's data is a property set ([MS-ONESTORE] 2.6) or a reference to an inserted file.
+
+What the objects mean ([MS-ONE]: sections, pages, outlines, text runs, pictures, tables) is
+the layer above: `section()` returns pages with their levels and lines. The crate never writes
+and has no UI dependency, so the importer can be driven from the command line as easily as from
+the window. Where real files differ from the specification, see
+[`research/onenote-file-format/real-files.md`](research/onenote-file-format/real-files.md).
+
+## Importing
+
+`crates/import` runs `discover -> plan -> read -> convert -> write -> report`. It reads one
+section file at a time, so memory is bounded by the largest file, and a file that cannot be
+read costs that file and not the run. The tree it writes comes from `store` (notebook, section
+group, section, page, and sub-pages nested to any depth), and the pages from `formats`, so an
+imported page is the same as a typed one. Run it with `nocturne-cli import onenote`; see
+[`how-to/move-your-notes.md`](how-to/move-your-notes.md).
+
+The optional OfficeIMO path is an external bridge, not a Rust dependency. The resolver looks
+for `NOCTURNE_OFFICEIMO_BRIDGE` first, then for a pinned platform artifact under the Nocturne
+data directory. The bridge receives `--source`, `--out` and `--format html|cmgfm`; its output can
+then be checked as a normal Nocturne folder by the existing store checks. Artifact download and
+checksum metadata are release tooling, not an implicit network operation during Cargo builds.
+
+## Equations and diagrams
+
+- **Equations** are TeX maths (`crates/math`). RaTeX, a pure Rust typesetter that follows KaTeX,
+  lays a formula out as shapes: glyphs of the KaTeX faces, lines, rectangles and paths. When it
+  cannot take a formula (a syntax error, or one past the length and nesting limits that keep it from
+  overflowing the stack) a smaller engine of the crate's own lays it out, and what that cannot read
+  stays visible as text. A page stores the TeX, not the picture, so the engine can change without
+  touching a page. The layout is pure and tested without a window; `ui-egui` paints it
+  (`mathview.rs`) with the KaTeX faces registered as `katex-<face>` fonts. RaTeX is pinned to an
+  exact version in the workspace manifest and is named only in `crates/math/src/tex.rs`. See
+  [how-to/write-equations.md](how-to/write-equations.md).
+- **Diagrams** (Mermaid) are stored as source, in a fenced block or `<pre class="diagram">` or
+  `<pre class="mermaid">`, and drawn by `crates/diagram`: `find` reads them out of a page's text in
+  either format, and `draw` turns one into an SVG with `mermaid-rs-renderer` (pure Rust, pinned to an
+  exact version, named only there), in the page's colours. A source is cut by size before the
+  renderer sees it (150 lines, 20,000 characters), a panic is caught, and a drawing too large for a
+  texture is refused, so nothing a page holds can crash the window. `ui-egui/diagramview.rs` draws
+  on a thread of its own, so no frame waits, and keeps each drawing by source and colours. The page
+  draws a diagram block as its picture (`preview.rs`); the block under the caret shows its source to
+  edit, with the drawing above it; the code view shows the page's text as it is, with no drawing. See
+  [how-to/draw-diagrams.md](how-to/draw-diagrams.md) and [`gaps.md`](gaps.md).
+
+## Testing and gates
+
+See [`testing.md`](testing.md). In short: unit tests in every crate, a hostile-input test that
+runs every command with junk parameters, headless UI tests that drive the window through the
+control channel, paired pixel comparisons (no committed golden pictures), and
+`cargo xtask ci` which runs fmt, clippy with warnings denied, all tests, the layer check, the
+asset attribution check, the documentation link check and the text style check.
+
+## Prototypes
+
+`prototypes/notebook-poc` is the first proof of concept: a standard-library-only command line
+and a small web app, plus the cloud-sync stress test that was run against a real OneDrive
+folder (see its README). It is not part of the workspace and is kept as a reference. The
+folder rules it proved are now in `crates/store`.
+
+## Reference material
+
+`docs/research/` holds the notes this design rests on: Microsoft's published `.one` file
+format specifications, paraphrased. They are notes, not Microsoft text. The feature list this
+project was designed against is kept out of this repository.

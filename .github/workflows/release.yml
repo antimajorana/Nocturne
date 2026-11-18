@@ -1,0 +1,278 @@
+# Builds all 5 platforms (Linux, Windows, macOS, Android, iPadOS/iOS) and publishes a
+# non-draft, latest GitHub Release v<version> whenever a new [workspace.package] version
+# lands on main, or when manually dispatched with replace_existing=true.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      replace_existing:
+        description: "Replace existing GitHub Release for the current Cargo.toml version if it already exists"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check release version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      should_release: ${{ steps.version.outputs.should_release }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      exists: ${{ steps.version.outputs.exists }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve Cargo.toml version and check GitHub Release
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPLACE_EXISTING: ${{ inputs.replace_existing || false }}
+        run: |
+          set -euo pipefail
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          if ! printf '%s' "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'; then
+            echo "::error::'$version' is not a valid semver version"
+            exit 1
+          fi
+          tag="v$version"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            exists="true"
+          else
+            exists="false"
+          fi
+          if [[ "$exists" == "false" || "$REPLACE_EXISTING" == "true" ]]; then
+            should_release="true"
+          else
+            should_release="false"
+          fi
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "exists=$exists"
+            echo "should_release=$should_release"
+          } >> "$GITHUB_OUTPUT"
+          echo "Release check: tag=$tag exists=$exists replace_existing=$REPLACE_EXISTING should_release=$should_release"
+          echo "Release check for \`$tag\`: exists=\`$exists\`, replace_existing=\`$REPLACE_EXISTING\`, should_release=\`$should_release\`" >> "$GITHUB_STEP_SUMMARY"
+
+  packaging:
+    name: Build all 5 platforms
+    needs: check
+    if: needs.check.outputs.should_release == 'true'
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/packaging.yml
+    with:
+      ref: ${{ github.sha }}
+    secrets: inherit
+
+  publish:
+    name: Publish GitHub Release
+    needs: [check, packaging]
+    if: needs.check.outputs.should_release == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.check.outputs.version }}
+      TAG: ${{ needs.check.outputs.tag }}
+      EXISTS: ${{ needs.check.outputs.exists }}
+      ANDROID_SIGNING: ${{ needs.packaging.outputs.android-signing }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: nocturne-*
+          path: artifacts
+
+      - name: Collect release binaries
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f \( \
+            -name '*.msi' -o -name '*.zip' -o -name '*.tar.gz' -o \
+            -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' -o \
+            -name '*.dmg' -o -name '*.apk' -o -name '*.ipa' \
+          \) -exec cp -n -t dist {} +
+          for want in \
+            "nocturne-$VERSION-windows-x64.msi" \
+            "nocturne-$VERSION-windows-x64-portable.zip" \
+            "nocturne-$VERSION-linux-x86_64.tar.gz" \
+            "nocturne-$VERSION-linux-x86_64.AppImage" \
+            "nocturne-$VERSION-linux-x86_64.deb" \
+            "nocturne-$VERSION-linux-x86_64.rpm" \
+            "nocturne-$VERSION-linux-aarch64.tar.gz" \
+            "nocturne-$VERSION-linux-aarch64.AppImage" \
+            "nocturne-$VERSION-linux-aarch64.deb" \
+            "nocturne-$VERSION-linux-aarch64.rpm" \
+            "Nocturne-$VERSION-macos-aarch64.dmg" \
+            "Nocturne-cli-$VERSION-macos-aarch64.zip" \
+            "Nocturne-$VERSION-macos-x86_64.dmg" \
+            "Nocturne-cli-$VERSION-macos-x86_64.zip" \
+            "nocturne-$VERSION-android-arm64.apk" \
+            "nocturne-$VERSION-ios-arm64.ipa"; do
+            [[ -f "dist/$want" ]] || { echo "::error::missing expected release asset: dist/$want"; exit 1; }
+          done
+
+      - name: Generate AltStore / SideStore source feed
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import json
+          import os
+          from pathlib import Path
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          version = os.environ["VERSION"]
+          tag = os.environ["TAG"]
+          ipa_name = f"nocturne-{version}-ios-arm64.ipa"
+          ipa_path = Path("dist") / ipa_name
+          ipa_size = ipa_path.stat().st_size
+          release_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+          download_url = f"https://github.com/{repo}/releases/download/{tag}/{ipa_name}"
+          icon_url = f"https://raw.githubusercontent.com/{repo}/main/assets/brand/nocturne-512.png"
+          source_url = f"https://github.com/{repo}/releases/latest/download/altstore-source.json"
+
+          feed = {
+              "name": "Nocturne",
+              "identifier": "io.github.antimajorana.nocturne.source",
+              "sourceURL": source_url,
+              "subtitle": "Notes as plain files in plain folders",
+              "description": "Official Nocturne releases for SideStore and AltStore.",
+              "iconURL": icon_url,
+              "tintColor": "#051C48",
+              "apps": [
+                  {
+                      "name": "Nocturne",
+                      "bundleIdentifier": "io.github.antimajorana.nocturne",
+                      "developerName": "antimajorana",
+                      "subtitle": "Notes as plain files in plain folders",
+                      "localizedDescription": (
+                          "Nocturne is a native note taking app for iPadOS and iOS where notes "
+                          "live as plain Markdown and HTML files in plain folders."
+                      ),
+                      "iconURL": icon_url,
+                      "tintColor": "#051C48",
+                      "version": version,
+                      "versionDate": release_date,
+                      "date": release_date,
+                      "versionDescription": f"Nocturne {tag}",
+                      "downloadURL": download_url,
+                      "size": ipa_size,
+                      "versions": [
+                          {
+                              "version": version,
+                              "date": release_date,
+                              "localizedDescription": f"Nocturne {tag}",
+                              "downloadURL": download_url,
+                              "size": ipa_size,
+                              "minOSVersion": "15.0",
+                          }
+                      ],
+                  }
+              ],
+              "news": [],
+          }
+
+          out_path = Path("dist") / "altstore-source.json"
+          out_path.write_text(json.dumps(feed, indent=2) + "\n", encoding="utf-8")
+          print(f"Wrote {out_path} ({ipa_name}, {ipa_size} bytes)")
+          PY
+
+      - name: Generate SHA256SUMS.txt
+        run: |
+          set -euo pipefail
+          (
+            cd dist
+            rm -f SHA256SUMS.txt
+            sha256sum -- * > ../SHA256SUMS.txt
+            mv ../SHA256SUMS.txt SHA256SUMS.txt
+          )
+          cat dist/SHA256SUMS.txt
+
+      - name: Create or update GitHub Release
+        run: |
+          set -euo pipefail
+          if [ "$ANDROID_SIGNING" = "release" ]; then
+            android_note="Install \`nocturne-${VERSION}-android-arm64.apk\` (64-bit ARM, Android 8+). Signed with the project release key so updates preserve your notebooks in place."
+          else
+            android_note="Install \`nocturne-${VERSION}-android-arm64.apk\` (64-bit ARM, Android 8+). Signed with a per-build key; copy \`Android/data/io.github.antimajorana.nocturne/files/Nocturne\` before uninstalling an earlier build."
+          fi
+
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          ANDROID_NOTE="$android_note" python3 - "$notes_file" <<'PY'
+          import os
+          import sys
+          import textwrap
+          from pathlib import Path
+
+          out = Path(sys.argv[1])
+          repo = os.environ["GITHUB_REPOSITORY"]
+          version = os.environ["VERSION"]
+          android_note = os.environ["ANDROID_NOTE"]
+
+          body = textwrap.dedent(f"""\
+          **Alpha release.** Nocturne is under active development; keep backups of notebooks you care about. Your notebooks live as plain files and folders under `Documents/Nocturne`. See `docs/gaps.md` for known platform gaps.
+
+          ### Quick Terminal Installers (SHA-256 verified)
+          - **Windows (PowerShell):** `irm https://raw.githubusercontent.com/{repo}/main/packaging/install.ps1 | iex`
+          - **macOS / Linux:** `curl -fsSL https://raw.githubusercontent.com/{repo}/main/packaging/install.sh | sh`
+
+          ### Platform Downloads
+          - **Windows (x64):** `nocturne-{version}-windows-x64.msi` or `nocturne-{version}-windows-x64-portable.zip`. Desktop builds are currently **unsigned**; if Windows SmartScreen shows *"Windows protected your PC"*, choose **More info -> Run anyway**.
+          - **iPadOS / iOS (arm64):** `nocturne-{version}-ios-arm64.ipa`
+            - **SideStore / AltStore (1-tap source):** add `https://github.com/{repo}/releases/latest/download/altstore-source.json` in Sources, or open the `.ipa` in SideStore/AltStore.
+            - **Sideloadly:** install `nocturne-{version}-ios-arm64.ipa` over USB-C and re-sign with your Apple ID (free Apple IDs require trusting your profile in Settings and refreshing every 7 days).
+          - **macOS (Apple Silicon & Intel):** `Nocturne-{version}-macos-aarch64.dmg`, `Nocturne-{version}-macos-x86_64.dmg`, and standalone CLI archives `Nocturne-cli-{version}-macos-*.zip`. Unsigned builds may require right-click -> **Open** on first launch.
+          - **Linux (x86_64 & aarch64):** `.AppImage`, `.deb`, `.rpm`, and `.tar.gz` packages.
+          - **Android (arm64):** {android_note}
+
+          ### Verification
+          Verify any download against `SHA256SUMS.txt` or with:
+          ```sh
+          gh attestation verify <file> --repo {repo}
+          ```
+          """)
+          out.write_text(body, encoding="utf-8")
+          PY
+
+          if [ "$EXISTS" = "true" ]; then
+            git tag -f "$TAG" "$GITHUB_SHA"
+            git push -f origin "refs/tags/$TAG"
+            existing_assets="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' || true)"
+            for name in $existing_assets; do
+              if [ ! -f "dist/$name" ]; then
+                gh release delete-asset "$TAG" "$name" --repo "$GITHUB_REPOSITORY" --yes
+              fi
+            done
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --draft=false --prerelease=false --latest \
+              --title "Nocturne $TAG" --notes-file "$notes_file"
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+              --latest --target "$GITHUB_SHA" \
+              --title "Nocturne $TAG" --notes "$(cat "$notes_file")" --generate-notes
+          fi
+          echo "Published https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,98 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*", "android", "ios", "xtask", "docs/demo/scripts"]
+default-members = ["crates/*", "apps/nocturne", "apps/nocturne-cli", "apps/nocturne-setup", "xtask"]
+
+[workspace.package]
+version = "0.0.10"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/antimajorana/Nocturne"
+publish = false
+
+[workspace.dependencies]
+nocturne-model = { path = "crates/model" }
+nocturne-math = { path = "crates/math" }
+nocturne-diagram = { path = "crates/diagram" }
+nocturne-ink = { path = "crates/ink" }
+nocturne-formats = { path = "crates/formats" }
+nocturne-text = { path = "crates/text" }
+nocturne-onenote = { path = "crates/onenote" }
+nocturne-import = { path = "crates/import" }
+nocturne-store = { path = "crates/store" }
+nocturne-engine = { path = "crates/engine" }
+nocturne-mcp = { path = "crates/mcp" }
+nocturne-ui-egui = { path = "crates/ui-egui" }
+craft-i18n = { git = "https://github.com/storytold/craft-libs", rev = "92d392cff132eaf53e13afff77f38b5c11b73aa0" }
+
+# Versions match the sibling Craft apps (storytold/wordcraft).
+eframe = "0.37"
+egui = { version = "0.37", features = ["default_fonts"] }
+egui_extras = { version = "0.37", default-features = false, features = ["image", "file", "svg_text"] }
+egui_kittest = { version = "0.37", features = ["wgpu", "snapshot"] }
+serde_json = "1"
+zip = { version = "4", default-features = false, features = ["deflate"] }
+# Equations: a pure Rust, KaTeX compatible TeX maths typesetter. Pinned exactly, because it is
+# 0.x and young; the adapter in crates/math is the only place that names it.
+# Diagrams: a pure Rust Mermaid renderer. Pinned exactly, because it is 0.x and young; only
+# crates/diagram names it.
+mermaid-rs-renderer = { version = "=0.3.1", default-features = false }
+ratex-parser = "=0.1.15"
+ratex-layout = "=0.1.15"
+ratex-types = "=0.1.15"
+ratex-font = "=0.1.15"
+# Build time only, Windows only: puts the icon and the version into the .exe files.
+winresource = "0.1"
+# The system file and folder dialogs, for "Open a notebook folder". UI only.
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+# The system clipboard: HTML plus its plain-text alternative, pictures and files. Keep
+# Wayland data-control enabled so rich clipboard writes reach native Wayland applications.
+arboard = { version = "3.7", default-features = false, features = ["image-data", "wayland-data-control"] }
+# The log facade. The app routes it into its log file (apps/nocturne/src/applog.rs).
+log = "0.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+# OneNote packages (.onepkg) are Windows cabinet files, usually LZX compressed (issue #17).
+# Pure Rust, reading only; only crates/import names it.
+cab = "0.6"
+# JPEG XL pictures (issue #29): a pure Rust decoder. It plugs into `image` through image's decoding
+# hooks, so egui_extras' loader draws a .jxl like any other picture. Decoding only; Nocturne never
+# writes JPEG XL.
+jxl-oxide = { version = "0.12", default-features = false, features = ["image"] }
+hayro = { version = "=0.5.0", default-features = false, features = ["embed-fonts"] }
+# A drop-in SystemTime/Instant: std's own panics with "time not implemented on this
+# platform" on wasm32-unknown-unknown, which has no clock. This is std's types everywhere
+# else and Date.now() there, with no wasm-bindgen glue needed in nocturne-model itself.
+web-time = "1.1"
+# The user's UTC offset, read once when the desktop app starts, so timestamps are shown on
+# the user's clock. Already in the tree through zip; only the app names it.
+time = { version = "0.3", default-features = false, features = ["std", "local-offset"] }
+
+# Mermaid 0.3.1 uses std::time::Instant in its layout metrics on the ordinary render path.
+# Those metrics are discarded by Nocturne, but Instant::now() panics on wasm32-unknown-unknown.
+# Keep the upstream crate local until its WASM-safe timer fix is released.
+[patch.crates-io]
+mermaid-rs-renderer = { path = "vendor/mermaid-rs-renderer" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+too_many_arguments = "allow"
+type_complexity = "allow"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+debug = 0
+
+

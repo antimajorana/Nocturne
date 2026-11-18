@@ -1,0 +1,18 @@
+[package]
+name = "nocturne-onenote"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Nocturne OneNote reader: reads .one sections and .onetoc2 color metadata (MS-ONESTORE, MS-ONE) into plain models. Read only, no UI, no file system writes"
+
+[lints]
+workspace = true
+
+[features]
+# Builders for synthetic `.one` files, so other crates can test against a section file without
+# a real notebook.
+testing = []
+
+[dependencies]
