@@ -14,7 +14,7 @@
 - [ ] Page or demo changes: `cargo xtask demo-check`, the format parity test, and a side by
       side look at both formats
 - [ ] UI changes: the pictures were looked at; `cargo xtask screenshots` if they changed
-- [ ] New files under `assets/` or `docs/images/` have a row in `ATTRIBUTION.md`
+- [ ] New files under `assets/` have a row in `ATTRIBUTION.md`
 
 ## How it was checked
 

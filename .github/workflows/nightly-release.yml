@@ -258,7 +258,7 @@ jobs:
               "subtitle": "Notes as plain files in plain folders",
               "description": "Official Nocturne releases for SideStore and AltStore.",
               "iconURL": icon_url,
-              "tintColor": "#051C48",
+              "tintColor": "#3A2D8D",
               "apps": [
                   {
                       "name": "Nocturne",
@@ -270,7 +270,7 @@ jobs:
                           "live as plain Markdown and HTML files in plain folders."
                       ),
                       "iconURL": icon_url,
-                      "tintColor": "#051C48",
+                      "tintColor": "#3A2D8D",
                       "version": version,
                       "versionDate": release_date,
                       "date": release_date,

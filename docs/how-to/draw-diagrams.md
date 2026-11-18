@@ -4,8 +4,6 @@ A diagram in Nocturne is Mermaid source: plain text that says what to draw. The 
 text, and Nocturne draws it where it stands, in your theme's colours. Nothing is a picture until
 you look at it, and nothing is sent anywhere.
 
-![A page with a pie chart and a bar and line chart drawn where they stand](../images/diagrams.png)
-
 ## See one, and change it
 
 1. Put a diagram in a page. Insert, then **Diagram**, adds a starter one; or write your own.

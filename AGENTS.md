@@ -253,7 +253,7 @@ dialog is an in-app themed modal and persists the user's choice in the settings 
     environment, the working directory or a fixed folder. A test that cannot be isolated says so
     and runs alone.
 - **Themes.** The UI uses theme tokens only. Contrast tests must pass for all 14 themes.
-- **Assets.** Every file in `assets/` or `docs/images/` needs a row in `ATTRIBUTION.md`.
+- **Assets.** Every file in `assets/` needs a row in `ATTRIBUTION.md`.
 - **Text style.** Plain ASCII, no em dashes, short sentences. `cargo xtask text` checks it.
 - **Honesty.** Mark what is verified and what is assumed. Do not claim coverage, platform
   support or licences that were not checked. Keep `docs/gaps.md` true.
