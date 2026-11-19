@@ -98,6 +98,16 @@ pub enum Act {
     ZoomTo(u32),
     /// Fit the page width to the available reading area.
     PageWidth,
+    /// Zoom and pan so every container and ink stroke on the page fits in view.
+    FitAllContent,
+    /// Show or fold away the infinite-canvas minimap.
+    ToggleMinimap,
+    /// Toggle automatic return from the eraser to the last writing tool after rubbing ink out.
+    ToggleEraserAutoReturn,
+    /// Open the Infomaniak kDrive sync setup and status dialog.
+    OpenCloudSync,
+    /// Switch between Tablet Studio chrome and the Classic Ribbon.
+    ToggleStudioLayout,
     /// Cut or copy what is selected.
     Clipboard(&'static str),
     /// Put the clipboard into the page: a picture as a file beside it, anything else as
@@ -428,12 +438,26 @@ pub fn paint_paper_canvas(
     if !rules.on() {
         return;
     }
-    let step = (rules.step() * scale).max(4.0);
+    let base = rules.step() * scale;
+    if !base.is_finite() || base <= 0.0 {
+        return;
+    }
+    let mut factor: i64 = 1;
+    #[allow(clippy::cast_precision_loss)]
+    while base * (factor as f32) < 5.0 && factor < 1000 {
+        factor = match factor {
+            1 => 2,
+            2 => 5,
+            _ => factor * 2,
+        };
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let step = base * (factor as f32);
     let index = |screen: f32, anchor: f32| {
         let line = ((screen - anchor) / step).round();
         #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
         {
-            line.clamp(i64::MIN as f32, i64::MAX as f32) as i64
+            (line.clamp(-1.0e12, 1.0e12) as i64).saturating_mul(factor)
         }
     };
     let colour = |n: i64| if rules.fives() && n.rem_euclid(5) == 0 { strong } else { line };
@@ -479,6 +503,10 @@ pub struct View<'a> {
     pub space_tool: bool,
     /// Whether single-finger touch draws on the canvas instead of scrolling/panning.
     pub finger_drawing: bool,
+    /// Whether lifting the eraser after erasing ink switches back to the previous writing tool.
+    pub eraser_auto_return: bool,
+    /// Whether the infinite-canvas minimap is currently shown.
+    pub show_minimap: bool,
     /// True while the caret is in a table, which is when the Table tab is offered.
     pub in_table: bool,
     /// Whether the table the caret is in is drawn with lines round its cells.
@@ -2589,7 +2617,7 @@ fn modify_tool(ui: &mut Ui, id: egui::Id, under: Rect, i: usize, nib: Nib, rack_
 
 /// The eraser, racked beside the pens because that is where a hand reaches for it, and
 /// drawn like them: a pale sleeve a hand holds, and the worn rubber below it.
-fn eraser_on_rack(ui: &mut Ui, chosen: bool, t: &Tokens) -> egui::Response {
+fn eraser_on_rack(ui: &mut Ui, chosen: bool, auto_return: bool, t: &Tokens, acts: &mut Vec<Act>) -> bool {
     let (rect, resp) = ui.allocate_exact_size(vec2(27.0, GROUP_H - 20.0), Sense::click());
     let enabled = ui.is_enabled();
     resp.widget_info(move || egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, chosen, crate::tl_id!("ui.eraser")));
@@ -2624,10 +2652,54 @@ fn eraser_on_rack(ui: &mut Ui, chosen: bool, t: &Tokens) -> egui::Response {
         egui::Stroke::new(1.2, egui::Color32::from_white_alpha(120)),
     );
     painter.rect_stroke(whole, 2.0, egui::Stroke::new(0.9, body_edge), egui::StrokeKind::Inside);
+
+    let mut picked_up = resp.clicked();
+    let popup_id = egui::Id::new("ribbon-eraser-popup");
+    let mut open = ui.data(|d| d.get_temp::<bool>(popup_id).unwrap_or(false));
     if chosen {
-        chevron(&painter, egui::pos2(rect.center().x, rect.max.y - 5.0), t.muted);
+        let chev = egui::Rect::from_center_size(egui::pos2(rect.center().x, rect.max.y - 5.0), vec2(14.0, 11.0));
+        let hit = ui.interact(chev, resp.id.with("chevron"), Sense::click());
+        chevron(&painter, chev.center(), if hit.hovered() { t.accent } else { t.muted });
+        if hit.clicked() {
+            open = !open;
+            picked_up = false;
+        }
     }
-    resp.on_hover_text(crate::tl_id!("ui.rub_out_whatever_the_pointer_passes_over"))
+    resp.context_menu(|ui| {
+        let mut checked = auto_return;
+        if ui.checkbox(&mut checked, crate::tl_id!("ui.eraser_auto_return")).on_hover_text(crate::tl_id!("ui.eraser_auto_return_tip")).changed() {
+            acts.push(Act::ToggleEraserAutoReturn);
+            ui.close();
+        }
+    });
+    let resp = resp.on_hover_text(crate::tl_id!("ui.rub_out_whatever_the_pointer_passes_over"));
+    if open {
+        mark_popup_open(ui.ctx());
+        let mut toggled = false;
+        let area = egui::Area::new(popup_id.with("area"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.left_bottom())
+            .constrain(true)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    let mut checked = auto_return;
+                    if ui
+                        .checkbox(&mut checked, crate::tl_id!("ui.eraser_auto_return"))
+                        .on_hover_text(crate::tl_id!("ui.eraser_auto_return_tip"))
+                        .changed()
+                    {
+                        acts.push(Act::ToggleEraserAutoReturn);
+                        toggled = true;
+                    }
+                });
+            })
+            .response;
+        if toggled || away(ui, &area, &resp) {
+            open = false;
+        }
+    }
+    ui.data_mut(|d| d.insert_temp(popup_id, open));
+    picked_up
 }
 
 /// Draws one drawing tool upright inside `rect`, the way OneNote draws its rack.
@@ -2938,7 +3010,7 @@ fn draw_tab(ui: &mut Ui, view: &View<'_>, t: &Tokens, acts: &mut Vec<Act>) {
         }
     });
     group(ui, crate::tl_id!("ui.drawing_tools"), t, |ui| {
-        if eraser_on_rack(ui, view.pointer == Pointer::Erase, t).clicked() {
+        if eraser_on_rack(ui, view.pointer == Pointer::Erase, view.eraser_auto_return, t, acts) {
             acts.push(Act::InkPointer(Pointer::Erase));
         }
         for (i, nib) in view.rack.iter().enumerate() {
@@ -3274,7 +3346,7 @@ fn view_tab(ui: &mut Ui, source: bool, view: &View<'_>, t: &Tokens, acts: &mut V
             }
             rows(ui, |ui| {
                 egui::ComboBox::from_label(crate::tl_id!("ui.zoom")).width(76.0).selected_text(format!("{}%", view.zoom_percent)).show_ui(ui, |ui| {
-                    for percent in [50, 60, 75, 80, 90, 100, 110, 125, 150, 175, 200, 250] {
+                    for percent in [15, 25, 35, 50, 60, 75, 80, 90, 100, 110, 125, 150, 175, 200, 250] {
                         if ui.selectable_label(view.zoom_percent == percent, format!("{percent}%")).clicked() {
                             acts.push(Act::ZoomTo(percent));
                         }
@@ -3288,6 +3360,32 @@ fn view_tab(ui: &mut Ui, source: bool, view: &View<'_>, t: &Tokens, acts: &mut V
                     .clicked()
                 {
                     acts.push(Act::PageWidth);
+                }
+                if small(
+                    ui,
+                    None,
+                    crate::tl_id!("ui.fit_all"),
+                    crate::tl_id!("ui.fit_all_content"),
+                    crate::tl_id!("ui.fit_all_content_tip"),
+                    false,
+                    t,
+                )
+                .clicked()
+                {
+                    acts.push(Act::FitAllContent);
+                }
+                if small(
+                    ui,
+                    None,
+                    crate::tl_id!("ui.minimap"),
+                    crate::tl_id!("ui.toggle_minimap"),
+                    crate::tl_id!("ui.toggle_minimap_tip"),
+                    view.show_minimap,
+                    t,
+                )
+                .clicked()
+                {
+                    acts.push(Act::ToggleMinimap);
                 }
             });
         });

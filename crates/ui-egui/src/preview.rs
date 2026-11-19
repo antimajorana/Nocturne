@@ -272,6 +272,38 @@ fn draw_spans(
     // from a drag that crossed more than one paragraph.
     selected: Option<(usize, usize)>,
 ) {
+    // At deep overview zoom (< 30% for 15pt body text -> size < 4.5pt), paint lightweight
+    // proportional placeholder bars instead of rasterizing tiny fractional font sizes into egui's
+    // glyph atlas on every pinch-zoom frame.
+    if size < 4.5 && selected.is_none() {
+        let text = text_of(spans);
+        let chars = text.chars().count();
+        if chars == 0 {
+            ui.allocate_exact_size(vec2(ui.available_width().max(4.0), (size * 1.2).max(2.0)), egui::Sense::hover());
+            return;
+        }
+        let avail_w = ui.available_width().max(8.0);
+        let char_w = (size * 0.52).max(0.8);
+        #[allow(clippy::cast_precision_loss)]
+        let total_w = (chars as f32) * char_w;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let lines = (total_w / avail_w).ceil().clamp(1.0, 60.0) as usize;
+        let line_h = (size * 1.45).max(2.0);
+        let bar_h = (size * 0.65).max(1.0);
+        #[allow(clippy::cast_precision_loss)]
+        let (rect, _) = ui.allocate_exact_size(vec2(avail_w, lines as f32 * line_h), egui::Sense::hover());
+        let bar_color = color.gamma_multiply(0.38);
+        for row in 0..lines {
+            #[allow(clippy::cast_precision_loss)]
+            let rem = (total_w - row as f32 * avail_w).clamp(avail_w * 0.18, avail_w);
+            let w = if row + 1 < lines { avail_w * 0.96 } else { rem };
+            #[allow(clippy::cast_precision_loss)]
+            let y = rect.min.y + row as f32 * line_h + (line_h - bar_h) * 0.5;
+            let bar = egui::Rect::from_min_size(egui::pos2(rect.min.x, y), vec2(w, bar_h));
+            ui.painter().rect_filled(bar, 0.5, bar_color);
+        }
+        return;
+    }
     if !spans.iter().any(|s| s.math) {
         // A line that mixes the two directions is drawn by egui in the wrong order, and a
         // paragraph that reads right to left is not wrapped by it, so both go through the

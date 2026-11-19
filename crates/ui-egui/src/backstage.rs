@@ -46,6 +46,10 @@ pub enum Act {
     CheckForUpdates,
     /// Open the releases page in the browser, when an update cannot be installed from here.
     OpenReleases,
+    /// Open Infomaniak kDrive Cloud Sync setup and status.
+    OpenCloudSync,
+    /// Toggle between Tablet Studio layout and Classic Ribbon.
+    ToggleStudioLayout,
     ResetPreferences,
     /// Another page of the File screen: Info, New or Open.
     Page(&'static str),
@@ -524,6 +528,16 @@ fn options_page(
             }
         });
     ui.label(egui::RichText::new(crate::tl_id!("ui.interface_size_hint")).size(11.5).color(t.muted));
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new(crate::tl_id!("ui.tablet_and_cloud_sync_heading")).strong().size(15.0).color(t.strong));
+    ui.horizontal_wrapped(|ui| {
+        if open_action(ui, crate::tl_id!("ui.kdrive_sync_open_btn"), 210.0, 34.0, t, true).clicked() {
+            acts.push(Act::OpenCloudSync);
+        }
+        if open_action(ui, crate::tl_id!("ui.toggle_studio_layout_btn"), 220.0, 34.0, t, false).clicked() {
+            acts.push(Act::ToggleStudioLayout);
+        }
+    });
     ui.add_space(12.0);
     // Shown here too: Options is where someone asked for a log looks, and an older build may
     // not have the option they were told about.

@@ -539,6 +539,8 @@ struct Editor {
     content_bottom: Option<f32>,
     /// How wide each box was drawn last frame, in page points (`containers::Moved::shown_widths`).
     shown_widths: Vec<f32>,
+    /// Container bounding frames in unzoomed page coordinates from the most recent layout pass.
+    last_frames: Vec<egui::Rect>,
 }
 
 impl Editor {
@@ -907,6 +909,7 @@ enum Dialog {
         page: PathBuf,
         name: String,
     },
+    CloudSync(crate::sync_ui::CloudSyncForm),
 }
 
 struct ImportJob {
@@ -1044,8 +1047,12 @@ pub struct NocturneApp {
     editor: Option<Editor>,
     dialog: Option<Dialog>,
     import_job: Option<ImportJob>,
+    sync_job: Option<crate::sync_ui::SyncJob>,
+    auto_sync_started_on_launch: bool,
+    last_auto_sync_trigger: Option<Instant>,
     status: String,
     status_is_error: bool,
+    status_shown_at: Option<Instant>,
     /// The host keeps notebook files only for this session, rather than on durable storage.
     session_only_storage: bool,
     search: String,
@@ -1085,6 +1092,8 @@ pub struct NocturneApp {
     stylus: crate::stylus::Stylus,
     /// Where the page's words were drawn last frame, which is where its ink goes.
     page_rect: Option<egui::Rect>,
+    /// Visible screen-space viewport (`ScrollArea::inner_rect`) of the open page canvas.
+    page_view_rect: Option<egui::Rect>,
     /// The canvas translation in screen points. It is UI state, so it never changes page data.
     canvas_pan: egui::Vec2,
     /// Last middle-button position while panning the canvas.
@@ -1111,6 +1120,20 @@ pub struct NocturneApp {
     finger_handle_drag: Option<egui::TouchId>,
     /// Vertical scroll delta queued by external platform pan gestures (e.g. `UIPanGestureRecognizer`).
     pending_external_scroll_y: f32,
+    /// Exact vertical ScrollArea offset queued by minimap pan or 2-frame Fit All Content.
+    pending_scroll_offset_y: Option<f32>,
+    /// Page-space bounding box awaiting second-frame origin measurement after Fit All Content zoom.
+    pending_fit_bounds: Option<egui::Rect>,
+    /// UI layout mode (`auto` -> Tablet Studio on iPadOS, Classic Ribbon on desktop).
+    ui_layout_mode: crate::tablet_chrome::UiLayoutMode,
+    /// Whether the infinite-canvas minimap is enabled.
+    show_minimap: bool,
+    /// Whether the infinite-canvas minimap body is folded to its compact header chip.
+    minimap_collapsed: bool,
+    /// Whether lifting the eraser after rubbing out ink returns to the last writing pen.
+    eraser_auto_return: bool,
+    /// Cached presence of a saved kDrive token so Studio top bar avoids per-frame Keychain/disk reads.
+    sync_has_token: Option<bool>,
     /// Whether the platform software keyboard is explicitly reported visible.
     soft_keyboard_visible: bool,
     /// Reported bottom inset of the software keyboard in logical points.
@@ -1240,6 +1263,11 @@ impl NocturneApp {
             .filter(|percent| backstage::UI_SCALES.contains(percent))
             .unwrap_or(100);
         let wizard_level = session.settings.get("telemetry_level").unwrap_or_else(|| "debug".to_string());
+        let ui_layout_mode =
+            session.settings.get(crate::tablet_chrome::UI_LAYOUT_KEY).map(|v| crate::tablet_chrome::UiLayoutMode::parse(&v)).unwrap_or_default();
+        let show_minimap = session.settings.get("show_minimap").map(|v| !v.trim().eq_ignore_ascii_case("false")).unwrap_or(true);
+        let minimap_collapsed = session.settings.get("minimap_collapsed").map(|v| !v.trim().eq_ignore_ascii_case("false")).unwrap_or(true);
+        let eraser_auto_return = session.settings.get("eraser_auto_return").is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
         let mut app = NocturneApp {
             session,
             saver: crate::saver::Saver::default(),
@@ -1261,8 +1289,12 @@ impl NocturneApp {
                 None
             },
             import_job: None,
+            sync_job: None,
+            auto_sync_started_on_launch: false,
+            last_auto_sync_trigger: None,
             status: crate::tl_id!("ui.ready_2").into(),
             status_is_error: false,
+            status_shown_at: None,
             session_only_storage: false,
             search: String::new(),
             searched: String::new(),
@@ -1290,6 +1322,7 @@ impl NocturneApp {
             ribbon_tab: "Home".to_string(),
             stylus: crate::stylus::Stylus::default(),
             page_rect: None,
+            page_view_rect: None,
             canvas_pan: egui::Vec2::ZERO,
             collect_pending: false,
             page_hbar: None,
@@ -1303,6 +1336,13 @@ impl NocturneApp {
             finger_pan: FingerPanState::Idle,
             finger_handle_drag: None,
             pending_external_scroll_y: 0.0,
+            pending_scroll_offset_y: None,
+            pending_fit_bounds: None,
+            ui_layout_mode,
+            show_minimap,
+            minimap_collapsed,
+            eraser_auto_return,
+            sync_has_token: None,
             soft_keyboard_visible: false,
             soft_keyboard_inset_bottom: 0.0,
             last_safe_area_bottom: 0.0,
@@ -1958,6 +1998,23 @@ impl NocturneApp {
             || self.compact_pane_fills()
     }
 
+    /// Returns `true` when a modal dialog, backstage screen, source view, or floating window blocks
+    /// raw canvas long-press injection (`TouchLongPress` on iPadOS).
+    pub fn has_canvas_blocking_overlay(&self) -> bool {
+        self.external_gesture_blocked() || self.ribbon_peek || self.theme_window || self.import_job.is_some()
+    }
+
+    /// Returns `true` when the window renders the simplified Tablet Studio chrome instead of the
+    /// multi-row Classic Ribbon.
+    pub fn is_tablet_studio(&self, ctx: &Context) -> bool {
+        self.ui_layout_mode.is_tablet_studio(ctx.os(), self.compact)
+    }
+
+    pub fn set_ui_layout_mode(&mut self, mode: crate::tablet_chrome::UiLayoutMode) {
+        self.ui_layout_mode = mode;
+        let _ = self.session.settings.set(crate::tablet_chrome::UI_LAYOUT_KEY, mode.id());
+    }
+
     /// Android's Back button: closes the topmost thing over the page and says whether it did.
     /// A dialog closes as its Cancel would (the first-use wizard goes back a step instead); a
     /// shown-over ribbon or the format painter get Escape, as from the keyboard; the File screen,
@@ -2084,9 +2141,14 @@ impl NocturneApp {
             && page_rect.contains(pos)
         {
             #[allow(clippy::cast_precision_loss)]
-            let ratio = new_zoom as f32 / old_zoom.max(1) as f32;
+            let old_z = old_zoom.max(1) as f32 / 100.0;
+            #[allow(clippy::cast_precision_loss)]
+            let new_z = new_zoom as f32 / 100.0;
+            let ratio = new_z / old_z;
             let anchor = self.editor.as_ref().map_or(page_rect.min, |ed| ed.origin);
-            let delta = (pos - anchor) * (1.0 - ratio);
+            let margin_at = |z: f32| ((page_rect.width() - 780.0 * z) / 2.0).clamp(8.0, 127.0);
+            let mut delta = (pos - anchor) * (1.0 - ratio);
+            delta.x -= margin_at(new_z) - margin_at(old_z);
             if delta.is_finite() {
                 self.apply_external_pan(delta);
             }
@@ -2654,6 +2716,11 @@ impl NocturneApp {
         self.page_rect
     }
 
+    /// Visible screen-space viewport of the open page (`ScrollArea::inner_rect`), unshifted by scroll offset.
+    pub fn page_view_rect(&self) -> Option<egui::Rect> {
+        self.page_view_rect
+    }
+
     /// The page's zoom, in percent, as the View tab shows it.
     pub fn zoom_percent(&self) -> u32 {
         self.zoom_percent
@@ -2691,6 +2758,7 @@ impl NocturneApp {
     pub fn say(&mut self, msg: impl Into<String>) {
         self.status = msg.into();
         self.status_is_error = false;
+        self.status_shown_at = Some(Instant::now());
     }
 
     /// Says something went wrong, in our own words rather than the engine's.
@@ -2700,6 +2768,7 @@ impl NocturneApp {
     pub fn alert(&mut self, key: &str, title: &str, message: &str) {
         self.status = message.to_string();
         self.status_is_error = true;
+        self.status_shown_at = Some(Instant::now());
         if self.muted_alerts.contains(key) {
             return;
         }
@@ -2723,11 +2792,13 @@ impl NocturneApp {
     fn complain(&mut self, msg: &str) {
         self.status = msg.to_string();
         self.status_is_error = true;
+        self.status_shown_at = Some(Instant::now());
     }
 
     fn fail(&mut self, e: &EngineError) {
         self.status = crate::i18n::format_message_id("ui.could_not_complete_the_action_error", &[("error", &e.to_string())]);
         self.status_is_error = true;
+        self.status_shown_at = Some(Instant::now());
     }
 
     fn run(&mut self, id: &str, p: &Params) -> Option<Output> {
@@ -3000,6 +3071,7 @@ impl NocturneApp {
                 arranged,
                 content_bottom: None,
                 shown_widths: Vec::new(),
+                last_frames: Vec::new(),
                 columns: nocturne_store::page::table_columns(dir).unwrap_or_default(),
                 justified: nocturne_store::page::justified(dir).unwrap_or_default(),
                 across: None,
@@ -3889,6 +3961,10 @@ impl NocturneApp {
     // ---------- panels ----------
 
     fn top_bar(&mut self, ui: &mut Ui) {
+        if self.is_tablet_studio(ui.ctx()) {
+            self.studio_top_bar(ui);
+            return;
+        }
         self.title_band(ui, true);
         self.ribbon_bar(ui);
         // Below the ribbon, as OneNote can put it.
@@ -3897,6 +3973,213 @@ impl NocturneApp {
             egui::Panel::top("quick-access").show(ui, |ui| {
                 ui.horizontal(|ui| self.quick_access(ui, tokens));
             });
+        }
+    }
+
+    fn current_view_state<'a>(&'a self, ctx: &Context, family: Option<&'a str>, size: Option<&'a str>, marks: pageedit::Marks) -> ribbon::View<'a> {
+        ribbon::View {
+            split_panes: self.split_panes,
+            always_on_top: self.always_on_top,
+            full_page: self.full_page,
+            rules: self.rules,
+            hide_title: self.hide_title,
+            snap: self.snap_to_grid,
+            zoom_percent: self.zoom_percent,
+            pointer: self.pointer,
+            rack: &self.rack,
+            nib: self.nib,
+            in_table: self.caret_in_table(),
+            space_tool: self.space_tool,
+            finger_drawing: self.is_finger_drawing(),
+            eraser_auto_return: self.eraser_auto_return,
+            show_minimap: self.show_minimap,
+            table_borders: self.caret_table_has_borders(),
+            table_align: self.caret_cells_align(),
+            table_shade: self.caret_cells_shade(),
+            gridcraft: self.gridcraft.is_some(),
+            page_colour: self.editor.as_ref().and_then(|e| e.colour),
+            rule_colour: self.editor.as_ref().and_then(|e| e.rule_colour),
+            can_undo: self.can_undo(),
+            can_redo: self.can_redo(),
+            can_ink_redo: self.pad.as_ref().is_some_and(crate::inkpad::Pad::can_redo),
+            sensitivity: self.sensitivity,
+            pressure_curve: self.pressure_curve,
+            pressure_available: self.stylus.sample().pen,
+            has_page: self.editor.is_some(),
+            painting: self.painter.is_some(),
+            style: self.caret_style(ctx),
+            font_family: family,
+            font_size: size,
+            marks,
+        }
+    }
+
+    fn studio_top_bar(&mut self, ui: &mut Ui) {
+        let tokens = self.tokens;
+        let drawer_open = !self.full_page;
+        let can_back = self.nav.can_back();
+        let can_forward = self.nav.can_forward();
+        let breadcrumb = self.editor.as_ref().map(|ed| ed.title.clone()).unwrap_or_default();
+        let sync_busy = self.sync_job.is_some();
+        let sync_configured = *self
+            .sync_has_token
+            .get_or_insert_with(|| self.session.sync_secrets().get_secret(nocturne_engine::KDRIVE_TOKEN_KEY).ok().flatten().is_some());
+        let show_source = self.show_source;
+        let mut out = crate::tablet_chrome::StudioTopBarOut::default();
+        egui::Panel::top("studio-top-bar").show_separator_line(false).show(ui, |ui| {
+            let font_sel = self.font_selection(ui.ctx());
+            let mut search_buf = std::mem::take(&mut self.search);
+            let mut focus_search = self.focus_search;
+            let view = self.current_view_state(ui.ctx(), None, None, font_sel.marks);
+            let input = crate::tablet_chrome::StudioTopBarIn {
+                drawer_open,
+                can_back,
+                can_forward,
+                breadcrumb: &breadcrumb,
+                sync_busy,
+                sync_configured,
+                show_source,
+                view,
+            };
+            out = crate::tablet_chrome::show_top_bar(ui, &input, &mut search_buf, &mut focus_search, &tokens);
+            self.search = search_buf;
+            self.focus_search = focus_search;
+            self.band_bottom = ui.min_rect().max.y;
+        });
+        if out.toggle_drawer {
+            self.full_page = !self.full_page;
+            self.compact_full_page = false;
+        }
+        if out.nav_back {
+            self.go_back();
+        }
+        if out.nav_forward {
+            self.go_forward();
+        }
+        if out.add_page {
+            if let Some(parent) = self.selected.clone().and_then(|p| {
+                if nocturne_store::tree::read_node(&p).is_some_and(|n| n.kind == NodeKind::Page) {
+                    p.parent().map(Path::to_path_buf)
+                } else {
+                    Some(p)
+                }
+            }) {
+                self.create_page_in(&parent);
+            } else {
+                self.dialog = Some(Dialog::NewNotebook { name: String::new(), format: None });
+            }
+        }
+        if out.clear_page_caret
+            && let Some(caret) = self.editor.as_mut().and_then(|ed| ed.caret.as_mut())
+        {
+            caret.focus = false;
+        }
+        for act in out.acts {
+            self.ribbon_act(act);
+        }
+    }
+
+    pub fn open_cloud_sync_dialog(&mut self) {
+        self.dialog = Some(Dialog::CloudSync(crate::sync_ui::CloudSyncForm::from_session(&self.session)));
+    }
+
+    pub fn start_background_sync(&mut self, ctx: &Context) {
+        if self.sync_job.is_some() {
+            return;
+        }
+        // Flush any dirty open page and ink before scanning local files so in-memory edits are included!
+        self.save_now();
+        if let Some(pad) = self.pad.as_mut()
+            && pad.dirty
+        {
+            let _ = pad.save();
+        }
+        let cfg = nocturne_engine::SyncConfig::load(&self.session.settings);
+        let root = self.session.root().to_path_buf();
+        let settings = self.session.settings.clone();
+        let http = self.session.sync_http();
+        let secrets = self.session.sync_secrets();
+        match crate::sync_ui::SyncJob::start(ctx.clone(), root, settings, cfg, http, secrets) {
+            Ok(job) => {
+                self.sync_job = Some(job);
+                self.say(crate::tl_id!("ui.kdrive_sync_in_progress"));
+            }
+            Err(err) => self.complain(&err),
+        }
+    }
+
+    fn poll_sync(&mut self, ctx: &Context) {
+        if !self.auto_sync_started_on_launch {
+            self.auto_sync_started_on_launch = true;
+            let cfg = nocturne_engine::SyncConfig::load(&self.session.settings);
+            let has_tok = self.session.sync_secrets().get_secret(nocturne_engine::KDRIVE_TOKEN_KEY).ok().flatten().is_some();
+            if cfg.auto_sync && has_tok && self.session.sync_http().is_supported() {
+                self.last_auto_sync_trigger = Some(Instant::now());
+                self.start_background_sync(ctx);
+            }
+        }
+
+        let Some(outcome) = self.sync_job.as_ref().and_then(crate::sync_ui::SyncJob::try_recv) else {
+            return;
+        };
+        self.sync_job = None;
+        match outcome {
+            Ok(staged) => {
+                // Flush any edits made while the sync worker was in flight BEFORE applying staged downloads!
+                self.save_now();
+                if let Some(pad) = self.pad.as_mut()
+                    && pad.dirty
+                {
+                    let _ = pad.save();
+                }
+                if let Some(discovered) = staged.discovered_drive_id {
+                    let mut cfg = nocturne_engine::SyncConfig::load(&self.session.settings);
+                    cfg.drive_id = Some(discovered);
+                    let _ = cfg.save(&self.session.settings);
+                }
+                let open_rel =
+                    self.editor.as_ref().and_then(|ed| ed.dir.strip_prefix(self.session.root()).ok().map(|r| r.to_string_lossy().replace('\\', "/")));
+                let reload_open = open_rel.as_deref().is_some_and(|prefix| staged.touched_local_paths().iter().any(|rel| rel.starts_with(prefix)));
+                match nocturne_engine::apply_staged_sync(staged, &self.session.settings) {
+                    Ok(report) => {
+                        self.session.refresh();
+                        if reload_open
+                            && let Some(dir) = self.editor.as_ref().map(|e| e.dir.clone())
+                            && dir.is_dir()
+                        {
+                            self.open_page(&dir);
+                        }
+                        let msg = crate::sync_ui::format_sync_report_summary(&report);
+                        if let Some(Dialog::CloudSync(ref mut form)) = self.dialog {
+                            if form.drive_id_input.trim().is_empty() && report.drive_id > 0 {
+                                form.drive_id_input = report.drive_id.to_string();
+                            }
+                            form.last_message = Some((msg.clone(), !report.conflicts.is_empty()));
+                        }
+                        self.say(msg);
+                    }
+                    Err(err) => {
+                        let msg = err.to_string();
+                        if let Some(Dialog::CloudSync(ref mut form)) = self.dialog {
+                            form.last_message = Some((msg.clone(), true));
+                        }
+                        self.complain(&msg);
+                    }
+                }
+            }
+            Err(nocturne_engine::SyncError::Cancelled) => {
+                if let Some(Dialog::CloudSync(ref mut form)) = self.dialog {
+                    form.last_message = Some((crate::tl_id!("ui.kdrive_sync_cancelled").to_string(), false));
+                }
+                self.say(crate::tl_id!("ui.kdrive_sync_cancelled"));
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                if let Some(Dialog::CloudSync(ref mut form)) = self.dialog {
+                    form.last_message = Some((msg.clone(), true));
+                }
+                self.complain(&msg);
+            }
         }
     }
 
@@ -4162,6 +4445,19 @@ impl NocturneApp {
                 backstage::Act::ClearTelemetry(path) => self.dialog = Some(Dialog::ClearTelemetry { path }),
                 backstage::Act::CheckForUpdates => crate::update::start(ui.ctx().clone(), self.update.clone()),
                 backstage::Act::OpenReleases => ui.ctx().open_url(egui::OpenUrl::new_tab(backstage::LATEST_RELEASE)),
+                backstage::Act::OpenCloudSync => {
+                    self.backstage = None;
+                    self.open_cloud_sync_dialog();
+                }
+                backstage::Act::ToggleStudioLayout => {
+                    let next = if self.is_tablet_studio(ui.ctx()) {
+                        crate::tablet_chrome::UiLayoutMode::ClassicRibbon
+                    } else {
+                        crate::tablet_chrome::UiLayoutMode::TabletStudio
+                    };
+                    self.set_ui_layout_mode(next);
+                    self.backstage = None;
+                }
                 backstage::Act::ResetPreferences => self.dialog = Some(Dialog::ResetPreferences),
                 backstage::Act::ExportTelemetry(root) => {
                     if let Some(session) = std::fs::read_dir(&root)
@@ -4590,6 +4886,8 @@ impl NocturneApp {
             in_table: self.caret_in_table(),
             space_tool: self.space_tool,
             finger_drawing: self.is_finger_drawing(),
+            eraser_auto_return: self.eraser_auto_return,
+            show_minimap: self.show_minimap,
             table_borders: self.caret_table_has_borders(),
             table_align: self.caret_cells_align(),
             table_shade: self.caret_cells_shade(),
@@ -5025,6 +5323,44 @@ impl NocturneApp {
                 self.fit_page_width = false;
             }
             ribbon::Act::PageWidth => self.fit_page_width = true,
+            ribbon::Act::FitAllContent => {
+                if let Some(ed) = self.editor.as_ref() {
+                    let stroke_bounds = self.pad.as_ref().map(crate::inkpad::Pad::stroke_bounds).unwrap_or_default();
+                    let bounds_page = crate::minimap::content_bounds_page(&ed.last_frames, &stroke_bounds);
+                    let view_size = self.page_view_rect.or(self.page_rect).map_or(vec2(820.0, 620.0), |r| r.size());
+                    let target_zoom = crate::minimap::compute_fit_zoom_percent(bounds_page, view_size);
+                    self.set_zoom_percent(target_zoom);
+                    self.fit_page_width = false;
+                    self.canvas_pan = egui::Vec2::ZERO;
+                    self.pending_scroll_offset_y = Some(0.0);
+                    self.pending_fit_bounds = Some(bounds_page);
+                }
+            }
+            ribbon::Act::ToggleMinimap => {
+                self.show_minimap = !self.show_minimap;
+                let _ = self.session.settings.set("show_minimap", if self.show_minimap { "true" } else { "false" });
+            }
+            ribbon::Act::ToggleEraserAutoReturn => {
+                self.eraser_auto_return = !self.eraser_auto_return;
+                let _ = self.session.settings.set("eraser_auto_return", if self.eraser_auto_return { "true" } else { "false" });
+            }
+            ribbon::Act::OpenCloudSync => {
+                self.open_cloud_sync_dialog();
+            }
+            ribbon::Act::ToggleStudioLayout => {
+                let next = match self.ui_layout_mode {
+                    crate::tablet_chrome::UiLayoutMode::TabletStudio => crate::tablet_chrome::UiLayoutMode::ClassicRibbon,
+                    crate::tablet_chrome::UiLayoutMode::ClassicRibbon => crate::tablet_chrome::UiLayoutMode::TabletStudio,
+                    crate::tablet_chrome::UiLayoutMode::Auto => {
+                        if cfg!(target_os = "ios") {
+                            crate::tablet_chrome::UiLayoutMode::ClassicRibbon
+                        } else {
+                            crate::tablet_chrome::UiLayoutMode::TabletStudio
+                        }
+                    }
+                };
+                self.set_ui_layout_mode(next);
+            }
             ribbon::Act::FormatPainter(sticky) => self.pick_up_formatting(sticky),
             ribbon::Act::PageTemplates => {
                 let name = self.templates_pane.as_ref().map(|p| p.name.clone()).unwrap_or_default();
@@ -6071,6 +6407,18 @@ impl NocturneApp {
     /// The open page's blocks, as the editor holds them.
     pub fn editor_blocks(&self) -> Vec<nocturne_formats::Block> {
         self.editor.as_ref().map(|e| e.blocks.clone()).unwrap_or_default()
+    }
+
+    pub fn editor_origin(&self) -> Option<egui::Pos2> {
+        self.editor.as_ref().map(|e| e.origin)
+    }
+
+    pub fn ink_stroke_count(&self) -> usize {
+        self.pad.as_ref().map_or(0, crate::inkpad::Pad::strokes)
+    }
+
+    pub fn ribbon_act_for_test(&mut self, act: ribbon::Act) {
+        self.ribbon_act(act);
     }
 
     /// Picks up a pen, which is all it takes: the whole page is the ink's, so there is no
@@ -8131,6 +8479,7 @@ impl NocturneApp {
                 // With no page open there is nothing to scroll, zoom or write on, so the last
                 // page's rect must not linger for the platform's gestures to aim at.
                 self.page_rect = None;
+                self.page_view_rect = None;
                 crate::containers::clear_touch_handles(ui.ctx());
                 crate::inkpad::clear_held_hit_cache(ui.ctx());
                 ui.vertical_centered(|ui| {
@@ -8419,7 +8768,15 @@ impl NocturneApp {
         let space_on = self.space_tool && self.pointer == ribbon::Pointer::Write;
         let mut space_over = false;
         let current_zoom_pct = self.zoom_percent;
+        let tablet_studio = self.is_tablet_studio(ui.ctx());
+        let canvas_overlay_open = self.dialog.is_some()
+            || self.ribbon_peek
+            || self.backstage.is_some()
+            || !self.search.trim().is_empty()
+            || crate::ribbon::any_popup_open(ui.ctx());
         let mut multitouch_step: Option<crate::touch_ux::MultiTouchStep> = None;
+        let mut pill_acts: Vec<ribbon::Act> = Vec::new();
+        let mut minimap_out = crate::minimap::MinimapOut::default();
         {
             let Some(ed) = self.editor.as_mut() else { return };
             let missing_fonts = crate::fonts::ensure_page_fonts(ui.ctx(), &crate::fonts::page_families(&ed.blocks));
@@ -8429,43 +8786,45 @@ impl NocturneApp {
             }
             // One id for the title, whether it is drawn as words or as a text box.
             let title_id = egui::Id::new("page-title-box");
-            ui.horizontal_wrapped(|ui| {
-                // File details live in the status bar. Keep only compact page controls
-                // here, with a drop instruction while a file is actually over the window.
-                if ui.input(|i| !i.raw.hovered_files.is_empty()) {
-                    ui.label(egui::RichText::new(crate::tl_id!("ui.drop_a_file_onto_the_page_to_add_it")).small().color(tokens.muted));
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // The page controls, in OneNote's order: full page, search, source.
-                    let full = icon_toggle(
-                        ui,
-                        if full_page { Icon::ExitFullPage } else { Icon::FullPage },
-                        full_page,
-                        &tokens,
-                        crate::tl_id!("ui.full_page"),
-                        if full_page { crate::tl_id!("ui.show_the_notebooks_again") } else { crate::tl_id!("ui.give_the_page_the_whole_window") },
-                    );
-                    if full.clicked() {
-                        toggle_full_page = true;
+            if !tablet_studio {
+                ui.horizontal_wrapped(|ui| {
+                    // File details live in the status bar. Keep only compact page controls
+                    // here, with a drop instruction while a file is actually over the window.
+                    if ui.input(|i| !i.raw.hovered_files.is_empty()) {
+                        ui.label(egui::RichText::new(crate::tl_id!("ui.drop_a_file_onto_the_page_to_add_it")).small().color(tokens.muted));
                     }
-                    if icon_toggle(ui, Icon::Search, false, &tokens, crate::tl_id!("ui.search"), crate::tl_id!("ui.search_all_pages")).clicked() {
-                        focus_search = true;
-                    }
-                    if icon_toggle(
-                        ui,
-                        Icon::Code,
-                        show_source,
-                        &tokens,
-                        crate::tl_id!("ui.page_source"),
-                        if show_source { crate::tl_id!("ui.hide_the_page_source") } else { crate::tl_id!("ui.show_the_page_source") },
-                    )
-                    .clicked()
-                    {
-                        toggle_source = true;
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // The page controls, in OneNote's order: full page, search, source.
+                        let full = icon_toggle(
+                            ui,
+                            if full_page { Icon::ExitFullPage } else { Icon::FullPage },
+                            full_page,
+                            &tokens,
+                            crate::tl_id!("ui.full_page"),
+                            if full_page { crate::tl_id!("ui.show_the_notebooks_again") } else { crate::tl_id!("ui.give_the_page_the_whole_window") },
+                        );
+                        if full.clicked() {
+                            toggle_full_page = true;
+                        }
+                        if icon_toggle(ui, Icon::Search, false, &tokens, crate::tl_id!("ui.search"), crate::tl_id!("ui.search_all_pages")).clicked() {
+                            focus_search = true;
+                        }
+                        if icon_toggle(
+                            ui,
+                            Icon::Code,
+                            show_source,
+                            &tokens,
+                            crate::tl_id!("ui.page_source"),
+                            if show_source { crate::tl_id!("ui.hide_the_page_source") } else { crate::tl_id!("ui.show_the_page_source") },
+                        )
+                        .clicked()
+                        {
+                            toggle_source = true;
+                        }
+                    });
                 });
-            });
-            ui.separator();
+                ui.separator();
+            }
             let height = ui.available_height();
             // How far the page's content reaches sideways on screen this frame (issue #188).
             let mut page_span: Option<(f32, f32)> = None;
@@ -8507,8 +8866,10 @@ impl NocturneApp {
                     let page_dir = ed.page_dir;
                     let available_width = ui.available_width();
                     let page_column = 780.0 * zoom_scale;
-                    let margin = if wide { ((available_width - page_column) / 2.0).max(8.0) } else { 0.0 };
-                    egui::Frame::NONE.inner_margin(egui::Margin { left: margin as i8, right: margin as i8, top: 4, bottom: 8 }).show(ui, |ui| {
+                    let margin = if wide { ((available_width - page_column) / 2.0).clamp(8.0, 127.0) } else { 0.0 };
+                    #[allow(clippy::cast_possible_truncation)]
+                    let margin_i8 = margin.round() as i8;
+                    egui::Frame::NONE.inner_margin(egui::Margin { left: margin_i8, right: margin_i8, top: 4, bottom: 8 }).show(ui, |ui| {
                         let column = if available_width >= page_column { page_column } else { (available_width - 16.0).max(1.0) };
                         ui.set_min_width(column);
                         ui.set_width(column);
@@ -8750,7 +9111,11 @@ impl NocturneApp {
                                 // does. The room is claimed so the page can be scrolled
                                 // into it and so what is drawn there is never cut off.
                                 let used = ui.cursor().min.y - top.y;
-                                let want = crate::inkpad::SHEET_H.max(used + 240.0);
+                                let ink_bottom = pad
+                                    .as_ref()
+                                    .and_then(crate::inkpad::Pad::bounds)
+                                    .map_or(0.0, |[_, _, _, y1]| (y1 * zoom_scale).max(0.0) + 160.0);
+                                let want = crate::inkpad::SHEET_H.max(used + 240.0).max(ink_bottom);
                                 if want > used {
                                     ui.allocate_space(vec2(ui.available_width(), want - used));
                                 }
@@ -8770,6 +9135,7 @@ impl NocturneApp {
                                 *from_blocks = true;
                             }
                             ed.content_bottom = Some(moved.bottom);
+                            ed.last_frames = moved.frames.clone();
                             ed.shown_widths = std::mem::take(&mut moved.shown_widths);
                             if moved.boxes {
                                 *boxes_moved = true;
@@ -8829,15 +9195,21 @@ impl NocturneApp {
                 let page_outer = ui.available_rect_before_wrap();
                 let ext_scroll_y = std::mem::take(&mut self.pending_external_scroll_y);
                 let total_scroll_y = ext_scroll_y + finger_pan_delta.y;
-                let shown = egui::ScrollArea::vertical().id_salt("page-main").auto_shrink([false, false]).scroll_source(scroll).show(ui, |ui| {
+                let mut scroll_area = egui::ScrollArea::vertical().id_salt("page-main").auto_shrink([false, false]).scroll_source(scroll);
+                if let Some(target_y) = self.pending_scroll_offset_y.take() {
+                    let scroll_id = ui.make_persistent_id("page-main");
+                    egui::scroll_area::State::default().store(ui.ctx(), scroll_id);
+                    scroll_area = scroll_area.vertical_scroll_offset(target_y.max(0.0));
+                }
+                let shown = scroll_area.show(ui, |ui| {
                     if total_scroll_y != 0.0 && total_scroll_y.is_finite() {
-                        ui.scroll_with_delta(vec2(0.0, total_scroll_y));
+                        ui.scroll_with_delta_animation(vec2(0.0, total_scroll_y), egui::style::ScrollAnimation::none());
                     }
                     // On a touch screen two fingers scroll, pan sideways, and pinch-zoom the page,
                     // suppressed while a stylus contact is active for palm rejection.
                     if !stylus_active && let Some(touch) = ui.input(|i| i.multi_touch()) {
                         let step = crate::touch_ux::compute_multitouch_canvas_step(touch.translation_delta, touch.zoom_delta, current_zoom_pct);
-                        ui.scroll_with_delta(vec2(0.0, step.scroll_y));
+                        ui.scroll_with_delta_animation(vec2(0.0, step.scroll_y), egui::style::ScrollAnimation::none());
                         multitouch_step = Some(step);
                     }
                     page(
@@ -8861,11 +9233,89 @@ impl NocturneApp {
                     .then(|| egui::Rect::from_x_y_ranges((max_cross - scroll_style.bar_width)..=max_cross, shown.inner_rect.y_range()));
                 // Sideways the page is a canvas: when what is on it reaches past the view's
                 // sides, a bar along the bottom shows it and moves the canvas (issue #188).
+                let view = shown.inner_rect;
+                self.page_view_rect = Some(view);
+                let vertical = shown.content_size.y > view.height() + 0.5;
+                let reserve = if vertical { ui.spacing().scroll.bar_width + ui.spacing().scroll.bar_outer_margin } else { 0.0 };
                 if let Some(span) = page_span {
-                    let view = shown.inner_rect;
-                    let vertical = shown.content_size.y > view.height() + 0.5;
-                    let reserve = if vertical { ui.spacing().scroll.bar_width + ui.spacing().scroll.bar_outer_margin } else { 0.0 };
                     hbar = crate::hscroll::show(ui.ctx(), egui::Id::new("page-hscroll"), view, span, reserve);
+                }
+                // Second frame of Fit All Content: now that `ed.origin` reflects the new zoom,
+                // center `bounds_page.center()` inside `view`.
+                if let Some(fit_bounds) = self.pending_fit_bounds.take() {
+                    let (new_pan, new_scroll_y) = crate::minimap::compute_pan_and_scroll_for_page_center(
+                        fit_bounds.center(),
+                        view,
+                        ed.origin,
+                        zoom_scale,
+                        shown.state.offset().y,
+                        shown.content_size.y,
+                        self.canvas_pan,
+                    );
+                    self.canvas_pan = new_pan;
+                    self.pending_scroll_offset_y = Some(new_scroll_y);
+                    ui.ctx().request_repaint();
+                }
+                if !canvas_overlay_open {
+                    let hbar_clearance = if hbar.track.is_some() { 18.0 } else { 0.0 };
+                    let mut pill_clearance = hbar_clearance;
+                    if tablet_studio {
+                        let pill_view = ribbon::View {
+                            rules,
+                            zoom_percent: current_zoom_pct,
+                            pointer: pen.pointer,
+                            rack: &self.rack,
+                            nib: self.nib,
+                            finger_drawing: self.session.finger_drawing(),
+                            eraser_auto_return: self.eraser_auto_return,
+                            show_minimap: self.show_minimap,
+                            can_undo: ed.history.can_undo() || pad.as_ref().is_some_and(crate::inkpad::Pad::can_undo),
+                            can_redo: !self.undone.is_empty(),
+                            can_ink_redo: pad.as_ref().is_some_and(crate::inkpad::Pad::can_redo),
+                            ..ribbon::View::default()
+                        };
+                        let (acts, pill_rect) = crate::tablet_chrome::show_pencil_pill(ui.ctx(), view, hbar_clearance, &pill_view, &tokens);
+                        pill_acts = acts;
+                        if let Some(pr) = pill_rect {
+                            pill_clearance = pill_clearance.max((view.max.y - pr.min.y + 8.0).max(0.0));
+                        }
+                    }
+                    if self.show_minimap {
+                        let stroke_bounds = pad.as_ref().map(crate::inkpad::Pad::stroke_bounds).unwrap_or_default();
+                        minimap_out = crate::minimap::show(
+                            ui.ctx(),
+                            view,
+                            ed.origin,
+                            current_zoom_pct,
+                            self.minimap_collapsed,
+                            pill_clearance,
+                            reserve,
+                            &ed.last_frames,
+                            &stroke_bounds,
+                            &tokens,
+                        );
+                        if let Some(target_center) = minimap_out.pan_to_page_center {
+                            let (new_pan, new_scroll_y) = crate::minimap::compute_pan_and_scroll_for_page_center(
+                                target_center,
+                                view,
+                                ed.origin,
+                                zoom_scale,
+                                shown.state.offset().y,
+                                shown.content_size.y,
+                                self.canvas_pan,
+                            );
+                            self.canvas_pan = new_pan;
+                            self.pending_scroll_offset_y = Some(new_scroll_y);
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                }
+                if tablet_studio
+                    && let Some(shown_at) = self.status_shown_at
+                    && shown_at.elapsed() < std::time::Duration::from_secs(4)
+                {
+                    crate::tablet_chrome::show_transient_notice(ui.ctx(), view, &self.status, self.status_is_error, &tokens);
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
                 }
             }
             if changed {
@@ -8986,6 +9436,21 @@ impl NocturneApp {
         for act in page_acts {
             self.ribbon_act(act);
         }
+        for act in pill_acts {
+            self.ribbon_act(act);
+        }
+        if minimap_out.toggle_collapsed {
+            self.minimap_collapsed = !self.minimap_collapsed;
+            let _ = self.session.settings.set("minimap_collapsed", if self.minimap_collapsed { "true" } else { "false" });
+        }
+        if minimap_out.fit_all {
+            self.ribbon_act(ribbon::Act::FitAllContent);
+        }
+        let finished_erase = self.pad.as_mut().is_some_and(crate::inkpad::Pad::take_finished_erase);
+        if finished_erase && self.eraser_auto_return && self.pointer == ribbon::Pointer::Erase {
+            self.session.toggle_eraser(nocturne_engine::EraserToggleMode::Pen);
+            self.sync_tool_state_from_session();
+        }
         if ink_changed {
             self.last_ink_change = Some(Instant::now());
         }
@@ -9047,6 +9512,9 @@ impl NocturneApp {
     }
 
     fn status_bar(&mut self, ui: &mut Ui) {
+        if self.is_tablet_studio(ui.ctx()) {
+            return;
+        }
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 let color = if self.status_is_error { self.tokens.warn } else { self.tokens.muted };
@@ -10248,6 +10716,61 @@ impl NocturneApp {
                     keep = false;
                 }
             }
+            Dialog::CloudSync(form) => {
+                let supported = self.session.sync_http().is_supported() && self.session.sync_secrets().is_supported();
+                let busy = self.sync_job.is_some();
+                let out = crate::sync_ui::show_sync_dialog(ctx, form, supported, busy, &self.tokens);
+                if out.cancel_running
+                    && let Some(job) = self.sync_job.as_ref()
+                {
+                    job.cancel();
+                }
+                if out.clear_token && self.run("sync.configure", &params(&[("clear_token", "true")])).is_some() {
+                    self.sync_has_token = Some(false);
+                    form.has_saved_token = false;
+                    form.token_input.clear();
+                    form.last_message = Some((crate::tl_id!("ui.kdrive_token_cleared").to_string(), false));
+                }
+                if out.convert_existing_to_markdown
+                    && self.run("sync.configure", &params(&[("convert_notebooks_to_markdown", "true"), ("markdown_default", "true")])).is_some()
+                {
+                    form.markdown_default = true;
+                    form.last_message = Some((crate::tl_id!("ui.kdrive_converted_notebooks_md").to_string(), false));
+                }
+                if out.save_only || out.save_and_sync_now {
+                    let drive_val = if form.drive_id_input.trim().is_empty() { "auto" } else { form.drive_id_input.trim() };
+                    let mut p = params(&[
+                        ("endpoint", form.endpoint.trim()),
+                        ("drive_id", drive_val),
+                        ("remote_path", form.remote_path.trim()),
+                        ("auto_sync", if form.auto_sync { "true" } else { "false" }),
+                        ("markdown_default", if form.markdown_default { "true" } else { "false" }),
+                        ("propagate_deletes", if form.propagate_deletes { "true" } else { "false" }),
+                    ]);
+                    if !form.token_input.trim().is_empty() {
+                        p.insert("token".into(), form.token_input.trim().into());
+                    }
+                    if self.run("sync.configure", &p).is_some() {
+                        if !form.token_input.trim().is_empty() {
+                            self.sync_has_token = Some(true);
+                            form.has_saved_token = true;
+                            form.token_input.clear();
+                        } else {
+                            self.sync_has_token = None;
+                        }
+                        if out.save_and_sync_now {
+                            self.start_background_sync(ctx);
+                        } else {
+                            form.last_message = Some((crate::tl_id!("ui.kdrive_settings_saved").to_string(), false));
+                        }
+                    } else {
+                        form.last_message = Some((self.status.clone(), true));
+                    }
+                }
+                if out.close {
+                    keep = false;
+                }
+            }
         }
         if keep {
             self.dialog = Some(next);
@@ -10320,7 +10843,20 @@ impl NocturneApp {
                 let id = text("command").ok_or("missing command")?;
                 let params = nocturne_engine::params_from_json(p.get("params"));
                 self.save_now();
+                if let Some(pad) = self.pad.as_mut()
+                    && pad.dirty
+                {
+                    let _ = pad.save();
+                }
                 let out = self.session.run(id, &params).map_err(|e| e.to_string())?;
+                if id == "sync.configure" {
+                    self.sync_has_token = None;
+                } else if id == "sync.now"
+                    && let Some(dir) = self.editor.as_ref().map(|ed| ed.dir.clone())
+                    && dir.is_dir()
+                {
+                    self.open_page(&dir);
+                }
                 if self.editor.as_ref().is_some_and(|ed| !ed.dir.exists()) {
                     self.editor = None;
                 }
@@ -10760,6 +11296,7 @@ impl NocturneApp {
         self.clipboard_keys(ctx);
         self.poll_control(ctx);
         self.poll_import(ctx);
+        self.poll_sync(ctx);
         if !self.event_frames.is_empty() {
             ctx.request_repaint();
         }
@@ -10812,6 +11349,7 @@ impl NocturneApp {
             // No page is drawn under it, so the last page's rect is dropped: the platform's pan
             // and pinch take only touches on a page that is on the screen.
             self.page_rect = None;
+            self.page_view_rect = None;
             self.title_band(ui, false);
             self.storage_notice(ui);
             self.backstage_screen(ui);
@@ -10834,6 +11372,7 @@ impl NocturneApp {
         } else {
             // And no page rect: the one from the frame before is no longer on the screen.
             self.page_rect = None;
+            self.page_view_rect = None;
         }
         self.paint_formatting(ctx);
         self.laser_keys(ctx);

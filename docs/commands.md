@@ -124,6 +124,15 @@ Parameters:
 - path (required): the notebook, group or section
 - color (required): purple, blue, teal, green, yellow, orange, red, magenta, gray, or none for the theme's own colour
 
+## `node.format`
+
+Set the default page format for a notebook, section group or section (changes the tree).
+
+Parameters:
+
+- path (required): the notebook, group or section
+- format (required): html, cmgfm, or none to inherit the parent or global format
+
 ## `node.delete`
 
 Move a page, section or group into its notebook's recycle bin (changes the tree).
@@ -362,4 +371,32 @@ Toggle finger drawing.
 Parameters:
 
 - enabled (optional): true, false, or toggle; default: toggle
+
+## `sync.status`
+
+Show Infomaniak kDrive sync settings and last sync summary.
+
+No parameters.
+
+## `sync.configure`
+
+Configure Infomaniak kDrive sync settings and Personal API Token (changes the tree).
+
+Parameters:
+
+- endpoint (optional): kDrive API base URL (default https://api.infomaniak.com)
+- drive_id (optional): numeric kDrive ID, or auto to detect automatically
+- remote_path (optional): folder path inside kDrive (default The Oracle/Nocturne)
+- auto_sync (optional): true or false
+- markdown_default (optional): true or false; when true, sets global default_format to cmgfm
+- propagate_deletes (optional): true or false; default false
+- token (optional): Personal API Token with drive scope, stored only in the secret store
+- clear_token (optional): true to remove the stored token
+- convert_notebooks_to_markdown (optional): true to set _node.toml format = cmgfm on existing user notebooks
+
+## `sync.now`
+
+Run a two-way kDrive sync for the notebooks folder (changes the tree).
+
+No parameters.
 

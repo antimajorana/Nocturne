@@ -104,6 +104,10 @@ pub struct Pad {
     shape_from: Option<(f32, f32)>,
     /// Last sampled eraser position in page coordinates while erasing a stroke.
     eraser_last: Option<(f32, f32)>,
+    /// True while the current pointer-down gesture has rubbed out at least one stroke.
+    erased_since_press: bool,
+    /// Latched on pointer release when `erased_since_press` was true; consumed by [`Pad::take_finished_erase`].
+    finished_erase_gesture: bool,
     /// Where the pointer was when a move or a stretch began, and the box as it was then.
     grabbed: Option<(egui::Pos2, (f32, f32, f32, f32), Grab)>,
     /// How far held ink was moved by hand in the ordinary pointer since the window last asked,
@@ -139,6 +143,11 @@ impl Pad {
         self.grabbed.is_some()
     }
 
+    /// Returns `true` once when the user has just lifted the stylus/finger after erasing ink.
+    pub fn take_finished_erase(&mut self) -> bool {
+        std::mem::replace(&mut self.finished_erase_gesture, false)
+    }
+
     /// The ink of the page in `page_dir`: what is in its `ink.svg`, or an empty layer when
     /// it has none. Every page has a layer; the file appears the first time the page is
     /// drawn on, so a page nobody has drawn on stays as clean as it was.
@@ -165,6 +174,8 @@ impl Pad {
             loop_now: Vec::new(),
             shape_from: None,
             eraser_last: None,
+            erased_since_press: false,
+            finished_erase_gesture: false,
             grabbed: None,
             shift: (0.0, 0.0),
             kept: Vec::new(),
@@ -638,6 +649,7 @@ pub fn show_with_input_and_handles(
         pad.predict_history.clear();
         pad.shape_from = None;
         pad.eraser_last = None;
+        pad.erased_since_press = false;
         pad.loop_now.clear();
         dropped_grab = pad.grabbed.take().is_some();
         pad.dirty |= dropped_grab;
@@ -648,8 +660,22 @@ pub fn show_with_input_and_handles(
     // Painting on the layer, not through the ui, so ink outside text remains visible. Cut off
     // where the view ends as well as the page: a scrolled page reaches above the view, and this
     // layer sits above the ribbon.
-    let painter = ui.ctx().layer_painter(ui.layer_id()).with_clip_rect(body.intersect(ui.clip_rect()));
+    let clip = body.intersect(ui.clip_rect());
+    let painter = ui.ctx().layer_painter(ui.layer_id()).with_clip_rect(clip);
+    let cull_offscreen = zoom < 0.50 || pad.drawing.strokes.len() > 64;
     for stroke in &pad.drawing.strokes {
+        if cull_offscreen {
+            let Some(screen_bounds) = stroke_screen_bounds(stroke, origin, zoom) else {
+                continue;
+            };
+            if !screen_bounds.intersects(clip) {
+                continue;
+            }
+        }
+        if zoom < 0.35 || stroke.width * zoom < 1.1 {
+            paint_stroke_lod(&painter, origin, stroke, zoom, dark_page);
+            continue;
+        }
         let mut scaled = stroke.clone();
         scaled.colour = shown_colour(scaled.colour, dark_page);
         scaled.width *= zoom;
@@ -756,17 +782,25 @@ pub fn show_with_input_and_handles(
 
     // While a pen is in hand the whole page belongs to it, so this goes on last and over
     // everything: a press must not land in the words underneath and move the caret.
+    // Foreground overlays (minimap, Pencil tool pill, scrollbars, popups) sit at Order::Foreground
+    // above ink-overlay (Order::Middle) and keep their own presses.
+    let over_foreground = ui
+        .ctx()
+        .pointer_interact_pos()
+        .or_else(|| ui.ctx().pointer_latest_pos())
+        .and_then(|p| ui.ctx().layer_id_at(p))
+        .is_some_and(|l| l.order >= egui::Order::Foreground);
     let layer = ui.id().with("ink-layer");
     // A pen that came down on the page while the caret was the pointer has just picked up a
     // pen (issue #9). Its press began before this layer was here, so egui gave it to whatever
     // was under it last frame: hand it to the layer, so the touch that switched the tool also
     // draws.
-    if ui.data_mut(|d| d.remove_temp::<bool>(claim_press_id())).unwrap_or(false) && ui.input(|i| i.pointer.primary_down()) {
+    if ui.data_mut(|d| d.remove_temp::<bool>(claim_press_id())).unwrap_or(false) && ui.input(|i| i.pointer.primary_down()) && !over_foreground {
         ui.ctx().set_dragged_id(layer);
     }
     let resp = ui.interact(hit, layer, Sense::click_and_drag());
     if pen.pointer == Pointer::Laser {
-        laser(ui, &painter, body, origin, zoom, resp.is_pointer_button_down_on());
+        laser(ui, &painter, body, origin, zoom, resp.is_pointer_button_down_on() && !over_foreground);
         return dropped_grab;
     }
     ui.ctx().set_cursor_icon(match pen.pointer {
@@ -780,10 +814,12 @@ pub fn show_with_input_and_handles(
 
     // Not egui's drag, which only begins once the pointer has travelled far enough: a pen
     // put down and lifted in one place is a dot, and a dot is ink.
-    let down = resp.is_pointer_button_down_on();
+    let stroke_in_flight = pad.drawing_now.is_some() || pad.eraser_last.is_some() || !pad.loop_now.is_empty() || pad.grabbed.is_some();
+    let down = resp.is_pointer_button_down_on() && (!over_foreground || stroke_in_flight);
     let at = ui.ctx().pointer_interact_pos().filter(|p| body.contains(*p)).map(|p| ((p.x - origin.x) / zoom, (p.y - origin.y) / zoom));
     if pen.pointer != Pointer::Erase {
         pad.eraser_last = None;
+        pad.erased_since_press = false;
     }
     let mut changed = false;
     match pen.pointer {
@@ -804,8 +840,13 @@ pub fn show_with_input_and_handles(
                 } else {
                     changed = pad.drawing.erase_at(x, y, radius) > 0;
                 }
+                pad.erased_since_press |= changed;
                 pad.eraser_last = Some((x, y));
             } else {
+                if !down && pad.erased_since_press {
+                    pad.finished_erase_gesture = true;
+                    pad.erased_since_press = false;
+                }
                 pad.eraser_last = None;
             }
         }
@@ -914,7 +955,7 @@ pub fn show_with_input_and_handles(
                 // A press on a corner stretches, inside the box moves, on a stroke picks
                 // that stroke up, and anywhere else lets go.
                 let corner = held_box.and_then(|b| grab_corner(b, here, handle_reach));
-                let pick_radius = if touch_handles { 10.0 / zoom.max(0.25) } else { 3.0 };
+                let pick_radius = if touch_handles { 10.0 / zoom.max(0.15) } else { 3.0 };
                 match (corner, held_box, at) {
                     (Some(c), Some(b), _) => pad.grabbed = Some((here, as_tuple(b, origin, zoom), c)),
                     (None, Some(b), _) if b.contains(here) => pad.grabbed = Some((here, as_tuple(b, origin, zoom), Grab::Move)),
@@ -996,6 +1037,47 @@ fn grab_corner(box_: egui::Rect, at: egui::Pos2, reach: f32) -> Option<Grab> {
 /// A rectangle on the screen as the ink's own coordinates.
 fn as_tuple(b: egui::Rect, origin: egui::Pos2, zoom: f32) -> (f32, f32, f32, f32) {
     ((b.min.x - origin.x) / zoom, (b.min.y - origin.y) / zoom, (b.max.x - origin.x) / zoom, (b.max.y - origin.y) / zoom)
+}
+
+fn stroke_screen_bounds(stroke: &Stroke, origin: egui::Pos2, zoom: f32) -> Option<egui::Rect> {
+    let first = stroke.dabs.first()?;
+    let mut min_x = first.x;
+    let mut max_x = first.x;
+    let mut min_y = first.y;
+    let mut max_y = first.y;
+    for d in stroke.dabs.iter().skip(1) {
+        min_x = min_x.min(d.x);
+        max_x = max_x.max(d.x);
+        min_y = min_y.min(d.y);
+        max_y = max_y.max(d.y);
+    }
+    let pad = (stroke.width * 2.0).max(2.0);
+    Some(egui::Rect::from_min_max(
+        origin + vec2((min_x - pad) * zoom, (min_y - pad) * zoom),
+        origin + vec2((max_x + pad) * zoom, (max_y + pad) * zoom),
+    ))
+}
+
+fn paint_stroke_lod(painter: &egui::Painter, origin: egui::Pos2, stroke: &Stroke, zoom: f32, dark_page: bool) {
+    let shown = shown_colour(stroke.colour, dark_page);
+    let colour = egui::Color32::from_rgb(shown.0, shown.1, shown.2).gamma_multiply(stroke.tool.opacity());
+    let width = (stroke.width * zoom).max(0.8);
+    if stroke.dabs.len() == 1 {
+        let d = &stroke.dabs[0];
+        painter.circle_filled(origin + vec2(d.x * zoom, d.y * zoom), width * 0.5, colour);
+        return;
+    }
+    let mut pts = Vec::with_capacity(stroke.dabs.len().min(64));
+    for (idx, d) in stroke.dabs.iter().enumerate() {
+        let p = origin + vec2(d.x * zoom, d.y * zoom);
+        let is_end = idx + 1 == stroke.dabs.len();
+        if pts.last().is_none_or(|prev: &egui::Pos2| is_end || prev.distance_sq(p) >= 0.64) {
+            pts.push(p);
+        }
+    }
+    if pts.len() >= 2 {
+        painter.add(egui::Shape::line(pts, egui::Stroke::new(width, colour)));
+    }
 }
 
 /// One stroke, as triangles between the two edges of its ribbon, with a round cap at each

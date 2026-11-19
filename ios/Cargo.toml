@@ -46,7 +46,7 @@ eframe = { workspace = true, default-features = false, features = ["default_font
 nocturne-setup = { path = "../apps/nocturne-setup" }
 objc2 = "0.6"
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFCGTypes", "objc2"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "NSArray", "NSAttributedString", "NSBundle", "NSData", "NSDictionary", "NSNotification", "NSObjCRuntime", "NSObject", "NSOperation", "NSPathUtilities", "NSProcessInfo", "NSRange", "NSString", "NSValue"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "NSArray", "NSAttributedString", "NSBundle", "NSData", "NSDate", "NSDictionary", "NSError", "NSNotification", "NSObjCRuntime", "NSObject", "NSOperation", "NSPathUtilities", "NSProcessInfo", "NSRange", "NSString", "NSURL", "NSURLRequest", "NSURLResponse", "NSURLSession", "NSValue"] }
 objc2-ui-kit = { version = "0.3", default-features = false, features = ["std", "bitflags", "block2", "objc2-core-foundation", "NSText", "UIAction", "UICommand", "UIEditMenuInteraction", "UIEvent", "UIGeometry", "UIGestureRecognizer", "UIImage", "UIIndirectScribbleInteraction", "UIInteraction", "UIMenu", "UIMenuController", "UIMenuElement", "UIPanGestureRecognizer", "UIPasteboard", "UIPencilInteraction", "UIPinchGestureRecognizer", "UIResponder", "UIScreen", "UIScribbleInteraction", "UITextInput", "UITextInputTraits", "UITouch", "UIView", "UIWindow"] }
 raw-window-handle = "0.6"
 time = { workspace = true }

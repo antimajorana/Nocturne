@@ -1257,7 +1257,7 @@ fn f3_t2_zoom_percent_clamping_consistency_at_min_and_max_bounds() {
     }
     settle(&mut h);
     let min_zoom = h.state().zoom_percent();
-    assert_eq!(min_zoom, 50, "minimum canonical zoom_percent must clamp at 50: {min_zoom}");
+    assert_eq!(min_zoom, 15, "minimum canonical zoom_percent must clamp at 15: {min_zoom}");
     if let Some(json_z) = json_zoom_percent(&inspect(&mut h)) {
         assert_eq!(json_z, min_zoom);
     }
@@ -1273,10 +1273,10 @@ fn f3_t2_zoom_percent_clamping_consistency_at_min_and_max_bounds() {
         assert_eq!(json_z, max_zoom);
     }
 
-    // Verify touch_ux step stays consistent with canonical 50..=250 range when integrated.
-    let step_low = compute_multitouch_canvas_step(egui::Vec2::ZERO, 0.2, 50);
+    // Verify touch_ux step stays consistent with canonical 15..=250 range when integrated.
+    let step_low = compute_multitouch_canvas_step(egui::Vec2::ZERO, 0.2, 15);
     let step_high = compute_multitouch_canvas_step(egui::Vec2::ZERO, 4.0, 250);
-    assert!(step_low.new_zoom.is_none_or(|z| z >= 50), "zoom_percent clamping consistency at lower bound: {step_low:?}");
+    assert!(step_low.new_zoom.is_none_or(|z| z >= 15), "zoom_percent clamping consistency at lower bound: {step_low:?}");
     assert!(step_high.new_zoom.is_none_or(|z| z <= 250), "zoom_percent clamping consistency at upper bound: {step_high:?}");
 }
 

@@ -166,6 +166,29 @@ pub fn egui_overlay_blocks_native_gesture(ctx: &egui::Context, show_source: bool
     false
 }
 
+/// Returns `true` when a long-press at `pos` lands inside the open page canvas and no modal,
+/// dialog, backstage screen, source view, popup, or foreground overlay (`Order::Middle`+) owns
+/// `pos`.
+///
+/// Outside the open page canvas (modal confirmation buttons such as Delete notebook, top bar,
+/// ribbon, backstage, drawer), synthetic `PointerButton::Secondary` injection must be suppressed:
+/// in `egui 0.37`, any `PointerButton { pressed: false }` clears `PointerState::press_origin`
+/// while the finger is still down, canceling deliberate taps (>= 0.50 s), whereas egui's built-in
+/// `LONG_TOUCHED` flag already opens `.context_menu(...)` on `Sense::click()` widgets.
+#[must_use]
+pub fn should_inject_canvas_long_press(ctx: &egui::Context, page_rect: Option<egui::Rect>, canvas_overlay_open: bool, pos: egui::Pos2) -> bool {
+    if canvas_overlay_open || !pos.is_finite() {
+        return false;
+    }
+    let Some(rect) = page_rect else {
+        return false;
+    };
+    if !rect.contains(pos) {
+        return false;
+    }
+    !egui_overlay_blocks_native_gesture(ctx, false, Some(pos))
+}
+
 /// Validates an incremental pan delta in logical points matching `NocturneApp::apply_external_pan`.
 ///
 /// Positive `(dx, dy)` moves the canvas/scroll in the direction of the finger drag (natural scrolling),

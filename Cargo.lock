@@ -3043,6 +3043,9 @@ dependencies = [
  "nocturne-model",
  "nocturne-store",
  "serde_json",
+ "sha2",
+ "ureq",
+ "web-time",
 ]
 
 [[package]]

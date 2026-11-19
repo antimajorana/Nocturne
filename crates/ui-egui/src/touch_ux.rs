@@ -13,7 +13,7 @@ pub const TOUCH_HANDLE_HIT_SIZE: f32 = 32.0;
 pub const TOUCH_PILL_HEIGHT: f32 = TABLET_MIN_INTERACT_HEIGHT;
 
 /// Minimum canvas zoom percentage shared across pinch-zoom, toolbar zoom, and wheel zoom.
-pub const MIN_ZOOM_PERCENT: u32 = 50;
+pub const MIN_ZOOM_PERCENT: u32 = 15;
 
 /// Maximum canvas zoom percentage shared across pinch-zoom, toolbar zoom, and wheel zoom.
 pub const MAX_ZOOM_PERCENT: u32 = 250;
@@ -221,7 +221,7 @@ mod tests {
         assert_eq!(step(Vec2::ZERO, 0.99, 100).new_zoom, None);
         assert_eq!(step(Vec2::ZERO, 1.5, 220).new_zoom, Some(MAX_ZOOM_PERCENT));
         assert_eq!(step(Vec2::ZERO, 1.5, MAX_ZOOM_PERCENT).new_zoom, None);
-        assert_eq!(step(Vec2::ZERO, 0.5, 60).new_zoom, Some(MIN_ZOOM_PERCENT));
+        assert_eq!(step(Vec2::ZERO, 0.5, 20).new_zoom, Some(MIN_ZOOM_PERCENT));
         assert_eq!(step(Vec2::ZERO, 0.5, MIN_ZOOM_PERCENT).new_zoom, None);
     }
 

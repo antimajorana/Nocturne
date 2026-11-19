@@ -15,10 +15,15 @@ mod error;
 mod json;
 pub mod sample;
 mod session;
+pub mod sync;
 mod tool_state;
 
 pub use commands::{CommandSpec, Output, Params, registry};
 pub use error::EngineError;
 pub use json::{commands_json, output_json, params_from_json};
 pub use session::Session;
+pub use sync::{
+    DEFAULT_KDRIVE_ENDPOINT, DEFAULT_KDRIVE_REMOTE_PATH, KDRIVE_TOKEN_KEY, SecretStore, StagedSync, SyncConfig, SyncError, SyncHttpClient,
+    SyncHttpMethod, SyncHttpRequest, SyncHttpResponse, SyncReport, apply_staged_sync, stage_sync,
+};
 pub use tool_state::{EraserToggleMode, InkActiveMode, InkPenKind, InkToolState};

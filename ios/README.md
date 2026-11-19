@@ -13,14 +13,16 @@ Native `egui` + `wgpu` Metal build of Nocturne packaged as a universal iPhone/iP
   `UIApplicationSupportsIndirectInputEvents` enables trackpad and mouse support alongside touch and
   Apple Pencil.
 - **Touch ergonomics and native UIKit bridges**: finger-only `UIPanGestureRecognizer` and
-  `UIPinchGestureRecognizer` (`50%` to `250%` zoom, [`src/gestures.rs`](src/gestures.rs),
-  [`touch_ux.rs`](../crates/ui-egui/src/touch_ux.rs)), Apple Pencil direct draw &
+  `UIPinchGestureRecognizer` (`15%` to `250%` zoom, [`src/gestures.rs`](src/gestures.rs),
+  [`touch_ux.rs`](../crates/ui-egui/src/touch_ux.rs)), Tablet Studio top bar + Apple Pencil tool
+  pill + collapsible infinite-canvas minimap, Apple Pencil direct draw &
   `UIPencilInteraction` double-tap/squeeze eraser toggle ([`src/pencil.rs`](src/pencil.rs)),
   native `UITextInput`/Scribble responder ([`src/text_input.rs`](src/text_input.rs)),
   `UIEditMenuInteraction` Copy/Paste menu ([`src/edit_menu.rs`](src/edit_menu.rs)), docked
-  above-keyboard formatting bar & frame avoidance ([`KeyboardObserver`](src/keyboard.rs)), and
-  `Cmd+V` paste through `UIPasteboard` ([`src/clipboard.rs`](src/clipboard.rs),
-  [`src/app.rs`](src/app.rs)).
+  above-keyboard formatting bar & frame avoidance ([`KeyboardObserver`](src/keyboard.rs)),
+  built-in Infomaniak kDrive sync (`NSURLSession` + Keychain token storage, [`src/http.rs`](src/http.rs),
+  [`src/keychain.rs`](src/keychain.rs)), and `Cmd+V` paste through `UIPasteboard`
+  ([`src/clipboard.rs`](src/clipboard.rs), [`src/app.rs`](src/app.rs)).
 - **Files app integration and diagnostics**: `UIFileSharingEnabled` and
   `LSSupportsOpeningDocumentsInPlace` expose `<HOME>/Documents/Nocturne` under
   **Files > On My iPad > Nocturne**, alongside exported runtime diagnostics at
@@ -85,22 +87,30 @@ Get-Content .\nocturne-0.0.10-ios-arm64.ipa.sha256
    re-sign with the same bundle ID (`io.github.antimajorana.nocturne`). iPadOS preserves
    `<HOME>/Documents/Nocturne` across refreshes.
 
-### Option B: SideStore (refreshes directly on the iPad)
+### Option B: SideStore (recommended; installs and updates directly on the iPad)
 
 1. **One-time SideStore setup**: install SideStore on your iPad using your Windows PC or Mac to
    generate the pairing file, enable the SideStore WireGuard loopback VPN, and sign in with your
    Apple ID inside SideStore (free Apple IDs allow up to 3 active sideloaded apps and a 7-day
    signing window).
-2. **Transfer the `.ipa` to your iPad**:
-   - Download the `nocturne-ios-arm64` artifact directly in Safari on the iPad, **or** copy
-     `nocturne-<version>-ios-arm64.ipa` over USB-C / iCloud Drive / AirDrop / kDrive into the
-     iPad **Files** app.
-   - If you downloaded the GitHub Actions artifact `.zip` on the iPad, tap the `.zip` in **Files**
-     once to unpack `nocturne-<version>-ios-arm64.ipa`.
-3. **Install in SideStore**:
+2. **Add the official Nocturne source feed (recommended for 1-tap updates)**:
    - Make sure the SideStore WireGuard VPN is enabled.
-   - Open **SideStore > My Apps > `+`**, pick `nocturne-<version>-ios-arm64.ipa`, and wait for
-     SideStore to re-sign and install the bundle.
+   - Open **SideStore > Sources > `+`**, paste:
+     ```text
+     https://github.com/antimajorana/Nocturne/releases/latest/download/altstore-source.json
+     ```
+     (always use the `/releases/latest/download/altstore-source.json` URL rather than a
+     version-pinned `/releases/download/vX.Y.Z/...` asset link so future releases show up).
+   - Tap **Add Source**, open **Sources > Nocturne**, and tap **FREE** / **INSTALL** on Nocturne.
+   - *Manual `.ipa` fallback (branch/CI artifacts)*: if you sideload a raw `.ipa` via
+     **My Apps > `+`**, SideStore does not link that install to the source feed; switch to the
+     source install above when you want in-app release updates.
+3. **Updating to a new Nocturne release in SideStore**:
+   - SideStore does not auto-refresh feeds in the background, and SideStore's **My Apps > Updates**
+     section has a known upstream bug (`SideStore#975`) where new source versions may not list there.
+   - To update: enable the WireGuard VPN, open **SideStore > Sources > Nocturne > View All Apps**
+     (or **My Apps**), **pull down to refresh**, then tap **Nocturne** to open its App Detail screen
+     and tap **UPDATE** (preserving `<HOME>/Documents/Nocturne` in place).
 4. **Trust the certificate (first install only)**:
    - Open **Settings > General > VPN & Device Management**, tap your Apple ID developer profile,
      and tap **Trust**.
