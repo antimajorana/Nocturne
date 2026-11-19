@@ -1,6 +1,6 @@
 //! Native iOS / iPadOS application entry and `eframe::App` shell for Nocturne.
 
-use crate::{clipboard, diagnostics, edit_menu, gestures, inbox, keyboard, pencil, storage, text_input};
+use crate::{clipboard, diagnostics, edit_menu, gestures, http, inbox, keyboard, keychain, pencil, storage, text_input};
 use nocturne_engine::Session;
 use nocturne_store::Settings;
 use nocturne_ui_egui::clipboard::Board as _;
@@ -234,8 +234,14 @@ pub(crate) fn run() -> Result<(), String> {
     std::fs::create_dir_all(&layout.notebooks).map_err(|e| format!("cannot create {}: {e}", layout.notebooks.display()))?;
 
     let settings = Settings::at(&layout.settings);
+    if settings.default_format().is_none() {
+        let _ = settings.set_default_format(nocturne_model::PageFormat::Cmgfm);
+    }
     let root = nocturne_store::settings::configured_notebooks_dir(&settings).filter(|p| p.is_dir()).unwrap_or_else(|| layout.notebooks.clone());
     let mut session = Session::new(&root, settings).map_err(|e| format!("cannot open the notebooks folder {}: {e}", root.display()))?;
+    if let Some(mtm) = MainThreadMarker::new() {
+        session.set_sync_backends(Arc::new(http::NsUrlSessionClient::new(mtm)), Arc::new(keychain::IosKeychainStore::new(mtm)));
+    }
 
     let initial_ingest = inbox::ingest_inbox(&layout.inbox, &mut session);
     let app_data = layout.app_data.clone();
@@ -395,8 +401,10 @@ impl eframe::App for Shell {
             }
 
             let touch_pos = gestures::latest_pointer_pos_in_events(&raw_input.events);
-            let egui_blocked = gestures::egui_overlay_blocks_native_gesture(ctx, self.app.show_source(), touch_pos);
-            bridge.gestures.sync_from_app(self.app.is_finger_drawing(), self.app.page_rect(), egui_blocked);
+            let canvas_overlay = self.app.has_canvas_blocking_overlay();
+            let egui_blocked = gestures::egui_overlay_blocks_native_gesture(ctx, canvas_overlay, touch_pos);
+            let visible_canvas = self.app.page_view_rect().or_else(|| self.app.page_rect());
+            bridge.gestures.sync_from_app(self.app.is_finger_drawing(), visible_canvas, egui_blocked, canvas_overlay);
             if let Some(delta) = bridge.gestures.drain_pan_delta() {
                 self.app.apply_external_pan(delta);
             }
@@ -425,39 +433,42 @@ impl eframe::App for Shell {
 
         let now_secs = raw_input.time.unwrap_or_else(|| ctx.input(|i| i.time));
         if let Some(long_press_pos) = self.long_press.update(now_secs, &raw_input.events) {
-            let caret_rect = self.app.keyboard_caret_rect();
             let page_rect = self.app.page_rect();
-            let caret_arr = caret_rect.map(|r| [r.min.x, r.min.y, r.width(), r.height()]);
-            let page_arr = page_rect.map(|r| [r.min.x, r.min.y, r.width(), r.height()]);
-            let near_caret = edit_menu::is_long_press_near_caret([long_press_pos.x, long_press_pos.y], caret_arr, page_arr);
-            let is_writable = caret_rect.is_some() && !self.app.show_source();
-            if let Some(bridge) = self.bridge.as_ref()
-                && edit_menu::should_present_native_edit_menu(caret_rect.is_some() && !self.egui_wants_ime && near_caret, true)
-            {
-                let target_arr = edit_menu::compute_menu_target_rect(caret_arr, Some([long_press_pos.x, long_press_pos.y]));
-                let target_rect = egui::Rect::from_min_size(egui::pos2(target_arr[0], target_arr[1]), egui::vec2(target_arr[2], target_arr[3]));
-                let has_selection = !self.app.selected_text_for_platform().is_empty();
-                let can_paste = is_writable && {
-                    let mut board = clipboard::IosPasteboard::new();
-                    board.text().is_some() || board.has_picture() || board.html().is_some()
-                };
-                bridge.edit_menu.present(&bridge.view, target_rect, has_selection, can_paste, is_writable);
-            } else {
-                raw_input.events.push(egui::Event::PointerMoved(long_press_pos));
-                raw_input.events.push(egui::Event::PointerButton {
-                    pos: long_press_pos,
-                    button: egui::PointerButton::Secondary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::NONE,
-                });
-                raw_input.events.push(egui::Event::PointerButton {
-                    pos: long_press_pos,
-                    button: egui::PointerButton::Secondary,
-                    pressed: false,
-                    modifiers: egui::Modifiers::NONE,
-                });
+            let canvas_view = self.app.page_view_rect().or(page_rect);
+            if gestures::should_inject_canvas_long_press(ctx, canvas_view, self.app.has_canvas_blocking_overlay(), long_press_pos) {
+                let caret_rect = self.app.keyboard_caret_rect();
+                let caret_arr = caret_rect.map(|r| [r.min.x, r.min.y, r.width(), r.height()]);
+                let page_arr = page_rect.map(|r| [r.min.x, r.min.y, r.width(), r.height()]);
+                let near_caret = edit_menu::is_long_press_near_caret([long_press_pos.x, long_press_pos.y], caret_arr, page_arr);
+                let is_writable = caret_rect.is_some() && !self.app.show_source();
+                if let Some(bridge) = self.bridge.as_ref()
+                    && edit_menu::should_present_native_edit_menu(caret_rect.is_some() && !self.egui_wants_ime && near_caret, true)
+                {
+                    let target_arr = edit_menu::compute_menu_target_rect(caret_arr, Some([long_press_pos.x, long_press_pos.y]));
+                    let target_rect = egui::Rect::from_min_size(egui::pos2(target_arr[0], target_arr[1]), egui::vec2(target_arr[2], target_arr[3]));
+                    let has_selection = !self.app.selected_text_for_platform().is_empty();
+                    let can_paste = is_writable && {
+                        let mut board = clipboard::IosPasteboard::new();
+                        board.text().is_some() || board.has_picture() || board.html().is_some()
+                    };
+                    bridge.edit_menu.present(&bridge.view, target_rect, has_selection, can_paste, is_writable);
+                } else {
+                    raw_input.events.push(egui::Event::PointerMoved(long_press_pos));
+                    raw_input.events.push(egui::Event::PointerButton {
+                        pos: long_press_pos,
+                        button: egui::PointerButton::Secondary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                    raw_input.events.push(egui::Event::PointerButton {
+                        pos: long_press_pos,
+                        button: egui::PointerButton::Secondary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                ctx.request_repaint();
             }
-            ctx.request_repaint();
         }
         if let Some(delay) = self.long_press.next_wakeup_delay(now_secs) {
             ctx.request_repaint_after(delay);

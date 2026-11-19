@@ -7,6 +7,7 @@ use nocturne_ios::edit_menu::{
 use nocturne_ios::gestures::{
     GestureBridgeState, GestureRect, OFFSCREEN_RELEASE_POS, PureInputEvent, PureTouchPhase, compute_incremental_pan, compute_incremental_pinch,
     egui_overlay_blocks_native_gesture, filter_pure_events, filter_pure_events_with_stylus_ids, should_begin_native_pan, should_begin_native_pinch,
+    should_inject_canvas_long_press,
 };
 use nocturne_ios::keyboard::compute_soft_keyboard_state;
 use nocturne_ios::pencil::{PencilBridgeState, PencilCommand, PencilPreferredAction, PencilSqueezePhase};
@@ -1059,4 +1060,160 @@ fn replace_range_while_marked_active_end_to_end_in_nocturne_and_egui() {
         assert!(!preedit, "egui_ime_preedit must be cleared after replace_range for {label}");
         assert_eq!(doc.marked_range_utf16(), None);
     }
+}
+
+#[test]
+fn deliberate_0_6s_tap_on_modal_button_clicks_with_canvas_long_press_guard() {
+    let (_dir, mut app, _clip) = make_test_app("ios-slow-tap-guard");
+    let ctx = egui::Context::default();
+    ctx.options_mut(nocturne_ui_egui::touch_ux::apply_mobile_touch_input_options);
+
+    // Settle layout in classic or studio mode and verify open canvas allows long-press injection.
+    step_app_frame(&ctx, &mut app, egui::RawInput::default());
+    step_app_frame(&ctx, &mut app, egui::RawInput::default());
+    let page = app.page_rect().expect("page_rect");
+    let open_canvas_pos = Pos2::new(page.center().x, page.min.y + 180.0);
+    assert!(
+        should_inject_canvas_long_press(&ctx, app.page_rect(), app.has_canvas_blocking_overlay(), open_canvas_pos),
+        "open canvas must still accept long-press secondary-click injection"
+    );
+
+    // Open a modal dialog (`open_link_dialog`) and verify `should_inject_canvas_long_press` blocks injection!
+    app.open_link_dialog();
+    step_app_frame(&ctx, &mut app, egui::RawInput::default());
+    step_app_frame(&ctx, &mut app, egui::RawInput::default());
+    assert!(app.has_canvas_blocking_overlay());
+    assert!(
+        !should_inject_canvas_long_press(&ctx, app.page_rect(), app.has_canvas_blocking_overlay(), Pos2::new(512.0, 384.0)),
+        "modal dialog must suppress synthetic secondary-click injection"
+    );
+
+    // Replay a 0.58 s finger press (>= 0.50 s LONG_PRESS_SECS, < 0.80 s max_click_duration)
+    // on a modal confirmation button with TouchLongPress + canvas guard:
+    let modal_ctx = egui::Context::default();
+    modal_ctx.options_mut(nocturne_ui_egui::touch_ux::apply_mobile_touch_input_options);
+    let mut lp = TouchLongPress::default();
+    let run_modal_frame = |time: f64, mut events: Vec<egui::Event>, guard_blocks: bool, lp: &mut TouchLongPress| -> (bool, Pos2) {
+        if let Some(fire_pos) = lp.update(time, &events)
+            && !guard_blocks
+        {
+            events.push(egui::Event::PointerMoved(fire_pos));
+            events.push(egui::Event::PointerButton {
+                pos: fire_pos,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            });
+            events.push(egui::Event::PointerButton {
+                pos: fire_pos,
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        let mut clicked = false;
+        let mut center = Pos2::new(180.0, 130.0);
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 300.0))),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        let mut out = modal_ctx.run_ui(raw, |ui| {
+            egui::Window::new("Confirm Delete").collapsible(false).fixed_pos(Pos2::new(100.0, 80.0)).show(ui.ctx(), |ui| {
+                let r = ui.add_sized([140.0, 44.0], egui::Button::new("Delete"));
+                center = r.rect.center();
+                clicked = r.clicked();
+            });
+        });
+        out.textures_delta.clear();
+        (clicked, center)
+    };
+
+    // Two warmup frames so egui::Window completes its sizing pass and registers hit-test rects.
+    let _ = run_modal_frame(0.0, Vec::new(), true, &mut lp);
+    let (_, btn_pos) = run_modal_frame(0.02, Vec::new(), true, &mut lp);
+
+    let touch_ev =
+        |phase: egui::TouchPhase, pos: Pos2| egui::Event::Touch { device_id: egui::TouchDeviceId(0), id: egui::TouchId(7), phase, pos, force: None };
+    let prim_ev = |pressed: bool, pos: Pos2| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+
+    assert!(
+        !run_modal_frame(
+            0.05,
+            vec![touch_ev(egui::TouchPhase::Start, btn_pos), egui::Event::PointerMoved(btn_pos), prim_ev(true, btn_pos)],
+            true,
+            &mut lp
+        )
+        .0
+    );
+    // At t = 0.56 s (>= 0.50 s LONG_PRESS_SECS), TouchLongPress fires, but guard_blocks == true suppresses Secondary click injection!
+    assert!(!run_modal_frame(0.56, Vec::new(), true, &mut lp).0);
+    // At t = 0.63 s (0.58 s hold < 0.80 s egui max_click_duration), finger lifts -> Delete button clicks cleanly!
+    let (clicked, _) =
+        run_modal_frame(0.63, vec![touch_ev(egui::TouchPhase::End, btn_pos), prim_ev(false, btn_pos), egui::Event::PointerGone], true, &mut lp);
+    assert!(clicked, "a 0.58s tap on a modal Delete button must click cleanly when canvas long-press guard is active");
+}
+
+#[test]
+fn scrolled_page_view_rect_and_foreground_pill_do_not_steal_or_poison_native_gestures() {
+    let (_dir, mut app, _clip) = make_test_app("ios-scrolled-view-rect-guard");
+    let ctx = egui::Context::default();
+    ctx.set_os(egui::os::OperatingSystem::IOS);
+
+    // Populate a tall page and scroll down so `page_rect().min.y` moves above the visible `page_view_rect().min.y`.
+    let tall_body: String = (0..120).map(|i| format!("Paragraph {i}\n\n")).collect();
+    app.set_body(&tall_body);
+    focus_block_zero(&ctx, &mut app);
+    for _ in 0..10 {
+        app.apply_external_pan(Vec2::new(0.0, -60.0));
+        step_app_frame(&ctx, &mut app, egui::RawInput::default());
+        if app.page_rect().zip(app.page_view_rect()).is_some_and(|(r, v)| r.min.y < v.min.y - 40.0) {
+            break;
+        }
+    }
+
+    let raw_page = app.page_rect().expect("page_rect");
+    let view_page = app.page_view_rect().expect("page_view_rect");
+    assert!(raw_page.min.y < view_page.min.y, "scrolling down shifts page_rect above page_view_rect: {raw_page:?} vs {view_page:?}");
+
+    // A touch in the Studio top bar (`y = 20.0`) must be OUTSIDE the visible canvas `GestureRect`!
+    let visible_rect = nocturne_ios::gestures::GestureRect::from_bounds([view_page.min.x, view_page.min.y, view_page.max.x, view_page.max.y]);
+    assert!(!visible_rect.contains(view_page.center().x, 20.0), "top-bar touch must not count as in_canvas when scrolled");
+
+    // Touching directly on the floating Order::Foreground Pencil pill MUST block native pan,
+    // and once released (`None` touch_pos on next idle frame), open canvas MUST NOT remain poisoned!
+    let pill_pos = Pos2::new(view_page.center().x, view_page.max.y - 24.0);
+    assert!(
+        nocturne_ios::gestures::egui_overlay_blocks_native_gesture(&ctx, app.has_canvas_blocking_overlay(), Some(pill_pos)),
+        "touching the floating Foreground Pencil pill must block UIKit native pan"
+    );
+    step_app_frame(
+        &ctx,
+        &mut app,
+        egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(pill_pos),
+                egui::Event::PointerButton { pos: pill_pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+                egui::Event::PointerButton { pos: pill_pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
+            ],
+            ..Default::default()
+        },
+    );
+    // Note: intentionally omit `PointerGone` above to prove lingering `pointer_latest_pos` does NOT poison idle frames!
+    step_app_frame(&ctx, &mut app, egui::RawInput::default());
+    assert!(
+        !nocturne_ios::gestures::egui_overlay_blocks_native_gesture(&ctx, app.has_canvas_blocking_overlay(), None),
+        "idle frame after tapping Foreground pill must not remain blocked by lingering pointer_latest_pos"
+    );
+    let open_canvas_pos = Pos2::new(view_page.center().x, view_page.min.y + 120.0);
+    assert!(
+        !nocturne_ios::gestures::egui_overlay_blocks_native_gesture(&ctx, app.has_canvas_blocking_overlay(), Some(open_canvas_pos)),
+        "subsequent touch on open canvas must allow native pan/pinch immediately"
+    );
 }

@@ -216,6 +216,10 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ needs.prepare.outputs.tag }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: nocturne-*
@@ -235,64 +239,20 @@ jobs:
             android-arm64.apk ios-arm64.ipa; do
             ls dist | grep -q -- "$want\$" || { echo "::error::no *$want in the release files"; exit 1; }
           done
-          python3 - <<'PY'
-          import datetime
-          import json
-          import os
-          from pathlib import Path
-
-          repo = os.environ["GITHUB_REPOSITORY"]
-          version = os.environ["VERSION"]
-          tag = os.environ["TAG"]
-          ipa_name = f"nocturne-{version}-ios-arm64.ipa"
-          ipa_size = (Path("dist") / ipa_name).stat().st_size
-          release_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-          download_url = f"https://github.com/{repo}/releases/download/{tag}/{ipa_name}"
-          icon_url = f"https://raw.githubusercontent.com/{repo}/main/assets/brand/nocturne-512.png"
-          source_url = f"https://github.com/{repo}/releases/latest/download/altstore-source.json"
-
-          feed = {
-              "name": "Nocturne",
-              "identifier": "io.github.antimajorana.nocturne.source",
-              "sourceURL": source_url,
-              "subtitle": "Notes as plain files in plain folders",
-              "description": "Official Nocturne releases for SideStore and AltStore.",
-              "iconURL": icon_url,
-              "tintColor": "#3A2D8D",
-              "apps": [
-                  {
-                      "name": "Nocturne",
-                      "bundleIdentifier": "io.github.antimajorana.nocturne",
-                      "developerName": "antimajorana",
-                      "subtitle": "Notes as plain files in plain folders",
-                      "localizedDescription": (
-                          "Nocturne is a native note taking app for iPadOS and iOS where notes "
-                          "live as plain Markdown and HTML files in plain folders."
-                      ),
-                      "iconURL": icon_url,
-                      "tintColor": "#3A2D8D",
-                      "version": version,
-                      "versionDate": release_date,
-                      "date": release_date,
-                      "versionDescription": f"Nocturne {tag}",
-                      "downloadURL": download_url,
-                      "size": ipa_size,
-                      "versions": [
-                          {
-                              "version": version,
-                              "date": release_date,
-                              "localizedDescription": f"Nocturne {tag}",
-                              "downloadURL": download_url,
-                              "size": ipa_size,
-                              "minOSVersion": "15.0",
-                          }
-                      ],
-                  }
-              ],
-              "news": [],
-          }
-          (Path("dist") / "altstore-source.json").write_text(json.dumps(feed, indent=2) + "\n", encoding="utf-8")
-          PY
+          prev_feed="$RUNNER_TEMP/previous-altstore-source.json"
+          rm -f "$prev_feed"
+          gh release download --repo "$GITHUB_REPOSITORY" --pattern altstore-source.json --output "$prev_feed" || true
+          prev_args=()
+          if [[ -s "$prev_feed" ]]; then
+            prev_args=(--previous-feed "$prev_feed")
+          fi
+          python3 packaging/altstore_source.py \
+            --repo "$GITHUB_REPOSITORY" \
+            --version "$VERSION" \
+            --tag "$TAG" \
+            --ipa "dist/nocturne-$VERSION-ios-arm64.ipa" \
+            --output "dist/altstore-source.json" \
+            "${prev_args[@]}"
           (
             cd dist
             rm -f SHA256SUMS.txt

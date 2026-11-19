@@ -44,6 +44,7 @@ pub mod input_language {
 }
 pub mod inkpad;
 pub mod mathview;
+pub mod minimap;
 pub mod navhistory;
 pub mod pageedit;
 pub mod pagemenu;
@@ -57,6 +58,8 @@ pub mod ribbon_icons;
 pub mod saver;
 pub mod snippets;
 pub mod stylus;
+pub mod sync_ui;
+pub mod tablet_chrome;
 pub mod telemetry_export;
 #[cfg(test)]
 mod testing_dir;

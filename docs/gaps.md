@@ -88,8 +88,18 @@ imports shared documents placed in `Documents/Inbox/` (Share > Nocturne), and re
     until an egui release sizes iOS surfaces from the full window. Read from the sources; still to
     confirm on the iPad.
   - A finger tap may drift 10 points and still click (egui's default is 6; `max_click_dist` also
-    sets egui's click-and-drag and double-tap distance to 10 points). A press held for half a
-    second on a plain button is taken as a long press and does not click it.
+    sets egui's click-and-drag and double-tap distance to 10 points). Canvas long-press secondary
+    click injection (`TouchLongPress` at 0.50 s) is gated to the open page canvas when no modal,
+    dialog, backstage screen, or foreground overlay is active, so deliberate taps on dialog and
+    toolbar buttons still click.
+- **Infomaniak kDrive sync (`api.infomaniak.com` on desktop and iPadOS) has only been verified against a loopback server in CI.**
+  The kDrive REST v2/v3 client and two-phase 3-way reconciler (`crates/engine/src/sync/`) are
+  tested against an in-process loopback HTTP server on desktop, and `ios/src/http.rs`
+  (`NsUrlSessionClient`) plus `ios/src/keychain.rs` (`IosKeychainStore`) cross-check cleanly for
+  `aarch64-apple-ios`, but live round-trips against `https://api.infomaniak.com` (both desktop
+  `ureq` and physical iPad `NSURLSession` + Keychain) still require an account check with a real
+  Personal API Token (`drive` scope). Browser (`wasm32`) and Android builds do not provide
+  HTTP/secret-store backends for kDrive sync yet and say so in the Cloud Sync window.
 - **No desktop folder or file picker.** Open a notebook folder, Import, Add file or picture, Print
   out, Save picture as, and Export telemetry use the `filepicker.ios.rs` stand-in, returning no
   selection and posting a status notice pointing to `Files > On My iPad > Nocturne` or
@@ -205,13 +215,15 @@ imports shared documents placed in `Documents/Inbox/` (Share > Nocturne), and re
   keep only the To Do items not yet ticked, and takes the caret to a line when it is clicked. It lists
   what the pages said when it last looked; Refresh looks again. OneNote's other groupings (by section,
   title or date), its search box and Create Summary Page are not built.
-- **Page zoom scales the document.** The View tab has large Zoom Out and Zoom In buttons,
-  a percentage selector, 100% reset and Page Width; Ctrl+mouse wheel and two-finger pinch adjust
-  the same unified `50%..=250%` zoom range. Text, pictures, diagrams, equations, handwriting,
-  tables, container outlines and rule spacing scale together. Container move handles sit above
-  the outline so they do not cover its border. Wide zoom levels can extend beyond the reading
-  column and can be panned via `canvas_pan`, the page horizontal scrollbar, middle-drag, or
-  touch panning.
+- **Page zoom scales the document.** The View tab and Tablet Studio zoom menu have Zoom Out and
+  Zoom In buttons, a percentage selector, 100% reset, Page Width, Fit All Content, and a
+  collapsible infinite-canvas minimap; Ctrl+mouse wheel and two-finger pinch adjust the same
+  unified `15%..=250%` zoom range. Text, pictures, diagrams, equations, handwriting, tables,
+  container outlines and rule spacing scale together (with lightweight greeked text bars and
+  polyline stroke LOD below 30% overview zoom). Container move handles sit above the outline so
+  they do not cover its border. Wide zoom levels can extend beyond the reading column and can be
+  panned via `canvas_pan`, the page horizontal scrollbar, the minimap, middle-drag, or touch
+  panning.
 - **Right-to-left text works; the window around it does not know yet.** Arabic and the other
   right-to-left scripts draw, joined and in the right order; a page, a paragraph or a run can
   be given a direction; a right-to-left line hangs from the right edge with its bullet, box

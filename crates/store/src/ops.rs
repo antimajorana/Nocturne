@@ -506,6 +506,35 @@ pub fn set_color(dir: &Path, color: Option<NodeColor>) -> Result<()> {
     write_atomic(&file, &out)
 }
 
+/// Sets or clears the default page format (`format = "html"` or `format = "cmgfm"`) recorded in a
+/// notebook, section group, or section's `_node.toml`. `None` removes the line so new pages below
+/// it inherit from an ancestor folder or the global preference. Pages have no `_node.toml`.
+pub fn set_node_format(dir: &Path, format: Option<PageFormat>) -> Result<()> {
+    if page_file(dir).is_some() {
+        return Err(StoreError::invalid("a page already has its own file format; set the format on its notebook or section instead"));
+    }
+    let file = dir.join("_node.toml");
+    let text = fs::read_to_string(&file).map_err(|_| StoreError::NotFound(format!("{} is not a Nocturne folder", dir.display())))?;
+    let out = match format {
+        Some(f) => {
+            let line = format!("format = {}", kv::quote(f.id()));
+            if text.lines().any(|l| l.trim_start().starts_with("format =")) {
+                kv::replace_line(&text, "format =", &line)
+            } else {
+                let mut s = text;
+                if !s.ends_with('\n') {
+                    s.push('\n');
+                }
+                s.push_str(&line);
+                s.push('\n');
+                s
+            }
+        }
+        None => text.lines().filter(|l| !l.trim_start().starts_with("format =")).map(|l| format!("{l}\n")).collect(),
+    };
+    write_atomic(&file, &out)
+}
+
 /// Changes the title of a node. The folder name is not changed.
 ///
 /// A new page is written with its title in two places: where the page records it, and as
@@ -939,5 +968,29 @@ mod tests {
 
         remove_tree(&shared).expect("delete through the share");
         assert!(!nb.exists());
+    }
+
+    #[test]
+    fn set_node_format_updates_and_clears_notebook_and_section_format() {
+        let t = TempDir::new("ops-node-format");
+        let s = settings(&t);
+        let r = root(&t);
+        let nb = create_notebook(&r, "Research", Some(PageFormat::Html), &s).expect("nb");
+        let sec = create_node(&nb, "Notes", NodeKind::Section, None, &s).expect("section");
+        let existing_page = create_node(&sec, "Old HTML", NodeKind::Page, None, &s).expect("html page");
+        assert_eq!(tree::read_node(&existing_page).and_then(|n| n.format), Some(PageFormat::Html));
+
+        // Switch notebook _node.toml to cmgfm: new pages become index.md while existing pages stay untouched.
+        set_node_format(&nb, Some(PageFormat::Cmgfm)).expect("switch to cmgfm");
+        assert_eq!(tree::read_node(&nb).and_then(|n| n.format), Some(PageFormat::Cmgfm));
+        let md_page = create_node(&sec, "New Markdown", NodeKind::Page, None, &s).expect("md page");
+        assert_eq!(tree::read_node(&md_page).and_then(|n| n.format), Some(PageFormat::Cmgfm));
+        assert!(md_page.join("index.md").is_file());
+        assert!(existing_page.join("index.html").is_file());
+
+        // Clearing format falls back to global setting, and pages themselves reject set_node_format.
+        set_node_format(&nb, None).expect("clear format");
+        assert_eq!(tree::read_node(&nb).and_then(|n| n.format), None);
+        assert!(set_node_format(&md_page, Some(PageFormat::Html)).is_err());
     }
 }

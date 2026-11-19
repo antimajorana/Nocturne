@@ -12,7 +12,7 @@ use nocturne_store::search::Hit;
 use nocturne_store::tags::Tagged;
 use nocturne_store::{StoreError, assets, check, ops, page, page_templates, recycle, search, tags, tree};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub type Params = BTreeMap<String, String>;
 
@@ -454,6 +454,119 @@ fn ink_finger_drawing(s: &mut Session, p: &Params) -> Result<Output, EngineError
     Ok(Output::Json(serde_json::json!({ "finger_drawing": enabled })))
 }
 
+fn node_format(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
+    let dir = s.resolve(req(p, "path")?)?;
+    let raw = req(p, "format")?.trim().to_ascii_lowercase();
+    let fmt = match raw.as_str() {
+        "none" | "inherit" | "auto" => None,
+        other => Some(PageFormat::parse(other)?),
+    };
+    ops::set_node_format(&dir, fmt)?;
+    Ok(Output::None)
+}
+
+fn parse_opt_bool(p: &Params, key: &'static str) -> Result<Option<bool>, EngineError> {
+    match p.get(key).map(|v| v.trim().to_ascii_lowercase()) {
+        None => Ok(None),
+        Some(v) if v.is_empty() => Ok(None),
+        Some(v) if v == "true" => Ok(Some(true)),
+        Some(v) if v == "false" => Ok(Some(false)),
+        Some(_) => Err(EngineError::BadParam(format!("{key} must be true or false"))),
+    }
+}
+
+fn sync_status_json(s: &Session) -> Result<serde_json::Value, EngineError> {
+    let cfg = crate::sync::SyncConfig::load(&s.settings);
+    let has_token = s.sync_secrets().get_secret(crate::sync::KDRIVE_TOKEN_KEY).map(|opt| opt.is_some()).unwrap_or(false);
+    let (last_unix, last_summary) = crate::sync::SyncConfig::last_sync_info(&s.settings);
+    Ok(serde_json::json!({
+        "supported": s.sync_http().is_supported() && s.sync_secrets().is_supported(),
+        "has_token": has_token,
+        "endpoint": cfg.endpoint,
+        "drive_id": cfg.drive_id,
+        "remote_path": cfg.remote_path,
+        "auto_sync": cfg.auto_sync,
+        "markdown_default": cfg.markdown_default,
+        "propagate_deletes": cfg.propagate_deletes,
+        "last_sync_unix": last_unix,
+        "last_sync_summary": last_summary,
+    }))
+}
+
+fn sync_status(s: &mut Session, _p: &Params) -> Result<Output, EngineError> {
+    Ok(Output::Json(sync_status_json(s)?))
+}
+
+fn sync_configure(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
+    let mut cfg = crate::sync::SyncConfig::load(&s.settings);
+    if let Some(ep) = p.get("endpoint").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+        cfg.endpoint = ep.trim_end_matches('/').to_string();
+    }
+    if let Some(drive_raw) = p.get("drive_id") {
+        cfg.drive_id = crate::sync::parse_drive_id_input(drive_raw).map_err(EngineError::BadParam)?;
+    }
+    if let Some(remote) = p.get("remote_path").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+        cfg.remote_path = crate::sync::normalize_remote_path(remote);
+    }
+    if let Some(auto_sync) = parse_opt_bool(p, "auto_sync")? {
+        cfg.auto_sync = auto_sync;
+    }
+    if let Some(md) = parse_opt_bool(p, "markdown_default")? {
+        cfg.markdown_default = md;
+    }
+    if let Some(del) = parse_opt_bool(p, "propagate_deletes")? {
+        cfg.propagate_deletes = del;
+    }
+    let clear_token = parse_opt_bool(p, "clear_token")?.unwrap_or(false);
+    let convert_md = parse_opt_bool(p, "convert_notebooks_to_markdown")?.unwrap_or(false);
+
+    if clear_token {
+        s.sync_secrets().delete_secret(crate::sync::KDRIVE_TOKEN_KEY).map_err(|e| EngineError::BadParam(e.to_string()))?;
+    } else if let Some(tok) = p.get("token").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+        s.sync_secrets().set_secret(crate::sync::KDRIVE_TOKEN_KEY, tok).map_err(|e| EngineError::BadParam(e.to_string()))?;
+    }
+
+    cfg.save(&s.settings).map_err(|e| EngineError::BadParam(e.to_string()))?;
+    if cfg.markdown_default {
+        s.settings.set_default_format(PageFormat::Cmgfm)?;
+    }
+    if convert_md {
+        for dir in tree::child_dirs(s.root()) {
+            let folder = tree::folder_name(&dir);
+            if folder.eq_ignore_ascii_case("welcome-to-nocturne") {
+                continue;
+            }
+            if tree::read_node(&dir).is_some_and(|n| n.kind == NodeKind::Notebook) {
+                let _ = ops::set_node_format(&dir, Some(PageFormat::Cmgfm));
+                clear_descendant_format_overrides(&dir);
+            }
+        }
+    }
+    Ok(Output::Json(sync_status_json(s)?))
+}
+
+fn clear_descendant_format_overrides(parent: &Path) {
+    for child in tree::child_dirs(parent) {
+        if let Some(info) = tree::read_node(&child)
+            && matches!(info.kind, NodeKind::SectionGroup | NodeKind::Section)
+        {
+            if info.format.is_some() {
+                let _ = ops::set_node_format(&child, None);
+            }
+            clear_descendant_format_overrides(&child);
+        }
+    }
+}
+
+fn sync_now(s: &mut Session, _p: &Params) -> Result<Output, EngineError> {
+    let mut cfg = crate::sync::SyncConfig::load(&s.settings);
+    let http = s.sync_http();
+    let secrets = s.sync_secrets();
+    let report = crate::sync::run_sync_blocking(s.root(), &s.settings, &mut cfg, http.as_ref(), secrets.as_ref(), None)
+        .map_err(|e| EngineError::BadParam(e.to_string()))?;
+    Ok(Output::Json(report.to_json()))
+}
+
 static REGISTRY: &[CommandSpec] = &[
     CommandSpec {
         id: "notebook.create",
@@ -556,6 +669,13 @@ name (required): the template's name",
         params: "path (required): the notebook, group or section\ncolor (required): purple, blue, teal, green, yellow, orange, red, magenta, gray, or none for the theme's own colour",
         changes_tree: true,
         run: node_color,
+    },
+    CommandSpec {
+        id: "node.format",
+        label: "Set the default page format for a notebook, section group or section",
+        params: "path (required): the notebook, group or section\nformat (required): html, cmgfm, or none to inherit the parent or global format",
+        changes_tree: true,
+        run: node_format,
     },
     CommandSpec {
         id: "node.delete",
@@ -747,6 +867,27 @@ blocks (optional): the justified paragraphs' positions among the page's blocks, 
         params: "enabled (optional): true, false, or toggle; default: toggle",
         changes_tree: false,
         run: ink_finger_drawing,
+    },
+    CommandSpec {
+        id: "sync.status",
+        label: "Show Infomaniak kDrive sync settings and last sync summary",
+        params: "",
+        changes_tree: false,
+        run: sync_status,
+    },
+    CommandSpec {
+        id: "sync.configure",
+        label: "Configure Infomaniak kDrive sync settings and Personal API Token",
+        params: "endpoint (optional): kDrive API base URL (default https://api.infomaniak.com)\ndrive_id (optional): numeric kDrive ID, or auto to detect automatically\nremote_path (optional): folder path inside kDrive (default The Oracle/Nocturne)\nauto_sync (optional): true or false\nmarkdown_default (optional): true or false; when true, sets global default_format to cmgfm\npropagate_deletes (optional): true or false; default false\ntoken (optional): Personal API Token with drive scope, stored only in the secret store\nclear_token (optional): true to remove the stored token\nconvert_notebooks_to_markdown (optional): true to set _node.toml format = cmgfm on existing user notebooks",
+        changes_tree: true,
+        run: sync_configure,
+    },
+    CommandSpec {
+        id: "sync.now",
+        label: "Run a two-way kDrive sync for the notebooks folder",
+        params: "",
+        changes_tree: true,
+        run: sync_now,
     },
 ];
 

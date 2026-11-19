@@ -974,3 +974,56 @@
 @id	ui.curve_firm	$$$Firm@@@
 @id	ui.curve_scurve	$$$S-curve@@@
 @id	ui.curve_custom	$$$Custom@@@
+@id	ui.collapse_minimap	$$$Fold the canvas minimap@@@
+@id	ui.eraser_auto_return	$$$Auto-return to pen@@@
+@id	ui.eraser_auto_return_tip	$$$Switch back to your previous pen automatically when you lift the eraser after erasing ink@@@
+@id	ui.eraser_auto_short	$$$Auto@@@
+@id	ui.expand_minimap	$$$Expand the canvas minimap@@@
+@id	ui.fit_all	$$$Fit All@@@
+@id	ui.fit_all_content	$$$Fit All Content@@@
+@id	ui.fit_all_content_tip	$$$Zoom and pan so every container and ink stroke on this page fits in view@@@
+@id	ui.fit_all_short	$$$Fit@@@
+@id	ui.kdrive_advanced_section	$$$Advanced sync options@@@
+@id	ui.kdrive_auto_sync_label	$$$Sync automatically (on launch, resume, and after edits)@@@
+@id	ui.kdrive_clear_token	$$$Clear Token@@@
+@id	ui.kdrive_convert_notebooks_md_btn	$$$Set existing notebooks to Markdown (cmgfm) for new pages@@@
+@id	ui.kdrive_converted_notebooks_md	$$$Updated user notebooks to create new pages as Markdown (cmgfm).@@@
+@id	ui.kdrive_drive_id_auto_hint	$$$Auto-detect@@@
+@id	ui.kdrive_drive_id_label	$$$Drive ID (optional)@@@
+@id	ui.kdrive_endpoint_label	$$$kDrive API endpoint@@@
+@id	ui.kdrive_markdown_default_label	$$$Default new notebooks and pages to Markdown (cmgfm) for Kandinsky@@@
+@id	ui.kdrive_propagate_deletes_label	$$$Propagate file deletions (moves deleted files to trash)@@@
+@id	ui.kdrive_remote_folder_label	$$$kDrive folder path@@@
+@id	ui.kdrive_settings_saved	$$$Saved kDrive sync settings.@@@
+@id	ui.kdrive_sync_cancelled	$$$Cancelled kDrive sync.@@@
+@id	ui.kdrive_sync_finished_summary	$$$kDrive sync finished: {up} uploaded, {down} downloaded, {conflicts} conflicts@@@
+@id	ui.kdrive_sync_in_progress	$$$Syncing with kDrive...@@@
+@id	ui.kdrive_sync_intro	$$$Syncs plain notebook folders with Infomaniak kDrive (including free kDrive plans) using a Personal API Token with the 'drive' scope.@@@
+@id	ui.kdrive_sync_now_btn	$$$Sync Now@@@
+@id	ui.kdrive_sync_open_btn	$$$Infomaniak kDrive Sync...@@@
+@id	ui.kdrive_sync_tip	$$$Configure or run Infomaniak kDrive notebook sync@@@
+@id	ui.kdrive_sync_title	$$$Infomaniak kDrive Sync@@@
+@id	ui.kdrive_sync_unsupported_build	$$$kDrive network sync is not available in this browser or runtime build.@@@
+@id	ui.kdrive_token_cleared	$$$Removed the stored kDrive Personal API Token.@@@
+@id	ui.kdrive_token_label	$$$Personal API Token ('drive' scope)@@@
+@id	ui.kdrive_token_paste_hint	$$$Paste your Infomaniak Personal API Token@@@
+@id	ui.kdrive_token_saved_hint	$$$Token saved securely (type to replace)@@@
+@id	ui.minimap	$$$Map@@@
+@id	ui.minimap_canvas_tip	$$$Canvas minimap: tap or drag to move the view across the page@@@
+@id	ui.notebooks	$$$Notebooks@@@
+@id	ui.open_file_and_options	$$$Open File, Notebooks, and Options@@@
+@id	ui.pen_colour	$$$Pen colour@@@
+@id	ui.pen_thickness	$$$Pen thickness@@@
+@id	ui.save	$$$Save@@@
+@id	ui.show_minimap	$$$Show canvas minimap@@@
+@id	ui.studio_cycle_paper_lines	$$$Cycle paper lines (None / Ruled / Grid)@@@
+@id	ui.studio_short	$$$Studio@@@
+@id	ui.studio_toggle_drawer	$$$Show or hide the notebooks drawer@@@
+@id	ui.switch_to_classic_ribbon	$$$Switch to Classic Ribbon@@@
+@id	ui.sync_setup_short	$$$Sync...@@@
+@id	ui.sync_short	$$$Sync@@@
+@id	ui.syncing_short	$$$Syncing@@@
+@id	ui.tablet_and_cloud_sync_heading	$$$Tablet Studio and Cloud Sync@@@
+@id	ui.toggle_minimap	$$$Canvas Minimap@@@
+@id	ui.toggle_minimap_tip	$$$Show or hide the collapsible infinite-canvas minimap@@@
+@id	ui.toggle_studio_layout_btn	$$$Switch Tablet Studio / Classic Ribbon@@@

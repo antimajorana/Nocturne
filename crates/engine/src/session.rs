@@ -1,10 +1,12 @@
 use crate::commands::{self, Output, Params};
 use crate::error::EngineError;
+use crate::sync::{SecretStore, SyncHttpClient, default_http_client, default_secret_store};
 use crate::tool_state::{EraserToggleMode, InkActiveMode, InkPenKind, InkToolState};
 use nocturne_store::tree::{self, Node};
 use nocturne_store::{Settings, StoreError};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// A notebooks folder, the settings, and a cached copy of the tree.
 pub struct Session {
@@ -19,6 +21,8 @@ pub struct Session {
     tree: Vec<Node>,
     ink_tool: InkToolState,
     finger_drawing: bool,
+    sync_http: Arc<dyn SyncHttpClient>,
+    sync_secrets: Arc<dyn SecretStore>,
 }
 
 /// How the settings file keeps the list. A vertical bar cannot appear in a Windows path and
@@ -36,9 +40,36 @@ impl Session {
             settings.get(OPEN_KEY).map(|v| v.split(SEP).map(str::trim).filter(|p| !p.is_empty()).map(PathBuf::from).collect()).unwrap_or_default();
         let closed =
             settings.get(CLOSED_KEY).map(|v| v.split(SEP).map(str::trim).filter(|p| !p.is_empty()).map(PathBuf::from).collect()).unwrap_or_default();
-        let mut s = Session { root, extra, closed, settings, tree: Vec::new(), ink_tool: InkToolState::default(), finger_drawing: false };
+        let sync_http = default_http_client();
+        let sync_secrets = default_secret_store(&settings);
+        let mut s = Session {
+            root,
+            extra,
+            closed,
+            settings,
+            tree: Vec::new(),
+            ink_tool: InkToolState::default(),
+            finger_drawing: false,
+            sync_http,
+            sync_secrets,
+        };
         s.refresh();
         Ok(s)
+    }
+
+    /// Replaces the cloud-sync HTTP and secret-storage backends (for example `NSURLSession` and
+    /// Security.framework Keychain on iPadOS).
+    pub fn set_sync_backends(&mut self, http: Arc<dyn SyncHttpClient>, secrets: Arc<dyn SecretStore>) {
+        self.sync_http = http;
+        self.sync_secrets = secrets;
+    }
+
+    pub fn sync_http(&self) -> Arc<dyn SyncHttpClient> {
+        Arc::clone(&self.sync_http)
+    }
+
+    pub fn sync_secrets(&self) -> Arc<dyn SecretStore> {
+        Arc::clone(&self.sync_secrets)
     }
 
     pub fn root(&self) -> &Path {
