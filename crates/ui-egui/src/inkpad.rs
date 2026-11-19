@@ -672,7 +672,7 @@ pub fn show_with_input_and_handles(
                 continue;
             }
         }
-        if zoom < 0.35 || stroke.width * zoom < 1.1 {
+        if zoom < 0.35 {
             paint_stroke_lod(&painter, origin, stroke, zoom, dark_page);
             continue;
         }

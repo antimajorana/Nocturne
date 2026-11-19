@@ -169,6 +169,9 @@ fn format_of(s: &Span, size: f32, color: egui::Color32, tokens: &Tokens) -> Text
     let mono = s.code || s.math;
     let size = s.font_size.map_or(size, |points| size * f32::from(points) / 11.0);
     let size = if s.script.is_some() { size * 0.7 } else { size };
+    // Quantize sub-9pt font sizes to half-point buckets so tables, headings, and inline math do not
+    // flood egui's glyph atlas with fractional font sizes during continuous pinch-zoom below 50%.
+    let size = if size < 9.0 { (size.max(2.0) * 2.0).round() * 0.5 } else { size };
     let c = if s.link.is_some() {
         tokens.link
     } else if s.bold {

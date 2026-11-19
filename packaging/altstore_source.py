@@ -58,7 +58,7 @@ def normalize_prior_version(entry: dict[str, Any]) -> dict[str, Any] | None:
     download_url = str(entry.get("downloadURL", "")).strip()
     date = str(entry.get("date", "")).strip()
     size = entry.get("size")
-    if not version or not download_url or not date or not isinstance(size, int):
+    if not version or not download_url or not date or isinstance(size, bool) or not isinstance(size, int) or size < 0:
         return None
     build_version = str(entry.get("buildVersion", "")).strip()
     if not build_version:
@@ -140,8 +140,11 @@ def build_feed(
     }
 
     versions: list[dict[str, Any]] = [current_entry]
+    expected_url_prefix = f"https://github.com/{repo}/releases/download/"
     seen_keys = {(version, build_version), (download_url, "")}
     for prior in load_prior_versions(previous_feed_path):
+        if not str(prior.get("downloadURL", "")).startswith(expected_url_prefix):
+            continue
         key = (prior["version"], prior["buildVersion"])
         url_key = (prior["downloadURL"], "")
         if key in seen_keys or url_key in seen_keys:

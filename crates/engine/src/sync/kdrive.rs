@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const ROOT_DIR_ID: u64 = 1;
-const MAX_RETRIES: usize = 3;
+const MAX_RETRIES: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteEntry {
@@ -16,17 +16,22 @@ pub struct RemoteEntry {
     pub is_dir: bool,
     pub size: u64,
     pub last_modified_at: u64,
+    pub revised_at: u64,
     pub hash: Option<String>,
+    pub etag: Option<String>,
     pub visibility: Option<String>,
 }
 
 impl RemoteEntry {
-    /// Deterministic remote change fingerprint combining content hash (when kDrive supplies one),
-    /// byte size, and modification timestamp.
+    /// Deterministic remote change fingerprint combining content hash (when kDrive supplies one)
+    /// or `etag` + `last_modified_at` + `revised_at` + byte size + file ID when `hash` is null.
     pub fn fingerprint(&self) -> String {
         match self.hash.as_deref().filter(|h| !h.is_empty()) {
             Some(h) => format!("h:{h}:s:{}", self.size),
-            None => format!("m:{}:s:{}:id:{}", self.last_modified_at, self.size, self.id),
+            None => match self.etag.as_deref().filter(|e| !e.is_empty()) {
+                Some(etag) => format!("e:{etag}:m:{}:r:{}:s:{}:id:{}", self.last_modified_at, self.revised_at, self.size, self.id),
+                None => format!("m:{}:r:{}:s:{}:id:{}", self.last_modified_at, self.revised_at, self.size, self.id),
+            },
         }
     }
 }
@@ -39,6 +44,10 @@ pub struct KDriveClient<'a> {
 }
 
 fn is_loopback_http(url: &str) -> bool {
+    let authority = url.split("://").nth(1).and_then(|s| s.split(['/', '?', '#']).next()).unwrap_or("");
+    if authority.contains('@') {
+        return false;
+    }
     for prefix in ["http://127.0.0.1", "http://localhost"] {
         if let Some(rest) = url.strip_prefix(prefix)
             && (rest.is_empty() || rest.starts_with(':') || rest.starts_with('/'))
@@ -95,7 +104,7 @@ impl<'a> KDriveClient<'a> {
                     )));
                 }
                 429 | 503 => {
-                    let retry_secs = resp.header("Retry-After").and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1 + attempt as u64).clamp(1, 10);
+                    let retry_secs = resp.header("Retry-After").and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1 + attempt as u64).clamp(1, 65);
                     let detail = extract_api_error(&resp.body).unwrap_or_else(|| format!("HTTP {}", resp.status));
                     if attempt >= MAX_RETRIES {
                         return Err(SyncError::RateLimited { retry_after_secs: retry_secs, message: detail });
@@ -125,22 +134,97 @@ impl<'a> KDriveClient<'a> {
         json.get("data").cloned().ok_or_else(|| SyncError::Protocol(format!("{context}: response missing 'data' field")))
     }
 
+    /// Probes an optional JSON discovery endpoint:
+    /// - propagates `401` (`SyncError::Auth`), `429`/`503` (`RateLimited`), `Cancelled`, and `Transport`;
+    /// - returns `Ok(None)` on `403` (missing account/user scope on a `drive`-only token), `404`, or `422`
+    ///   (missing required query parameter such as `account_id`) so fallback probes can run cleanly.
+    fn probe_discovery_data(&self, path_and_query: &str) -> Result<Option<serde_json::Value>, SyncError> {
+        let url = format!("{}{}", self.endpoint, path_and_query);
+        let mut attempt = 0usize;
+        loop {
+            self.check_cancel()?;
+            let headers =
+                vec![("Authorization".to_string(), format!("Bearer {}", self.token)), ("Accept".to_string(), "application/json".to_string())];
+            let resp =
+                self.http.request(SyncHttpRequest { method: SyncHttpMethod::Get, url: url.clone(), headers, body: Vec::new(), timeout_secs: 30 })?;
+            match resp.status {
+                200..=299 => return Ok(Self::parse_envelope_data(&resp, path_and_query).ok()),
+                401 => {
+                    let detail = extract_api_error(&resp.body).unwrap_or_else(|| "HTTP 401".into());
+                    return Err(SyncError::Auth(format!(
+                        "kDrive rejected the token ({detail}). Check that the Personal API Token is valid and has the 'drive' scope"
+                    )));
+                }
+                429 | 503 => {
+                    let retry_secs = resp.header("Retry-After").and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1 + attempt as u64).clamp(1, 65);
+                    let detail = extract_api_error(&resp.body).unwrap_or_else(|| format!("HTTP {}", resp.status));
+                    if attempt >= MAX_RETRIES {
+                        return Err(SyncError::RateLimited { retry_after_secs: retry_secs, message: detail });
+                    }
+                    attempt += 1;
+                    sleep_interruptible(retry_secs, self.cancel)?;
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+
     /// Discovers the user's primary kDrive ID when none was explicitly configured.
+    ///
+    /// Probes `/2/drive/init`, `/1/my_ksuite/current?with=drive`, `/1/products?service_name=drive`
+    /// + `/2/drive?account_id=...`, `/1/accounts` + `/2/drive?account_id=...`, and `/2/drive`.
     pub fn discover_drive_id(&self) -> Result<u64, SyncError> {
-        if let Ok(resp) = self.send_with_retry(SyncHttpMethod::Get, "/2/drive/init?no_avatar_default=1&with=drives", &[], Vec::new())
-            && let Ok(data) = Self::parse_envelope_data(&resp, "drive/init")
+        if let Some(data) = self.probe_discovery_data("/2/drive/init?no_avatar_default=1&with=drives")?
             && let Some(id) = data.get("drives").and_then(|d| d.as_array()).and_then(|arr| pick_best_drive_id(arr))
         {
             return Ok(id);
         }
-        let resp = self.send_with_retry(SyncHttpMethod::Get, "/2/drive", &[], Vec::new())?;
-        let data = Self::parse_envelope_data(&resp, "drive list")?;
-        if let Some(arr) = data.as_array()
+        if let Some(data) = self.probe_discovery_data("/1/my_ksuite/current?with=drive")?
+            && let Some(id) = data.get("drive").and_then(|d| d.get("id")).and_then(|v| v.as_u64()).filter(|id| *id > 0)
+        {
+            return Ok(id);
+        }
+        let mut account_ids = Vec::new();
+        if let Some(data) = self.probe_discovery_data("/1/products?service_name=drive")?
+            && let Some(arr) = data.as_array()
+        {
+            for item in arr {
+                if let Some(aid) = item.get("account_id").and_then(|v| v.as_u64()).filter(|id| *id > 0)
+                    && !account_ids.contains(&aid)
+                {
+                    account_ids.push(aid);
+                }
+            }
+        }
+        if account_ids.is_empty()
+            && let Some(data) = self.probe_discovery_data("/1/accounts")?
+            && let Some(arr) = data.as_array()
+        {
+            for item in arr {
+                if let Some(aid) = item.get("id").and_then(|v| v.as_u64()).filter(|id| *id > 0)
+                    && !account_ids.contains(&aid)
+                {
+                    account_ids.push(aid);
+                }
+            }
+        }
+        for account_id in account_ids {
+            if let Some(data) = self.probe_discovery_data(&format!("/2/drive?account_id={account_id}"))?
+                && let Some(arr) = data.as_array()
+                && let Some(id) = pick_best_drive_id(arr)
+            {
+                return Ok(id);
+            }
+        }
+        if let Some(data) = self.probe_discovery_data("/2/drive")?
+            && let Some(arr) = data.as_array()
             && let Some(id) = pick_best_drive_id(arr)
         {
             return Ok(id);
         }
-        Err(SyncError::NotConfigured("no kDrive found on this Infomaniak account; enter your Drive ID manually if needed".into()))
+        Err(SyncError::NotConfigured(
+            "could not auto-discover your kDrive ID with a 'drive'-only token; enter your numeric Drive ID (or paste your https://ksuite.infomaniak.com/.../drive/<ID> URL) in Cloud Sync settings".into(),
+        ))
     }
 
     /// Lists all direct children of `dir_id` using cursor pagination.
@@ -169,6 +253,9 @@ impl<'a> KDriveClient<'a> {
             if has_more {
                 if next_cursor.is_none() || next_cursor == cursor {
                     return Err(SyncError::Protocol(format!("list directory {dir_id}: has_more=true without advancing cursor")));
+                }
+                if _page + 1 == 200 {
+                    return Err(SyncError::Protocol(format!("list directory {dir_id}: exceeded 200 paginated pages")));
                 }
                 cursor = next_cursor;
             } else {
@@ -299,8 +386,15 @@ impl<'a> KDriveClient<'a> {
     }
 
     /// Moves `file_id` to kDrive's trash (`DELETE /2/drive/{drive_id}/files/{file_id}`).
+    /// Treats HTTP 404 as already deleted so re-running after a partial trash pass is idempotent.
     pub fn trash_file(&self, drive_id: u64, file_id: u64) -> Result<(), SyncError> {
         let path = format!("/2/drive/{drive_id}/files/{file_id}");
+        let url = format!("{}{}", self.endpoint, path);
+        let headers = vec![("Authorization".to_string(), format!("Bearer {}", self.token)), ("Accept".to_string(), "application/json".to_string())];
+        let resp = self.http.request(SyncHttpRequest { method: SyncHttpMethod::Delete, url, headers, body: Vec::new(), timeout_secs: 60 })?;
+        if resp.status == 404 || (200..=299).contains(&resp.status) {
+            return Ok(());
+        }
         let _ = self.send_with_retry(SyncHttpMethod::Delete, &path, &[], Vec::new())?;
         Ok(())
     }
@@ -326,10 +420,12 @@ fn parse_remote_entry(raw: &serde_json::Value, fallback_parent: u64) -> Option<R
     let kind = raw.get("type").and_then(|v| v.as_str()).unwrap_or("file");
     let is_dir = kind.eq_ignore_ascii_case("dir");
     let size = raw.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
-    let last_modified_at = raw.get("last_modified_at").or_else(|| raw.get("revised_at")).and_then(|v| v.as_u64()).unwrap_or(0);
+    let last_modified_at = raw.get("last_modified_at").and_then(|v| v.as_u64()).unwrap_or(0);
+    let revised_at = raw.get("revised_at").and_then(|v| v.as_u64()).unwrap_or(0);
     let hash = raw.get("hash").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let etag = raw.get("etag").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     let visibility = raw.get("visibility").and_then(|v| v.as_str()).map(str::to_string);
-    Some(RemoteEntry { id, parent_id, name, is_dir, size, last_modified_at, hash, visibility })
+    Some(RemoteEntry { id, parent_id, name, is_dir, size, last_modified_at, revised_at, hash, etag, visibility })
 }
 
 fn extract_api_error(body: &[u8]) -> Option<String> {

@@ -15,6 +15,10 @@ pub fn method_as_str(method: SyncHttpMethod) -> &'static str {
 /// Validates a request URL before handing it to `NSURLSession`.
 pub fn validate_request_url(url: &str) -> Result<&str, SyncError> {
     let trimmed = url.trim();
+    let authority = trimmed.split("://").nth(1).and_then(|s| s.split(['/', '?', '#']).next()).unwrap_or("");
+    if authority.contains('@') {
+        return Err(SyncError::NotConfigured("sync URL must not embed userinfo credentials".into()));
+    }
     if trimmed.starts_with("https://") {
         return Ok(trimmed);
     }

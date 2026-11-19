@@ -2,8 +2,8 @@
 
 use crate::sync::kdrive::{KDriveClient, RemoteEntry};
 use crate::sync::manifest::{
-    LocalEntry, ManifestEntry, is_excluded_rel_path, load_manifest, make_target_key, manifest_path_for, save_manifest, scan_local_tree, sha256_bytes,
-    sha256_file, unix_now_secs,
+    LocalEntry, ManifestEntry, is_excluded_rel_path, load_manifest, make_target_key, manifest_path_for, save_manifest, scan_local_tree,
+    scan_recycled_prefixes, sha256_bytes, sha256_file, unix_now_secs,
 };
 use crate::sync::transport::{SecretStore, SyncHttpClient};
 use crate::sync::{KDRIVE_TOKEN_KEY, SyncConfig, SyncError, SyncReport};
@@ -82,7 +82,8 @@ pub fn stage_sync(
     };
     let (sync_root_id, normalized_remote) = client.ensure_sync_root(drive_id, &config.remote_path)?;
     let local_files = scan_local_tree(local_root, cancel)?;
-    let (remote_files, mut remote_dirs) = client.walk_subtree(drive_id, sync_root_id)?;
+    let recycled_prefixes = scan_recycled_prefixes(local_root);
+    let (remote_files, remote_dirs) = client.walk_subtree(drive_id, sync_root_id)?;
 
     let manifest_path = manifest_path_for(settings);
     let target_key = make_target_key(local_root, &config.endpoint, drive_id, &normalized_remote);
@@ -105,40 +106,95 @@ pub fn stage_sync(
     let _ = std::fs::remove_dir_all(&stage_dir);
     std::fs::create_dir_all(&stage_dir).map_err(|e| SyncError::Io(format!("create stage dir {}: {e}", stage_dir.display())))?;
 
+    let stage_res = stage_sync_into_dir(
+        &client,
+        drive_id,
+        discovered_drive_id,
+        sync_root_id,
+        normalized_remote,
+        local_root,
+        &local_files,
+        &recycled_prefixes,
+        &remote_files,
+        remote_dirs,
+        manifest_path,
+        target_key,
+        baseline,
+        &stage_dir,
+        now,
+        config,
+        cancel,
+    );
+    if stage_res.is_err() {
+        let _ = std::fs::remove_dir_all(&stage_dir);
+    }
+    stage_res
+}
+
+fn is_recycled_rel_path(rel: &str, recycled_prefixes: &BTreeSet<String>) -> bool {
+    recycled_prefixes.iter().any(|pfx| rel == pfx || rel.starts_with(&format!("{pfx}/")))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_sync_into_dir(
+    client: &KDriveClient<'_>,
+    drive_id: u64,
+    discovered_drive_id: Option<u64>,
+    sync_root_id: u64,
+    normalized_remote: String,
+    local_root: &Path,
+    local_files: &BTreeMap<String, LocalEntry>,
+    recycled_prefixes: &BTreeSet<String>,
+    remote_files: &BTreeMap<String, RemoteEntry>,
+    mut remote_dirs: BTreeMap<String, u64>,
+    manifest_path: PathBuf,
+    target_key: String,
+    baseline: BTreeMap<String, ManifestEntry>,
+    stage_dir: &Path,
+    now: u64,
+    config: &SyncConfig,
+    cancel: Option<&AtomicBool>,
+) -> Result<StagedSync, SyncError> {
     let mut all_paths = BTreeSet::new();
     all_paths.extend(local_files.keys().cloned());
     all_paths.extend(remote_files.keys().cloned());
     all_paths.extend(baseline.keys().cloned());
 
     // Pre-scan deletion circuit breakers BEFORE performing any remote upload or delete!
+    // Explicitly recycled items in `<notebook>/.nocturne/recycle-bin` always trash their remote
+    // counterpart (up to 50 files per pass) even when `propagate_deletes == false` so deleted
+    // pages/sections do not reappear on the next sync.
     let mut planned_remote_deletes: Vec<(String, u64)> = Vec::new();
     let mut planned_local_deletes: Vec<StagedLocalTrash> = Vec::new();
-    if config.propagate_deletes {
-        if !baseline.is_empty() && (local_files.is_empty() || remote_files.is_empty()) {
-            let _ = std::fs::remove_dir_all(&stage_dir);
-            return Err(SyncError::SafetyRefused("refusing to propagate deletions because one side of the sync folder is completely empty".into()));
+    if config.propagate_deletes && !baseline.is_empty() && (local_files.is_empty() || remote_files.is_empty()) {
+        return Err(SyncError::SafetyRefused("refusing to propagate deletions because one side of the sync folder is completely empty".into()));
+    }
+    let mut unrecycled_deletes = 0usize;
+    for rel in &all_paths {
+        if is_excluded_rel_path(rel) {
+            continue;
         }
-        for rel in &all_paths {
-            if is_excluded_rel_path(rel) {
-                continue;
+        match (local_files.get(rel), remote_files.get(rel), baseline.get(rel)) {
+            (Some(l), None, Some(b)) if config.propagate_deletes && l.sha256 == b.local_sha256 => {
+                unrecycled_deletes += 1;
+                planned_local_deletes.push(StagedLocalTrash { rel_path: rel.clone(), expected_local_sha256: b.local_sha256.clone() });
             }
-            match (local_files.get(rel), remote_files.get(rel), baseline.get(rel)) {
-                (Some(l), None, Some(b)) if l.sha256 == b.local_sha256 => {
-                    planned_local_deletes.push(StagedLocalTrash { rel_path: rel.clone(), expected_local_sha256: b.local_sha256.clone() });
-                }
-                (None, Some(r), Some(b)) if r.fingerprint() == b.remote_fingerprint => {
+            (None, Some(r), Some(b)) if r.fingerprint() == b.remote_fingerprint => {
+                let explicitly_recycled = is_recycled_rel_path(rel, recycled_prefixes);
+                if explicitly_recycled && planned_remote_deletes.len() < 50 {
+                    planned_remote_deletes.push((rel.clone(), r.id));
+                } else if config.propagate_deletes {
+                    unrecycled_deletes += 1;
                     planned_remote_deletes.push((rel.clone(), r.id));
                 }
-                _ => {}
             }
+            _ => {}
         }
-        let total_deletes = planned_remote_deletes.len() + planned_local_deletes.len();
-        if total_deletes > MAX_SAFE_DELETE_COUNT || (!baseline.is_empty() && total_deletes * 2 > baseline.len()) {
-            let _ = std::fs::remove_dir_all(&stage_dir);
-            return Err(SyncError::SafetyRefused(format!(
-                "refusing to delete {total_deletes} files in one sync pass (limit {MAX_SAFE_DELETE_COUNT}); turn off delete propagation or delete manually"
-            )));
-        }
+    }
+    if config.propagate_deletes && (unrecycled_deletes > MAX_SAFE_DELETE_COUNT || (!baseline.is_empty() && unrecycled_deletes * 2 > baseline.len())) {
+        return Err(SyncError::SafetyRefused(format!(
+            "refusing to delete {unrecycled_deletes} files in one sync pass (limit {MAX_SAFE_DELETE_COUNT}); turn off delete propagation or delete manually"
+        )));
     }
 
     let mut next_manifest = baseline.clone();
@@ -148,7 +204,6 @@ pub fn stage_sync(
 
     for rel in all_paths {
         if cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
-            let _ = std::fs::remove_dir_all(&stage_dir);
             return Err(SyncError::Cancelled);
         }
         if is_excluded_rel_path(&rel) {
@@ -168,7 +223,7 @@ pub fn stage_sync(
                     }
                     (true, false) => {
                         let (uploaded, sent_sha, sent_size) =
-                            upload_local_rel(&client, drive_id, sync_root_id, local_root, &rel, l, &mut remote_dirs)?;
+                            upload_local_rel(client, drive_id, sync_root_id, local_root, &rel, l, &mut remote_dirs)?;
                         next_manifest.insert(
                             rel.clone(),
                             ManifestEntry {
@@ -183,14 +238,9 @@ pub fn stage_sync(
                     }
                     (false, true) => {
                         stage_counter += 1;
-                        let staged = stage_remote_download(&client, drive_id, r, &stage_dir, stage_counter, &rel, Some(l.sha256.clone()), false)?;
-                        downloads.push(staged);
-                    }
-                    (true, true) => {
-                        // True 3-way edit conflict: download remote bytes FIRST and persist the conflict copy
-                        // directly to disk BEFORE uploading local over remote so no mid-pass abort can lose it!
-                        stage_counter += 1;
-                        let staged = stage_remote_download(&client, drive_id, r, &stage_dir, stage_counter, &rel, Some(l.sha256.clone()), true)?;
+                        let staged = stage_remote_download(client, drive_id, r, stage_dir, stage_counter, &rel, Some(l.sha256.clone()), false)?;
+                        // If kDrive populated `hash` asynchronously without content changing (`downloaded_sha256 == l.sha256`),
+                        // refresh the manifest fingerprint directly without rewriting the local file or adding a version snapshot.
                         if staged.downloaded_sha256 == l.sha256 {
                             let _ = std::fs::remove_file(&staged.staged_file);
                             next_manifest.insert(
@@ -205,12 +255,52 @@ pub fn stage_sync(
                             );
                             report.unchanged += 1;
                         } else {
+                            downloads.push(staged);
+                        }
+                    }
+                    (true, true) => {
+                        // Download remote bytes FIRST:
+                        // - If `downloaded_sha256 == l.sha256`, both sides made identical edits -> unchanged.
+                        // - If `downloaded_sha256 == b.local_sha256`, remote content never changed since baseline
+                        //   (e.g. kDrive's async `hash` arrived after upload) -> upload local edit without false conflict!
+                        // - Otherwise persist remote conflict copy BEFORE uploading local over remote!
+                        stage_counter += 1;
+                        let staged = stage_remote_download(client, drive_id, r, stage_dir, stage_counter, &rel, Some(l.sha256.clone()), true)?;
+                        if staged.downloaded_sha256 == l.sha256 {
+                            let _ = std::fs::remove_file(&staged.staged_file);
+                            next_manifest.insert(
+                                rel,
+                                ManifestEntry {
+                                    local_sha256: l.sha256.clone(),
+                                    local_size: l.size,
+                                    remote_id: r.id,
+                                    remote_fingerprint: r.fingerprint(),
+                                    synced_unix_secs: now,
+                                },
+                            );
+                            report.unchanged += 1;
+                        } else if staged.downloaded_sha256 == b.local_sha256 {
+                            let _ = std::fs::remove_file(&staged.staged_file);
+                            let (uploaded, sent_sha, sent_size) =
+                                upload_local_rel(client, drive_id, sync_root_id, local_root, &rel, l, &mut remote_dirs)?;
+                            next_manifest.insert(
+                                rel.clone(),
+                                ManifestEntry {
+                                    local_sha256: sent_sha,
+                                    local_size: sent_size,
+                                    remote_id: uploaded.id,
+                                    remote_fingerprint: uploaded.fingerprint(),
+                                    synced_unix_secs: now,
+                                },
+                            );
+                            report.uploaded.push(rel);
+                        } else {
                             let conflict_rel = conflict_rel_path(&rel, now);
                             let conflict_dest = local_path_for(local_root, &conflict_rel)?;
                             write_staged_to_dest(&staged.staged_file, &conflict_dest)?;
                             report.conflicts.push(conflict_rel);
                             let (uploaded, sent_sha, sent_size) =
-                                upload_local_rel(&client, drive_id, sync_root_id, local_root, &rel, l, &mut remote_dirs)?;
+                                upload_local_rel(client, drive_id, sync_root_id, local_root, &rel, l, &mut remote_dirs)?;
                             next_manifest.insert(
                                 rel.clone(),
                                 ManifestEntry {
@@ -228,7 +318,7 @@ pub fn stage_sync(
             (Some(l), Some(r), None) => {
                 // First sync with file present on both sides and no baseline: compare SHA-256!
                 stage_counter += 1;
-                let staged = stage_remote_download(&client, drive_id, r, &stage_dir, stage_counter, &rel, Some(l.sha256.clone()), true)?;
+                let staged = stage_remote_download(client, drive_id, r, stage_dir, stage_counter, &rel, Some(l.sha256.clone()), true)?;
                 if staged.downloaded_sha256 == l.sha256 {
                     let _ = std::fs::remove_file(&staged.staged_file);
                     next_manifest.insert(
@@ -247,7 +337,7 @@ pub fn stage_sync(
                     let conflict_dest = local_path_for(local_root, &conflict_rel)?;
                     write_staged_to_dest(&staged.staged_file, &conflict_dest)?;
                     report.conflicts.push(conflict_rel);
-                    let (uploaded, sent_sha, sent_size) = upload_local_rel(&client, drive_id, sync_root_id, local_root, &rel, l, &mut remote_dirs)?;
+                    let (uploaded, sent_sha, sent_size) = upload_local_rel(client, drive_id, sync_root_id, local_root, &rel, l, &mut remote_dirs)?;
                     next_manifest.insert(
                         rel.clone(),
                         ManifestEntry {
@@ -261,7 +351,7 @@ pub fn stage_sync(
                 }
             }
             (Some(l), None, None) => {
-                let (uploaded, sent_sha, sent_size) = upload_local_rel(&client, drive_id, sync_root_id, local_root, &rel, l, &mut remote_dirs)?;
+                let (uploaded, sent_sha, sent_size) = upload_local_rel(client, drive_id, sync_root_id, local_root, &rel, l, &mut remote_dirs)?;
                 next_manifest.insert(
                     rel.clone(),
                     ManifestEntry {
@@ -276,13 +366,13 @@ pub fn stage_sync(
             }
             (None, Some(r), None) => {
                 stage_counter += 1;
-                let staged = stage_remote_download(&client, drive_id, r, &stage_dir, stage_counter, &rel, None, false)?;
+                let staged = stage_remote_download(client, drive_id, r, stage_dir, stage_counter, &rel, None, false)?;
                 downloads.push(staged);
             }
             (Some(l), None, Some(b)) => {
                 // Remote was deleted since baseline. Modify ALWAYS beats delete; otherwise honour propagate_deletes.
                 if l.sha256 != b.local_sha256 || !config.propagate_deletes {
-                    let (uploaded, sent_sha, sent_size) = upload_local_rel(&client, drive_id, sync_root_id, local_root, &rel, l, &mut remote_dirs)?;
+                    let (uploaded, sent_sha, sent_size) = upload_local_rel(client, drive_id, sync_root_id, local_root, &rel, l, &mut remote_dirs)?;
                     next_manifest.insert(
                         rel.clone(),
                         ManifestEntry {
@@ -297,10 +387,12 @@ pub fn stage_sync(
                 }
             }
             (None, Some(r), Some(b)) => {
-                // Local was deleted since baseline. Remote modify ALWAYS beats delete; otherwise honour propagate_deletes.
-                if r.fingerprint() != b.remote_fingerprint || !config.propagate_deletes {
+                // Local was deleted since baseline. Remote modify ALWAYS beats delete; otherwise
+                // honour explicit local recycle-bin deletion or `propagate_deletes`.
+                let planned_trash = planned_remote_deletes.iter().any(|(p, _)| p == &rel);
+                if r.fingerprint() != b.remote_fingerprint || !planned_trash {
                     stage_counter += 1;
-                    let staged = stage_remote_download(&client, drive_id, r, &stage_dir, stage_counter, &rel, None, false)?;
+                    let staged = stage_remote_download(client, drive_id, r, stage_dir, stage_counter, &rel, None, false)?;
                     downloads.push(staged);
                 }
             }
@@ -321,7 +413,7 @@ pub fn stage_sync(
         local_root: local_root.to_path_buf(),
         manifest_path,
         target_key,
-        stage_dir,
+        stage_dir: stage_dir.to_path_buf(),
         manifest_entries: next_manifest,
         downloads,
         local_trashes: planned_local_deletes,
@@ -389,14 +481,60 @@ pub fn apply_staged_sync(mut staged: StagedSync, settings: &Settings) -> Result<
         let concurrent_change = current_sha != dl.expected_local_sha256;
 
         if dl.force_conflict_copy || concurrent_change {
+            // If the file was deleted locally mid-sync while remote modified it, modify beats delete:
+            // write the remote revision directly to `dest` instead of stranding a `.conflict-*` orphan.
+            if current_sha.is_none() && !dl.force_conflict_copy {
+                write_staged_to_dest(&dl.staged_file, &dest)?;
+                staged.manifest_entries.insert(
+                    dl.rel_path.clone(),
+                    ManifestEntry {
+                        local_sha256: dl.downloaded_sha256,
+                        local_size: dl.downloaded_size,
+                        remote_id: dl.remote_id,
+                        remote_fingerprint: dl.remote_fingerprint,
+                        synced_unix_secs: now,
+                    },
+                );
+                staged.report.downloaded.push(dl.rel_path);
+                continue;
+            }
             if current_sha.as_deref() == Some(dl.downloaded_sha256.as_str()) {
                 let _ = std::fs::remove_file(&dl.staged_file);
+                staged.manifest_entries.insert(
+                    dl.rel_path.clone(),
+                    ManifestEntry {
+                        local_sha256: dl.downloaded_sha256,
+                        local_size: dl.downloaded_size,
+                        remote_id: dl.remote_id,
+                        remote_fingerprint: dl.remote_fingerprint,
+                        synced_unix_secs: now,
+                    },
+                );
                 continue;
             }
             let conflict_rel = conflict_rel_path(&dl.rel_path, now);
             let conflict_dest = local_path_for(&staged.local_root, &conflict_rel)?;
             write_staged_to_dest(&dl.staged_file, &conflict_dest)?;
             staged.report.conflicts.push(conflict_rel);
+            // Record the remote fingerprint we just materialized into `.conflict-<ts>` while keeping
+            // `local_sha256` at `expected_local_sha256`, so the next sync pass uploads the new local
+            // edit cleanly instead of creating a duplicate conflict copy for this same remote version.
+            let prev_local_sha = dl
+                .expected_local_sha256
+                .clone()
+                .or_else(|| staged.manifest_entries.get(&dl.rel_path).map(|m| m.local_sha256.clone()))
+                .unwrap_or_default();
+            let prev_local_size = staged.manifest_entries.get(&dl.rel_path).map_or(0, |m| m.local_size);
+            staged.manifest_entries.insert(
+                dl.rel_path.clone(),
+                ManifestEntry {
+                    local_sha256: prev_local_sha,
+                    local_size: prev_local_size,
+                    remote_id: dl.remote_id,
+                    remote_fingerprint: dl.remote_fingerprint,
+                    synced_unix_secs: now,
+                },
+            );
             continue;
         }
 

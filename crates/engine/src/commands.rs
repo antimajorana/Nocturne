@@ -12,7 +12,7 @@ use nocturne_store::search::Hit;
 use nocturne_store::tags::Tagged;
 use nocturne_store::{StoreError, assets, check, ops, page, page_templates, recycle, search, tags, tree};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub type Params = BTreeMap<String, String>;
 
@@ -502,17 +502,8 @@ fn sync_configure(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
     if let Some(ep) = p.get("endpoint").map(|v| v.trim()).filter(|v| !v.is_empty()) {
         cfg.endpoint = ep.trim_end_matches('/').to_string();
     }
-    if let Some(drive_raw) = p.get("drive_id").map(|v| v.trim()) {
-        if drive_raw.is_empty() || drive_raw.eq_ignore_ascii_case("auto") {
-            cfg.drive_id = None;
-        } else {
-            let id = drive_raw
-                .parse::<u64>()
-                .ok()
-                .filter(|id| *id > 0)
-                .ok_or_else(|| EngineError::BadParam("drive_id must be a positive number or auto".into()))?;
-            cfg.drive_id = Some(id);
-        }
+    if let Some(drive_raw) = p.get("drive_id") {
+        cfg.drive_id = crate::sync::parse_drive_id_input(drive_raw).map_err(EngineError::BadParam)?;
     }
     if let Some(remote) = p.get("remote_path").map(|v| v.trim()).filter(|v| !v.is_empty()) {
         cfg.remote_path = crate::sync::normalize_remote_path(remote);
@@ -547,10 +538,24 @@ fn sync_configure(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
             }
             if tree::read_node(&dir).is_some_and(|n| n.kind == NodeKind::Notebook) {
                 let _ = ops::set_node_format(&dir, Some(PageFormat::Cmgfm));
+                clear_descendant_format_overrides(&dir);
             }
         }
     }
     Ok(Output::Json(sync_status_json(s)?))
+}
+
+fn clear_descendant_format_overrides(parent: &Path) {
+    for child in tree::child_dirs(parent) {
+        if let Some(info) = tree::read_node(&child)
+            && matches!(info.kind, NodeKind::SectionGroup | NodeKind::Section)
+        {
+            if info.format.is_some() {
+                let _ = ops::set_node_format(&child, None);
+            }
+            clear_descendant_format_overrides(&child);
+        }
+    }
 }
 
 fn sync_now(s: &mut Session, _p: &Params) -> Result<Output, EngineError> {

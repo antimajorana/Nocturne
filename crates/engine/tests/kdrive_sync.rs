@@ -19,8 +19,17 @@ struct ServerNode {
     is_dir: bool,
     bytes: Vec<u8>,
     last_modified_at: u64,
+    revised_at: u64,
+    omit_hash: bool,
     visibility: Option<String>,
     trashed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiscoveryMode {
+    DriveInit,
+    OpenApiAccountProducts,
+    DriveScopeOnlyNoAccount,
 }
 
 struct LoopbackState {
@@ -30,6 +39,8 @@ struct LoopbackState {
     nodes: BTreeMap<u64, ServerNode>,
     page_size: usize,
     rate_limit_next: usize,
+    discovery_mode: DiscoveryMode,
+    redirect_downloads: bool,
 }
 
 impl LoopbackState {
@@ -44,6 +55,8 @@ impl LoopbackState {
                 is_dir: true,
                 bytes: Vec::new(),
                 last_modified_at: 1_700_000_000,
+                revised_at: 1_700_000_000,
+                omit_hash: false,
                 visibility: Some("is_root".into()),
                 trashed: false,
             },
@@ -58,11 +71,22 @@ impl LoopbackState {
                 is_dir: true,
                 bytes: Vec::new(),
                 last_modified_at: 1_700_000_000,
+                revised_at: 1_700_000_000,
+                omit_hash: false,
                 visibility: Some("is_private_space".into()),
                 trashed: false,
             },
         );
-        Self { expected_token: token.into(), drive_id, next_id: 10, nodes, page_size: 2, rate_limit_next: 0 }
+        Self {
+            expected_token: token.into(),
+            drive_id,
+            next_id: 10,
+            nodes,
+            page_size: 2,
+            rate_limit_next: 0,
+            discovery_mode: DiscoveryMode::DriveInit,
+            redirect_downloads: false,
+        }
     }
 
     fn alloc_id(&mut self) -> u64 {
@@ -87,6 +111,8 @@ impl LoopbackState {
                         is_dir: true,
                         bytes: Vec::new(),
                         last_modified_at: 1_700_000_100,
+                        revised_at: 1_700_000_100,
+                        omit_hash: false,
                         visibility: None,
                         trashed: false,
                     },
@@ -102,6 +128,7 @@ impl LoopbackState {
             let node = self.nodes.get_mut(&existing_id).expect("existing");
             node.bytes = bytes.to_vec();
             node.last_modified_at = mtime;
+            node.revised_at = node.revised_at.saturating_add(1).max(mtime);
             return node.clone();
         }
         let id = self.alloc_id();
@@ -112,6 +139,8 @@ impl LoopbackState {
             is_dir: false,
             bytes: bytes.to_vec(),
             last_modified_at: mtime,
+            revised_at: mtime,
+            omit_hash: false,
             visibility: None,
             trashed: false,
         };
@@ -180,7 +209,7 @@ impl Drop for LoopbackServer {
 }
 
 fn node_json(n: &ServerNode) -> serde_json::Value {
-    let hash = if n.is_dir { serde_json::Value::Null } else { serde_json::Value::String(sha256_bytes(&n.bytes)) };
+    let hash = if n.is_dir || n.omit_hash { serde_json::Value::Null } else { serde_json::Value::String(sha256_bytes(&n.bytes)) };
     serde_json::json!({
         "id": n.id,
         "parent_id": n.parent_id,
@@ -188,6 +217,7 @@ fn node_json(n: &ServerNode) -> serde_json::Value {
         "type": if n.is_dir { "dir" } else { "file" },
         "size": n.bytes.len(),
         "last_modified_at": n.last_modified_at,
+        "revised_at": n.revised_at,
         "hash": hash,
         "visibility": n.visibility,
     })
@@ -220,8 +250,11 @@ fn parse_query(q: &str) -> BTreeMap<String, String> {
 fn write_http(mut stream: std::net::TcpStream, status: u16, extra: &[(&str, &str)], body: &[u8]) {
     let reason = match status {
         200 => "OK",
+        302 => "Found",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
+        422 => "Unprocessable Entity",
         429 => "Too Many Requests",
         _ => "Bad Request",
     };
@@ -250,6 +283,7 @@ fn handle_conn(stream: std::net::TcpStream, state: &Arc<Mutex<LoopbackState>>) {
     let (path, query_str) = full_target.split_once('?').unwrap_or((full_target, ""));
     let query = parse_query(query_str);
 
+    let mut host_hdr = String::new();
     let mut auth = String::new();
     let mut content_len = 0usize;
     loop {
@@ -262,6 +296,8 @@ fn handle_conn(stream: std::net::TcpStream, state: &Arc<Mutex<LoopbackState>>) {
                 auth = v.trim().to_string();
             } else if k.trim().eq_ignore_ascii_case("content-length") {
                 content_len = v.trim().parse::<usize>().unwrap_or(0);
+            } else if k.trim().eq_ignore_ascii_case("host") {
+                host_hdr = v.trim().to_string();
             }
         }
     }
@@ -271,6 +307,19 @@ fn handle_conn(stream: std::net::TcpStream, state: &Arc<Mutex<LoopbackState>>) {
     }
 
     let mut st = state.lock().expect("lock");
+    // Unauthenticated pre-signed storage download target used when `redirect_downloads == true`.
+    if method == "GET"
+        && let Some(id_str) = path.strip_prefix("/storage/blob/")
+    {
+        let file_id = id_str.parse::<u64>().unwrap_or(0);
+        if let Some(node) = st.nodes.get(&file_id).filter(|n| !n.trashed && !n.is_dir) {
+            write_http(stream, 200, &[("Content-Type", "application/octet-stream")], &node.bytes);
+        } else {
+            write_http(stream, 404, &[], b"not found");
+        }
+        return;
+    }
+
     if auth != format!("Bearer {}", st.expected_token) {
         let err = serde_json::json!({ "result": "error", "error": { "code": "not_authorized", "description": "invalid bearer token" } });
         write_http(stream, 401, &[("Content-Type", "application/json")], err.to_string().as_bytes());
@@ -284,8 +333,43 @@ fn handle_conn(stream: std::net::TcpStream, state: &Arc<Mutex<LoopbackState>>) {
     }
 
     if method == "GET" && path == "/2/drive/init" {
-        let payload = serde_json::json!({ "result": "success", "data": { "drives": [{ "id": st.drive_id, "name": "Free kDrive" }] } });
-        write_http(stream, 200, &[("Content-Type", "application/json")], payload.to_string().as_bytes());
+        match st.discovery_mode {
+            DiscoveryMode::DriveInit => {
+                let payload = serde_json::json!({ "result": "success", "data": { "drives": [{ "id": st.drive_id, "name": "Free kDrive" }] } });
+                write_http(stream, 200, &[("Content-Type", "application/json")], payload.to_string().as_bytes());
+            }
+            DiscoveryMode::OpenApiAccountProducts | DiscoveryMode::DriveScopeOnlyNoAccount => {
+                let err = serde_json::json!({ "result": "error", "error": { "code": "object_not_found", "description": "route not found" } });
+                write_http(stream, 404, &[("Content-Type", "application/json")], err.to_string().as_bytes());
+            }
+        }
+        return;
+    }
+    if method == "GET" && (path == "/1/my_ksuite/current" || path == "/1/products" || path == "/1/accounts") {
+        match st.discovery_mode {
+            DiscoveryMode::OpenApiAccountProducts if path == "/1/products" => {
+                let payload = serde_json::json!({ "result": "success", "data": [{ "id": 91, "account_id": 555, "service_name": "drive" }] });
+                write_http(stream, 200, &[("Content-Type", "application/json")], payload.to_string().as_bytes());
+            }
+            DiscoveryMode::DriveScopeOnlyNoAccount => {
+                let err = serde_json::json!({ "result": "error", "error": { "code": "forbidden_error", "description": "missing account scope" } });
+                write_http(stream, 403, &[("Content-Type", "application/json")], err.to_string().as_bytes());
+            }
+            _ => {
+                let err = serde_json::json!({ "result": "error", "error": { "code": "object_not_found", "description": "not applicable" } });
+                write_http(stream, 404, &[("Content-Type", "application/json")], err.to_string().as_bytes());
+            }
+        }
+        return;
+    }
+    if method == "GET" && path == "/2/drive" {
+        if query.get("account_id").map(String::as_str) == Some("555") {
+            let payload = serde_json::json!({ "result": "success", "data": [{ "id": st.drive_id, "name": "Free kDrive" }] });
+            write_http(stream, 200, &[("Content-Type", "application/json")], payload.to_string().as_bytes());
+        } else {
+            let err = serde_json::json!({ "result": "error", "error": { "code": "validation_failed", "description": "The account id field is required." } });
+            write_http(stream, 422, &[("Content-Type", "application/json")], err.to_string().as_bytes());
+        }
         return;
     }
 
@@ -302,8 +386,18 @@ fn handle_conn(stream: std::net::TcpStream, state: &Arc<Mutex<LoopbackState>>) {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
         let name = json.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let id = st.alloc_id();
-        let node =
-            ServerNode { id, parent_id, name, is_dir: true, bytes: Vec::new(), last_modified_at: 1_700_000_200, visibility: None, trashed: false };
+        let node = ServerNode {
+            id,
+            parent_id,
+            name,
+            is_dir: true,
+            bytes: Vec::new(),
+            last_modified_at: 1_700_000_200,
+            revised_at: 1_700_000_200,
+            omit_hash: false,
+            visibility: None,
+            trashed: false,
+        };
         st.nodes.insert(id, node.clone());
         let resp = serde_json::json!({ "result": "success", "data": node_json(&node) });
         write_http(stream, 200, &[("Content-Type", "application/json")], resp.to_string().as_bytes());
@@ -344,7 +438,12 @@ fn handle_conn(stream: std::net::TcpStream, state: &Arc<Mutex<LoopbackState>>) {
     if method == "GET" && segs.len() == 6 && segs[0] == "2" && segs[1] == "drive" && segs[3] == "files" && segs[5] == "download" {
         let file_id = segs[4].parse::<u64>().unwrap_or(0);
         if let Some(node) = st.nodes.get(&file_id).filter(|n| !n.trashed && !n.is_dir) {
-            write_http(stream, 200, &[("Content-Type", "application/octet-stream")], &node.bytes);
+            if st.redirect_downloads && !host_hdr.is_empty() {
+                let loc = format!("http://{host_hdr}/storage/blob/{file_id}");
+                write_http(stream, 302, &[("Location", &loc)], b"");
+            } else {
+                write_http(stream, 200, &[("Content-Type", "application/octet-stream")], &node.bytes);
+            }
         } else {
             write_http(stream, 404, &[], b"not found");
         }
@@ -531,6 +630,14 @@ fn concurrent_edit_and_true_3way_conflict_preserve_both_copies_without_data_loss
         std::fs::read_to_string(b.root().join("notes/sec/p1/index.md")).expect("kept mid-sync edit"),
         "---\ntitle: P1\n---\ntyped mid-sync!\n"
     );
+
+    // Subsequent sync pass on B MUST upload `typed mid-sync!` cleanly with ZERO duplicate conflict copies!
+    let rb2 = json_of(b.run("sync.now", &params(&[])).expect("b post-conflict sync"));
+    assert_eq!(rb2["conflicts"].as_array().expect("arr").len(), 0, "must not duplicate conflict copy on next sync pass");
+    assert!(
+        rb2["uploaded"].as_array().expect("arr").iter().any(|v| v.as_str() == Some("notes/sec/p1/index.md")),
+        "must upload canonical index.md cleanly: {rb2}"
+    );
 }
 
 #[test]
@@ -586,6 +693,100 @@ fn invalid_token_and_local_root_change_and_delete_vs_modify_behave_safely() {
         .find(|e| e.file_name().to_string_lossy().starts_with("a.conflict-"))
         .expect("remote conflict copy must survive mid-pass failure");
     assert_eq!(std::fs::read_to_string(preserved_conflict.path()).expect("read conflict"), "alpha-remote-h1");
+    let stage_parent = s.root().join(".nocturne-sync-stage");
+    let leftover_runs = std::fs::read_dir(&stage_parent)
+        .map(|rd| rd.filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().starts_with("run-")).count())
+        .unwrap_or(0);
+    assert_eq!(leftover_runs, 0, "failed stage_sync must clean up its run-* staging directory");
+
     assert!(s.run("sync.configure", &params(&[("endpoint", "http://localhost.evil.example"), ("token", "good-token")])).is_ok());
     assert!(s.run("sync.now", &params(&[])).is_err(), "http://localhost.evil.example must be rejected");
+}
+
+#[test]
+fn openapi_account_discovery_url_drive_id_302_download_revised_at_and_child_format_conversion() {
+    let srv = LoopbackServer::start("tok-openapi", 654321);
+    {
+        let mut st = srv.state.lock().expect("lock");
+        st.discovery_mode = DiscoveryMode::OpenApiAccountProducts;
+        st.redirect_downloads = true;
+    }
+
+    let tmp = TempDir::new("sync-openapi");
+    let mut s = Session::new(&tmp.path().join("nb"), Settings::at(tmp.path().join("cfg/s.toml"))).expect("s");
+    s.run("sync.configure", &params(&[("endpoint", &srv.endpoint), ("drive_id", "auto"), ("token", "tok-openapi")])).expect("cfg");
+
+    // 1. `/2/drive/init` is 404 and `/2/drive` without `account_id` is 422 -> discovers `account_id=555` via `/1/products` -> `/2/drive?account_id=555`!
+    std::fs::create_dir_all(s.root().join("vault")).expect("dir");
+    std::fs::write(s.root().join("vault/todo.md"), b"todo: 0").expect("write");
+    let r1 = json_of(s.run("sync.now", &params(&[])).expect("sync via account_id discovery"));
+    assert_eq!(r1["drive_id"], 654321);
+
+    // 2. When `hash` is null and `last_modified_at` + byte size stay unchanged, advancing `revised_at` MUST trigger download (via 302 redirect)!
+    {
+        let mut st = srv.state.lock().expect("lock");
+        let dir_id = st.ensure_dir_chain_under_private("The Oracle/Nocturne/vault");
+        let file_id = st.nodes.values().find(|n| !n.trashed && n.parent_id == dir_id && n.name == "todo.md").expect("todo.md").id;
+        let node = st.nodes.get_mut(&file_id).expect("mut");
+        node.omit_hash = true;
+        node.bytes = b"todo: 1".to_vec(); // exact same 7-byte size!
+        node.revised_at += 10; // only revised_at changes!
+    }
+    let r2 = json_of(s.run("sync.now", &params(&[])).expect("sync null-hash revised_at + 302 redirect"));
+    assert_eq!(r2["downloaded"].as_array().expect("arr").len(), 1);
+    assert_eq!(std::fs::read_to_string(s.root().join("vault/todo.md")).expect("updated via 302"), "todo: 1");
+
+    // 2b. When kDrive later populates `hash` asynchronously (changing `r.fingerprint()` from `m:...` to `h:...` while
+    // remote bytes still match baseline `todo: 1`) AND the user edits locally (`todo: 2`), sync must upload cleanly with ZERO false conflicts!
+    {
+        let mut st = srv.state.lock().expect("lock");
+        let dir_id = st.ensure_dir_chain_under_private("The Oracle/Nocturne/vault");
+        let file_id = st.nodes.values().find(|n| !n.trashed && n.parent_id == dir_id && n.name == "todo.md").expect("todo.md").id;
+        st.nodes.get_mut(&file_id).expect("mut").omit_hash = false;
+    }
+    std::fs::write(s.root().join("vault/todo.md"), b"todo: 2").expect("local edit after async hash");
+    let r2b = json_of(s.run("sync.now", &params(&[])).expect("sync async hash + local edit"));
+    assert_eq!(r2b["conflicts"].as_array().expect("arr").len(), 0, "async hash population must not trigger false conflict");
+    assert_eq!(r2b["uploaded"].as_array().expect("arr").len(), 1);
+
+    // 3. Strict `drive`-only token (`/1/*` -> 403, `/2/drive` -> 422) yields actionable `NotConfigured` error, and accepts pasted kDrive URL!
+    srv.state.lock().expect("lock").discovery_mode = DiscoveryMode::DriveScopeOnlyNoAccount;
+    s.run("sync.configure", &params(&[("drive_id", "auto")])).expect("reset auto");
+    let err = s.run("sync.now", &params(&[])).expect_err("must ask for Drive ID");
+    assert!(err.to_string().contains("Drive ID"), "expected actionable Drive ID prompt, got: {err}");
+
+    let st_url = json_of(
+        s.run("sync.configure", &params(&[("drive_id", "https://ksuite.infomaniak.com/all/kdrive/app/drive/654321/files/1")]))
+            .expect("parse kDrive web URL"),
+    );
+    assert_eq!(st_url["drive_id"], 654321);
+
+    // 4. `convert_notebooks_to_markdown=true` clears child section `format = "html"` overrides so new pages use `index.md`!
+    let nb = match s.run("notebook.create", &params(&[("name", "Legacy HTML"), ("format", "html")])).expect("html nb") {
+        Output::Path(p) => p,
+        other => panic!("expected Path, got {other:?}"),
+    };
+    let sec = match s
+        .run("node.create", &params(&[("parent", &nb.to_string_lossy()), ("kind", "section"), ("title", "Explicit HTML Sec"), ("format", "html")]))
+        .expect("html sec")
+    {
+        Output::Path(p) => p,
+        other => panic!("expected Path, got {other:?}"),
+    };
+    s.run("sync.configure", &params(&[("convert_notebooks_to_markdown", "true")])).expect("convert md");
+    let new_page =
+        match s.run("node.create", &params(&[("parent", &sec.to_string_lossy()), ("kind", "page"), ("title", "Fresh Note")])).expect("page") {
+            Output::Path(p) => p,
+            other => panic!("expected Path, got {other:?}"),
+        };
+    assert!(new_page.join("index.md").is_file(), "child section must inherit converted notebook's cmgfm format");
+
+    // 5. Deleting (`node.delete` -> recycle bin) a synced page with default `propagate_deletes = false` trashes it on kDrive
+    // instead of resurrecting the deleted page on the next sync!
+    s.run("sync.now", &params(&[])).expect("upload new_page");
+    s.run("node.delete", &params(&[("path", &new_page.to_string_lossy())])).expect("recycle new_page");
+    assert!(!new_page.exists());
+    let r_del = json_of(s.run("sync.now", &params(&[])).expect("sync after recycle"));
+    assert!(!new_page.exists(), "recycled page must not be re-downloaded when propagate_deletes is false");
+    assert!(!r_del["trashed_remote"].as_array().expect("arr").is_empty(), "recycled page files must be trashed on kDrive");
 }

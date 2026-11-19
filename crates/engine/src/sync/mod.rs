@@ -108,7 +108,7 @@ impl SyncConfig {
             .map(|s| s.trim().trim_end_matches('/').to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DEFAULT_KDRIVE_ENDPOINT.to_string());
-        let drive_id = settings.get(KEY_DRIVE_ID).and_then(|s| s.trim().parse::<u64>().ok()).filter(|id| *id > 0);
+        let drive_id = settings.get(KEY_DRIVE_ID).and_then(|s| parse_drive_id_input(&s).ok().flatten());
         let remote_path = normalize_remote_path(&settings.get(KEY_REMOTE_PATH).unwrap_or_else(|| DEFAULT_KDRIVE_REMOTE_PATH.to_string()));
         let auto_sync = settings.get(KEY_AUTO_SYNC).is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
         let markdown_default = settings.get(KEY_MARKDOWN_DEFAULT).map(|v| !v.trim().eq_ignore_ascii_case("false")).unwrap_or(true);
@@ -141,6 +141,31 @@ impl SyncConfig {
         let summary = settings.get(KEY_LAST_SYNC_SUMMARY).filter(|s| !s.trim().is_empty());
         (ts, summary)
     }
+}
+
+/// Parses a user-supplied kDrive identifier (`""`, `"auto"`, numeric `"123456"`, or a kDrive web
+/// URL such as `"https://ksuite.infomaniak.com/all/kdrive/app/drive/123456/files/1"`).
+pub fn parse_drive_id_input(raw: &str) -> Result<Option<u64>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    if let Ok(id) = trimmed.parse::<u64>()
+        && id > 0
+    {
+        return Ok(Some(id));
+    }
+    let clean = trimmed.split(['?', '#']).next().unwrap_or(trimmed);
+    let segs: Vec<&str> = clean.split('/').collect();
+    for pair in segs.windows(2) {
+        if pair[0].eq_ignore_ascii_case("drive")
+            && let Ok(id) = pair[1].parse::<u64>()
+            && id > 0
+        {
+            return Ok(Some(id));
+        }
+    }
+    Err("drive_id must be a positive number, a kDrive URL (.../drive/<ID>), or auto".into())
 }
 
 pub fn normalize_remote_path(raw: &str) -> String {

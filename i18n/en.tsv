@@ -984,7 +984,7 @@
 @id	ui.fit_all_content_tip	Zoom and pan so every container and ink stroke on this page fits in view
 @id	ui.fit_all_short	Fit
 @id	ui.kdrive_advanced_section	Advanced sync options
-@id	ui.kdrive_auto_sync_label	Sync automatically on launch
+@id	ui.kdrive_auto_sync_label	Sync automatically (on launch, resume, and after edits)
 @id	ui.kdrive_clear_token	Clear Token
 @id	ui.kdrive_convert_notebooks_md_btn	Set existing notebooks to Markdown (cmgfm) for new pages
 @id	ui.kdrive_converted_notebooks_md	Updated user notebooks to create new pages as Markdown (cmgfm).
@@ -1017,6 +1017,7 @@
 @id	ui.save	Save
 @id	ui.show_minimap	Show canvas minimap
 @id	ui.studio_cycle_paper_lines	Cycle paper lines (None / Ruled / Grid)
+@id	ui.studio_short	Studio
 @id	ui.studio_toggle_drawer	Show or hide the notebooks drawer
 @id	ui.switch_to_classic_ribbon	Switch to Classic Ribbon
 @id	ui.sync_setup_short	Sync...

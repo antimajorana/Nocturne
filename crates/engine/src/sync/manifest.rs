@@ -125,6 +125,35 @@ pub(crate) fn scan_local_tree(root: &Path, cancel: Option<&AtomicBool>) -> Resul
     Ok(out)
 }
 
+/// Scans `<root>/<notebook>/.nocturne/recycle-bin/*/recycled.toml` and returns slash-separated
+/// relative path prefixes (e.g. `"quantum-notes/new-section-1/old-page"`) that were explicitly
+/// recycled in Nocturne, so sync trashes the matching remote copy instead of re-downloading it.
+pub(crate) fn scan_recycled_prefixes(root: &Path) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let Ok(notebooks) = std::fs::read_dir(root) else { return out };
+    for nb_entry in notebooks.flatten() {
+        let nb_path = nb_entry.path();
+        if !nb_path.is_dir() {
+            continue;
+        }
+        let nb_name = nb_entry.file_name().to_string_lossy().into_owned();
+        if nb_name.starts_with('.') || nb_name.eq_ignore_ascii_case("welcome-to-nocturne") || nb_name.eq_ignore_ascii_case("Inbox") {
+            continue;
+        }
+        let bin_dir = nb_path.join(".nocturne").join("recycle-bin");
+        let Ok(recycled_entries) = std::fs::read_dir(&bin_dir) else { continue };
+        for rec_entry in recycled_entries.flatten() {
+            let meta = rec_entry.path().join("recycled.toml");
+            let Ok(text) = std::fs::read_to_string(&meta) else { continue };
+            let map = nocturne_model::kv::parse(&text);
+            if let Some(orig) = map.get("original").map(|s| s.trim().trim_matches('/')).filter(|s| !s.is_empty()) {
+                out.insert(format!("{nb_name}/{orig}"));
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn manifest_path_for(settings: &Settings) -> PathBuf {
     settings.path().parent().unwrap_or_else(|| Path::new(".")).join(MANIFEST_FILE)
 }

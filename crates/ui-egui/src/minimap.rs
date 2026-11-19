@@ -3,7 +3,7 @@
 use crate::icons::{self, Icon};
 use crate::theme::Tokens;
 use crate::touch_ux::{MAX_ZOOM_PERCENT, MIN_ZOOM_PERCENT};
-use egui::{Color32, Context, Id, Order, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2, pos2, vec2};
+use egui::{Context, Id, Order, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2, pos2, vec2};
 
 const MAP_W: f32 = 178.0;
 const MAP_H: f32 = 118.0;
@@ -213,7 +213,7 @@ pub fn show(
                         painter.rect_stroke(vr, 2.0, Stroke::new(1.5, tokens.accent), StrokeKind::Inside);
                     } else {
                         let c = to_map(view_page.center()).clamp(map_rect.min, map_rect.max);
-                        icons::paint(&painter, Rect::from_center_size(c, vec2(8.0, 8.0)), Icon::Pointer, Color32::WHITE);
+                        icons::paint(&painter, Rect::from_center_size(c, vec2(8.0, 8.0)), Icon::Pointer, tokens.accent);
                     }
 
                     if resp.dragged() || resp.is_pointer_button_down_on() {

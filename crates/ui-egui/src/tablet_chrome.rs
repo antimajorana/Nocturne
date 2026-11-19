@@ -6,22 +6,30 @@ use crate::ribbon::{Act, Pointer, RackEdit, RuleLines, View};
 use crate::theme::Tokens;
 use egui::os::OperatingSystem;
 use egui::{Align2, Color32, Context, Id, Order, Rect, RichText, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
-use nocturne_ink::{Rgb, shapes::Shape};
+use nocturne_ink::{Rgb, Tool, rack, shapes::Shape};
 
 pub const UI_LAYOUT_KEY: &str = "ui_layout_mode";
 
 const NIB_COLOURS: [Rgb; 8] = [
-    Rgb(25, 28, 34),
-    Rgb(31, 98, 214),
-    Rgb(210, 47, 57),
-    Rgb(24, 142, 78),
-    Rgb(219, 124, 22),
-    Rgb(132, 58, 196),
-    Rgb(18, 148, 168),
-    Rgb(245, 208, 42),
+    Rgb(0x20, 0x20, 0x20),
+    Rgb(0x18, 0x55, 0xc4),
+    Rgb(0xd0, 0x21, 0x21),
+    Rgb(0x16, 0x7f, 0x3d),
+    Rgb(0xdb, 0x7c, 0x16),
+    Rgb(0x84, 0x3a, 0xc4),
+    Rgb(0xff, 0xdd, 0x33),
+    Rgb(0x6f, 0xe3, 0x9a),
 ];
 
-const NIB_TENTHS: [u16; 4] = [15, 28, 50, 100];
+fn panel_is_dark(panel: Color32) -> bool {
+    let luma = 0.2126 * f32::from(panel.r()) + 0.7152 * f32::from(panel.g()) + 0.0722 * f32::from(panel.b());
+    luma < 128.0
+}
+
+fn shown_nib_color(colour: Rgb, panel: Color32) -> Color32 {
+    let adj = crate::inkpad::shown_colour(colour, panel_is_dark(panel));
+    Color32::from_rgb(adj.0, adj.1, adj.2)
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum UiLayoutMode {
@@ -248,7 +256,12 @@ pub fn show_pencil_pill(ctx: &Context, view_rect: Rect, bottom_clearance: f32, v
         return (acts, None);
     }
     let palette_id = Id::new("studio-nib-palette-open");
+    let shapes_open_id = Id::new("studio-shapes-palette-open");
     let mut palette_for = ctx.data(|d| d.get_temp::<Option<usize>>(palette_id)).flatten();
+    let mut shapes_open = ctx.data(|d| d.get_temp::<bool>(shapes_open_id)).unwrap_or(false);
+    if !matches!(view.pointer, Pointer::Shape(_)) {
+        shapes_open = false;
+    }
 
     let anchor_y = (view_rect.max.y - 12.0 - bottom_clearance.max(0.0)).max(view_rect.min.y + 52.0);
     let center_x = view_rect.center().x;
@@ -273,12 +286,37 @@ pub fn show_pencil_pill(ctx: &Context, view_rect: Rect, bottom_clearance: f32, v
                 {
                     crate::ribbon::mark_popup_open(ui.ctx());
                     ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        for tool in Tool::ALL {
+                            let chosen_tool = nib.tool == tool;
+                            let tool_label = crate::tl!(tool.label());
+                            let btn = ui.add(
+                                egui::Button::new(RichText::new(tool_label).small().color(if chosen_tool { t.accent } else { t.text }))
+                                    .selected(chosen_tool)
+                                    .min_size(vec2(48.0, 26.0)),
+                            );
+                            if btn.clicked() && !chosen_tool {
+                                let mut updated = nib;
+                                updated.tool = tool;
+                                if tool == Tool::Highlighter && updated.tenths < 80 {
+                                    updated.tenths = 140;
+                                } else if tool != Tool::Highlighter && updated.tenths > 100 {
+                                    updated.tenths = 30;
+                                }
+                                acts.push(Act::InkRack(RackEdit::Set(nib_idx, updated)));
+                            }
+                        }
+                    });
+                    ui.add_space(3.0);
+                    ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 5.0;
+                        let ring_edge = crate::theme::mix(t.panel, t.text, 0.28);
                         for rgb in NIB_COLOURS {
-                            let c = Color32::from_rgb(rgb.0, rgb.1, rgb.2);
+                            let c = shown_nib_color(rgb, t.panel);
                             let (sw, sr) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
                             sr.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, crate::tl_id!("ui.pen_colour")));
-                            ui.painter().circle_filled(sw.center(), 10.0, c);
+                            ui.painter().circle_filled(sw.center(), 9.5, c);
+                            ui.painter().circle_stroke(sw.center(), 9.5, Stroke::new(0.8, ring_edge));
                             if nib.colour == rgb {
                                 ui.painter().circle_stroke(sw.center(), 11.5, Stroke::new(2.0, t.accent));
                             }
@@ -289,15 +327,15 @@ pub fn show_pencil_pill(ctx: &Context, view_rect: Rect, bottom_clearance: f32, v
                             }
                         }
                         ui.separator();
-                        for tenths in NIB_TENTHS {
+                        for tenths in rack::THICKNESSES {
                             let w = f32::from(tenths) / 10.0;
                             let chosen = nib.tenths.abs_diff(tenths) <= 3;
-                            let (wr, ws) = ui.allocate_exact_size(vec2(26.0, 24.0), Sense::click());
+                            let (wr, ws) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
                             ws.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, crate::tl_id!("ui.pen_thickness")));
                             if chosen {
                                 ui.painter().rect_filled(wr, 5.0, t.accent.gamma_multiply(0.18));
                             }
-                            ui.painter().circle_filled(wr.center(), (w * 0.9).clamp(1.5, 8.0), t.text);
+                            ui.painter().circle_filled(wr.center(), (w * 0.5).clamp(1.2, 7.5), t.text);
                             if ws.clicked() {
                                 let mut updated = nib;
                                 updated.tenths = tenths;
@@ -308,6 +346,35 @@ pub fn show_pencil_pill(ctx: &Context, view_rect: Rect, bottom_clearance: f32, v
                     ui.separator();
                 } else if palette_for.is_some() {
                     palette_for = None;
+                }
+
+                if shapes_open && let Pointer::Shape(current_shape) = view.pointer {
+                    crate::ribbon::mark_popup_open(ui.ctx());
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        for shape in Shape::ALL {
+                            let here = current_shape == shape;
+                            let label = crate::tl!(shape.label());
+                            let (sr, resp) = ui.allocate_exact_size(vec2(30.0, 28.0), Sense::click());
+                            resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, here, label));
+                            if here {
+                                ui.painter().rect_filled(sr, 6.0, t.accent.gamma_multiply(0.18));
+                                ui.painter().rect_stroke(sr, 6.0, Stroke::new(1.2, t.accent), StrokeKind::Inside);
+                            } else if resp.hovered() {
+                                ui.painter().rect_filled(sr, 6.0, t.row_hover);
+                            }
+                            let box_ = Rect::from_center_size(sr.center(), vec2(15.0, 15.0));
+                            let dabs = nocturne_ink::shapes::trace(shape, (box_.min.x, box_.min.y), (box_.max.x, box_.max.y), 1.0);
+                            let pts: Vec<egui::Pos2> = dabs.iter().map(|d| pos2(d.x, d.y)).collect();
+                            if pts.len() >= 2 {
+                                ui.painter().add(egui::Shape::line(pts, Stroke::new(1.4, if here { t.accent } else { t.text })));
+                            }
+                            if resp.on_hover_text(label).clicked() {
+                                acts.push(Act::InkPointer(Pointer::Shape(shape)));
+                            }
+                        }
+                    });
+                    ui.separator();
                 }
 
                 ui.horizontal(|ui| {
@@ -323,33 +390,71 @@ pub fn show_pencil_pill(ctx: &Context, view_rect: Rect, bottom_clearance: f32, v
                     .clicked()
                     {
                         palette_for = None;
+                        shapes_open = false;
                         acts.push(Act::InkPointer(Pointer::Write));
                     }
 
-                    let max_nibs = view.rack.len().min(4);
+                    // Scale displayed rack slots to the available canvas width so portrait / Split View
+                    // never overflows, while showing up to 8 slots (all 7 default tools + 1) on full iPad width.
+                    let slot_cap = if view_rect.width() < 560.0 {
+                        3
+                    } else if view_rect.width() < 740.0 {
+                        5
+                    } else {
+                        8
+                    };
+                    let max_nibs = view.rack.len().min(slot_cap);
+                    let border_mix = crate::theme::mix(t.panel, t.text, 0.30);
                     for i in 0..max_nibs {
                         let nib = view.rack[i];
                         let active = view.pointer == Pointer::Draw && view.nib == i;
-                        let (nr, ns) = ui.allocate_exact_size(vec2(36.0, 34.0), Sense::click());
-                        ns.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, crate::tl_id!("ui.pen")));
+                        let tool_label = crate::tl!(nib.tool.label());
+                        let (nr, ns) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
+                        ns.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, active, tool_label));
                         if active {
                             ui.painter().rect_filled(nr, 7.0, t.accent.gamma_multiply(0.18));
                             ui.painter().rect_stroke(nr, 7.0, Stroke::new(1.5, t.accent), StrokeKind::Inside);
                         } else if ns.hovered() {
                             ui.painter().rect_filled(nr, 7.0, t.row_hover);
                         }
-                        let nib_col = Color32::from_rgb(nib.colour.0, nib.colour.1, nib.colour.2);
-                        icons::paint(
-                            ui.painter(),
-                            Rect::from_center_size(pos2(nr.center().x, nr.center().y - 3.0), vec2(16.0, 16.0)),
-                            Icon::Pen,
-                            nib_col,
-                        );
-                        ui.painter().line_segment(
-                            [pos2(nr.min.x + 7.0, nr.max.y - 5.0), pos2(nr.max.x - 7.0, nr.max.y - 5.0)],
-                            Stroke::new((nib.width() * 0.45).clamp(1.5, 4.0), nib_col),
-                        );
-                        if ns.clicked() {
+                        let nib_col = shown_nib_color(nib.colour, t.panel);
+                        match nib.tool {
+                            Tool::Highlighter => {
+                                let band = Rect::from_center_size(pos2(nr.center().x, nr.center().y - 2.0), vec2(18.0, 12.0));
+                                ui.painter().rect_filled(band, 3.0, nib_col.gamma_multiply(0.65));
+                                ui.painter().rect_stroke(band, 3.0, Stroke::new(0.9, border_mix), StrokeKind::Inside);
+                                let tip = Rect::from_min_max(pos2(nr.min.x + 6.0, nr.max.y - 7.0), pos2(nr.max.x - 6.0, nr.max.y - 3.0));
+                                ui.painter().rect_filled(tip, 1.5, nib_col);
+                            }
+                            Tool::Pencil => {
+                                icons::paint(
+                                    ui.painter(),
+                                    Rect::from_center_size(pos2(nr.center().x, nr.center().y - 3.0), vec2(15.0, 15.0)),
+                                    Icon::Pen,
+                                    nib_col,
+                                );
+                                for dx in [-7.0_f32, -2.0, 3.0] {
+                                    ui.painter().line_segment(
+                                        [pos2(nr.center().x + dx, nr.max.y - 5.0), pos2(nr.center().x + dx + 3.0, nr.max.y - 5.0)],
+                                        Stroke::new(1.8, nib_col),
+                                    );
+                                }
+                            }
+                            _ => {
+                                icons::paint(
+                                    ui.painter(),
+                                    Rect::from_center_size(pos2(nr.center().x, nr.center().y - 3.0), vec2(16.0, 16.0)),
+                                    Icon::Pen,
+                                    nib_col,
+                                );
+                                ui.painter().line_segment(
+                                    [pos2(nr.min.x + 7.0, nr.max.y - 5.0), pos2(nr.max.x - 7.0, nr.max.y - 5.0)],
+                                    Stroke::new((nib.width() * 0.45).clamp(1.5, 4.0), nib_col),
+                                );
+                            }
+                        }
+                        if ns.on_hover_text(tool_label).clicked() {
+                            shapes_open = false;
                             if active {
                                 palette_for = if palette_for == Some(i) { None } else { Some(i) };
                             } else {
@@ -361,6 +466,7 @@ pub fn show_pencil_pill(ctx: &Context, view_rect: Rect, bottom_clearance: f32, v
 
                     if studio_icon_btn(ui, Icon::Eraser, view.pointer == Pointer::Erase, true, crate::tl_id!("ui.toggle_eraser_tip"), t).clicked() {
                         palette_for = None;
+                        shapes_open = false;
                         acts.push(Act::InkPointer(Pointer::Erase));
                     }
                     let auto_btn = ui
@@ -380,16 +486,23 @@ pub fn show_pencil_pill(ctx: &Context, view_rect: Rect, bottom_clearance: f32, v
 
                     if studio_icon_btn(ui, Icon::Lasso, view.pointer == Pointer::Lasso, true, crate::tl_id!("ui.lasso_select"), t).clicked() {
                         palette_for = None;
+                        shapes_open = false;
                         acts.push(Act::InkPointer(Pointer::Lasso));
                     }
                     if studio_icon_btn(ui, Icon::Pointer, view.pointer == Pointer::Pick, true, crate::tl_id!("ui.select"), t).clicked() {
                         palette_for = None;
+                        shapes_open = false;
                         acts.push(Act::InkPointer(Pointer::Pick));
                     }
                     let shape_active = matches!(view.pointer, Pointer::Shape(_));
                     if studio_icon_btn(ui, Icon::Shapes, shape_active, true, crate::tl_id!("ui.shapes"), t).clicked() {
                         palette_for = None;
-                        acts.push(Act::InkPointer(if shape_active { Pointer::Draw } else { Pointer::Shape(Shape::Rectangle) }));
+                        if shape_active {
+                            shapes_open = !shapes_open;
+                        } else {
+                            shapes_open = true;
+                            acts.push(Act::InkPointer(Pointer::Shape(Shape::Rectangle)));
+                        }
                     }
                     if studio_icon_btn(ui, Icon::Hand, view.finger_drawing, true, crate::tl_id!("ui.finger_drawing_tip"), t).clicked() {
                         acts.push(Act::ToggleFingerDrawing);
@@ -405,7 +518,10 @@ pub fn show_pencil_pill(ctx: &Context, view_rect: Rect, bottom_clearance: f32, v
             });
         });
 
-    ctx.data_mut(|d| d.insert_temp(palette_id, palette_for));
+    ctx.data_mut(|d| {
+        d.insert_temp(palette_id, palette_for);
+        d.insert_temp(shapes_open_id, shapes_open);
+    });
     (acts, Some(area_resp.response.rect))
 }
 

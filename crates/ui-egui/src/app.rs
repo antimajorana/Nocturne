@@ -1048,8 +1048,13 @@ pub struct NocturneApp {
     dialog: Option<Dialog>,
     import_job: Option<ImportJob>,
     sync_job: Option<crate::sync_ui::SyncJob>,
+    cached_sync_config: Option<nocturne_engine::SyncConfig>,
     auto_sync_started_on_launch: bool,
     last_auto_sync_trigger: Option<Instant>,
+    sync_dirty_since_last: bool,
+    last_local_edit_at: Option<Instant>,
+    was_window_focused: bool,
+    last_ctx_is_ios: bool,
     status: String,
     status_is_error: bool,
     status_shown_at: Option<Instant>,
@@ -1290,8 +1295,13 @@ impl NocturneApp {
             },
             import_job: None,
             sync_job: None,
+            cached_sync_config: None,
             auto_sync_started_on_launch: false,
             last_auto_sync_trigger: None,
+            sync_dirty_since_last: false,
+            last_local_edit_at: None,
+            was_window_focused: true,
+            last_ctx_is_ios: cfg!(target_os = "ios"),
             status: crate::tl_id!("ui.ready_2").into(),
             status_is_error: false,
             status_shown_at: None,
@@ -2805,7 +2815,16 @@ impl NocturneApp {
         // A command may read or write the page an autosave is still writing.
         self.take_saves(true);
         match self.session.run(id, p) {
-            Ok(o) => Some(o),
+            Ok(o) => {
+                if id == "sync.configure" {
+                    self.cached_sync_config = None;
+                }
+                if !id.starts_with("sync.") && nocturne_engine::registry().iter().any(|spec| spec.id == id && spec.changes_tree) {
+                    self.sync_dirty_since_last = true;
+                    self.last_local_edit_at = Some(Instant::now());
+                }
+                Some(o)
+            }
             Err(e) => {
                 self.fail(&e);
                 None
@@ -3189,6 +3208,8 @@ impl NocturneApp {
                     ed.last_saved = Some(ts);
                     ed.saved_body = body;
                 }
+                self.sync_dirty_since_last = true;
+                self.last_local_edit_at = Some(Instant::now());
                 self.say(self.saved_caption(None));
             }
             Ok(_) => {}
@@ -3230,6 +3251,8 @@ impl NocturneApp {
                         }
                         ed.saved_body = saved.body;
                     }
+                    self.sync_dirty_since_last = true;
+                    self.last_local_edit_at = Some(Instant::now());
                     self.say(self.saved_caption(None));
                 }
                 Err(e) => {
@@ -3962,6 +3985,9 @@ impl NocturneApp {
 
     fn top_bar(&mut self, ui: &mut Ui) {
         if self.is_tablet_studio(ui.ctx()) {
+            if self.frameless {
+                self.title_band(ui, false);
+            }
             self.studio_top_bar(ui);
             return;
         }
@@ -4102,6 +4128,8 @@ impl NocturneApp {
         match crate::sync_ui::SyncJob::start(ctx.clone(), root, settings, cfg, http, secrets) {
             Ok(job) => {
                 self.sync_job = Some(job);
+                self.sync_dirty_since_last = false;
+                self.last_auto_sync_trigger = Some(Instant::now());
                 self.say(crate::tl_id!("ui.kdrive_sync_in_progress"));
             }
             Err(err) => self.complain(&err),
@@ -4109,13 +4137,41 @@ impl NocturneApp {
     }
 
     fn poll_sync(&mut self, ctx: &Context) {
-        if !self.auto_sync_started_on_launch {
-            self.auto_sync_started_on_launch = true;
-            let cfg = nocturne_engine::SyncConfig::load(&self.session.settings);
-            let has_tok = self.session.sync_secrets().get_secret(nocturne_engine::KDRIVE_TOKEN_KEY).ok().flatten().is_some();
-            if cfg.auto_sync && has_tok && self.session.sync_http().is_supported() {
-                self.last_auto_sync_trigger = Some(Instant::now());
-                self.start_background_sync(ctx);
+        let focused = ctx.input(|i| i.focused);
+        let regained_focus = !self.was_window_focused && focused;
+        self.was_window_focused = focused;
+
+        if self.sync_job.is_none() {
+            let cfg = self.cached_sync_config.get_or_insert_with(|| nocturne_engine::SyncConfig::load(&self.session.settings)).clone();
+            let supported = self.session.sync_http().is_supported() && self.session.sync_secrets().is_supported();
+            let has_tok = if cfg.auto_sync && supported {
+                *self
+                    .sync_has_token
+                    .get_or_insert_with(|| self.session.sync_secrets().get_secret(nocturne_engine::KDRIVE_TOKEN_KEY).ok().flatten().is_some())
+            } else {
+                false
+            };
+
+            if !self.auto_sync_started_on_launch {
+                self.auto_sync_started_on_launch = true;
+                if cfg.auto_sync && has_tok && supported {
+                    self.start_background_sync(ctx);
+                }
+            } else if cfg.auto_sync && has_tok && supported {
+                let since_last = self.last_auto_sync_trigger.map_or(std::time::Duration::from_secs(3600), |t| t.elapsed());
+                if regained_focus && since_last >= std::time::Duration::from_secs(30) {
+                    self.start_background_sync(ctx);
+                } else if self.sync_dirty_since_last {
+                    let page_clean = !self.saver.busy() && self.editor.as_ref().is_none_or(|e| e.dirty_since.is_none());
+                    let ink_clean = self.pad.as_ref().is_none_or(|p| !p.dirty);
+                    let edit_quiet = self.last_local_edit_at.map_or(std::time::Duration::from_secs(60), |t| t.elapsed());
+                    if page_clean && ink_clean && edit_quiet >= std::time::Duration::from_secs(25) && since_last >= std::time::Duration::from_secs(60)
+                    {
+                        self.start_background_sync(ctx);
+                    } else {
+                        ctx.request_repaint_after(std::time::Duration::from_secs(5));
+                    }
+                }
             }
         }
 
@@ -4136,10 +4192,14 @@ impl NocturneApp {
                     let mut cfg = nocturne_engine::SyncConfig::load(&self.session.settings);
                     cfg.drive_id = Some(discovered);
                     let _ = cfg.save(&self.session.settings);
+                    self.cached_sync_config = Some(cfg);
                 }
                 let open_rel =
                     self.editor.as_ref().and_then(|ed| ed.dir.strip_prefix(self.session.root()).ok().map(|r| r.to_string_lossy().replace('\\', "/")));
-                let reload_open = open_rel.as_deref().is_some_and(|prefix| staged.touched_local_paths().iter().any(|rel| rel.starts_with(prefix)));
+                let reload_open = open_rel.as_deref().is_some_and(|prefix| {
+                    let prefix_slash = format!("{prefix}/");
+                    staged.touched_local_paths().iter().any(|rel| *rel == prefix || rel.starts_with(&prefix_slash))
+                });
                 match nocturne_engine::apply_staged_sync(staged, &self.session.settings) {
                     Ok(report) => {
                         self.session.refresh();
@@ -4159,6 +4219,7 @@ impl NocturneApp {
                         self.say(msg);
                     }
                     Err(err) => {
+                        self.sync_dirty_since_last = true;
                         let msg = err.to_string();
                         if let Some(Dialog::CloudSync(ref mut form)) = self.dialog {
                             form.last_message = Some((msg.clone(), true));
@@ -4174,6 +4235,12 @@ impl NocturneApp {
                 self.say(crate::tl_id!("ui.kdrive_sync_cancelled"));
             }
             Err(err) => {
+                if !matches!(
+                    err,
+                    nocturne_engine::SyncError::NotConfigured(_) | nocturne_engine::SyncError::Unsupported(_) | nocturne_engine::SyncError::Auth(_)
+                ) {
+                    self.sync_dirty_since_last = true;
+                }
                 let msg = err.to_string();
                 if let Some(Dialog::CloudSync(ref mut form)) = self.dialog {
                     form.last_message = Some((msg.clone(), true));
@@ -5352,7 +5419,7 @@ impl NocturneApp {
                     crate::tablet_chrome::UiLayoutMode::TabletStudio => crate::tablet_chrome::UiLayoutMode::ClassicRibbon,
                     crate::tablet_chrome::UiLayoutMode::ClassicRibbon => crate::tablet_chrome::UiLayoutMode::TabletStudio,
                     crate::tablet_chrome::UiLayoutMode::Auto => {
-                        if cfg!(target_os = "ios") {
+                        if self.last_ctx_is_ios && !self.compact {
                             crate::tablet_chrome::UiLayoutMode::ClassicRibbon
                         } else {
                             crate::tablet_chrome::UiLayoutMode::TabletStudio
@@ -9452,7 +9519,10 @@ impl NocturneApp {
             self.sync_tool_state_from_session();
         }
         if ink_changed {
-            self.last_ink_change = Some(Instant::now());
+            let now = Instant::now();
+            self.last_ink_change = Some(now);
+            self.sync_dirty_since_last = true;
+            self.last_local_edit_at = Some(now);
         }
         // A change to the ink is finished once no button is down: what it was before becomes a
         // step undo can go back to.
@@ -10851,6 +10921,7 @@ impl NocturneApp {
                 let out = self.session.run(id, &params).map_err(|e| e.to_string())?;
                 if id == "sync.configure" {
                     self.sync_has_token = None;
+                    self.cached_sync_config = None;
                 } else if id == "sync.now"
                     && let Some(dir) = self.editor.as_ref().map(|ed| ed.dir.clone())
                     && dir.is_dir()
@@ -11293,6 +11364,7 @@ impl NocturneApp {
         if let Some(notice) = crate::filepicker::take_notice() {
             self.say(notice);
         }
+        self.last_ctx_is_ios = ctx.os() == egui::os::OperatingSystem::IOS;
         self.clipboard_keys(ctx);
         self.poll_control(ctx);
         self.poll_import(ctx);
@@ -11373,6 +11445,14 @@ impl NocturneApp {
             // And no page rect: the one from the frame before is no longer on the screen.
             self.page_rect = None;
             self.page_view_rect = None;
+        }
+        if self.editor.is_none()
+            && self.is_tablet_studio(ctx)
+            && let Some(shown_at) = self.status_shown_at
+            && shown_at.elapsed() < std::time::Duration::from_secs(4)
+        {
+            crate::tablet_chrome::show_transient_notice(ctx, ctx.content_rect(), &self.status, self.status_is_error, &self.tokens);
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
         self.paint_formatting(ctx);
         self.laser_keys(ctx);

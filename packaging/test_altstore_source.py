@@ -108,6 +108,48 @@ class AltStoreSourceTests(unittest.TestCase):
             )
             self.assertEqual(len(second["apps"][0]["versions"]), 1)
 
+    def test_rejects_untrusted_download_url_and_bool_size_in_prior_feed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ipa = root / "nocturne-0.0.13-ios-arm64.ipa"
+            make_test_ipa(ipa, "13")
+            prior_feed = root / "tampered.json"
+            prior_feed.write_text(
+                json.dumps(
+                    {
+                        "apps": [
+                            {
+                                "bundleIdentifier": "io.github.antimajorana.nocturne",
+                                "versions": [
+                                    {
+                                        "version": "0.0.11",
+                                        "date": "2026-11-10T00:00:00Z",
+                                        "downloadURL": "https://evil.example/nocturne.ipa",
+                                        "size": 1234,
+                                    },
+                                    {
+                                        "version": "0.0.10",
+                                        "date": "2026-11-09T00:00:00Z",
+                                        "downloadURL": "https://github.com/antimajorana/Nocturne/releases/download/v0.0.10/nocturne.ipa",
+                                        "size": True,
+                                    },
+                                ],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            feed = build_feed(
+                repo="antimajorana/Nocturne",
+                version="0.0.13",
+                tag="v0.0.13",
+                ipa_path=ipa,
+                release_date="2026-11-19T02:00:00Z",
+                previous_feed_path=prior_feed,
+            )
+            self.assertEqual([v["version"] for v in feed["apps"][0]["versions"]], ["0.0.13"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1159,3 +1159,61 @@ fn deliberate_0_6s_tap_on_modal_button_clicks_with_canvas_long_press_guard() {
         run_modal_frame(0.63, vec![touch_ev(egui::TouchPhase::End, btn_pos), prim_ev(false, btn_pos), egui::Event::PointerGone], true, &mut lp);
     assert!(clicked, "a 0.58s tap on a modal Delete button must click cleanly when canvas long-press guard is active");
 }
+
+#[test]
+fn scrolled_page_view_rect_and_foreground_pill_do_not_steal_or_poison_native_gestures() {
+    let (_dir, mut app, _clip) = make_test_app("ios-scrolled-view-rect-guard");
+    let ctx = egui::Context::default();
+    ctx.set_os(egui::os::OperatingSystem::IOS);
+
+    // Populate a tall page and scroll down so `page_rect().min.y` moves above the visible `page_view_rect().min.y`.
+    let tall_body: String = (0..120).map(|i| format!("Paragraph {i}\n\n")).collect();
+    app.set_body(&tall_body);
+    focus_block_zero(&ctx, &mut app);
+    for _ in 0..10 {
+        app.apply_external_pan(Vec2::new(0.0, -60.0));
+        step_app_frame(&ctx, &mut app, egui::RawInput::default());
+        if app.page_rect().zip(app.page_view_rect()).is_some_and(|(r, v)| r.min.y < v.min.y - 40.0) {
+            break;
+        }
+    }
+
+    let raw_page = app.page_rect().expect("page_rect");
+    let view_page = app.page_view_rect().expect("page_view_rect");
+    assert!(raw_page.min.y < view_page.min.y, "scrolling down shifts page_rect above page_view_rect: {raw_page:?} vs {view_page:?}");
+
+    // A touch in the Studio top bar (`y = 20.0`) must be OUTSIDE the visible canvas `GestureRect`!
+    let visible_rect = nocturne_ios::gestures::GestureRect::from_bounds([view_page.min.x, view_page.min.y, view_page.max.x, view_page.max.y]);
+    assert!(!visible_rect.contains(view_page.center().x, 20.0), "top-bar touch must not count as in_canvas when scrolled");
+
+    // Touching directly on the floating Order::Foreground Pencil pill MUST block native pan,
+    // and once released (`None` touch_pos on next idle frame), open canvas MUST NOT remain poisoned!
+    let pill_pos = Pos2::new(view_page.center().x, view_page.max.y - 24.0);
+    assert!(
+        nocturne_ios::gestures::egui_overlay_blocks_native_gesture(&ctx, app.has_canvas_blocking_overlay(), Some(pill_pos)),
+        "touching the floating Foreground Pencil pill must block UIKit native pan"
+    );
+    step_app_frame(
+        &ctx,
+        &mut app,
+        egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(pill_pos),
+                egui::Event::PointerButton { pos: pill_pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+                egui::Event::PointerButton { pos: pill_pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
+            ],
+            ..Default::default()
+        },
+    );
+    // Note: intentionally omit `PointerGone` above to prove lingering `pointer_latest_pos` does NOT poison idle frames!
+    step_app_frame(&ctx, &mut app, egui::RawInput::default());
+    assert!(
+        !nocturne_ios::gestures::egui_overlay_blocks_native_gesture(&ctx, app.has_canvas_blocking_overlay(), None),
+        "idle frame after tapping Foreground pill must not remain blocked by lingering pointer_latest_pos"
+    );
+    let open_canvas_pos = Pos2::new(view_page.center().x, view_page.min.y + 120.0);
+    assert!(
+        !nocturne_ios::gestures::egui_overlay_blocks_native_gesture(&ctx, app.has_canvas_blocking_overlay(), Some(open_canvas_pos)),
+        "subsequent touch on open canvas must allow native pan/pinch immediately"
+    );
+}

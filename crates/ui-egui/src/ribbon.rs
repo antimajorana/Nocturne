@@ -3387,6 +3387,19 @@ fn view_tab(ui: &mut Ui, source: bool, view: &View<'_>, t: &Tokens, acts: &mut V
                 {
                     acts.push(Act::ToggleMinimap);
                 }
+                if small(
+                    ui,
+                    None,
+                    crate::tl_id!("ui.studio_short"),
+                    crate::tl_id!("ui.toggle_studio_layout_btn"),
+                    crate::tl_id!("ui.toggle_studio_layout_btn"),
+                    false,
+                    t,
+                )
+                .clicked()
+                {
+                    acts.push(Act::ToggleStudioLayout);
+                }
             });
         });
     });

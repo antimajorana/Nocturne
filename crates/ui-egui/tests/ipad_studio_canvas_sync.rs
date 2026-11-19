@@ -8,7 +8,6 @@ use nocturne_store::Settings;
 use nocturne_store::testing::TempDir;
 use nocturne_ui_egui::NocturneApp;
 use nocturne_ui_egui::ribbon;
-use nocturne_ui_egui::tablet_chrome::UiLayoutMode;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,14 +51,26 @@ fn ipad_defaults_to_tablet_studio_and_switches_cleanly_with_classic_ribbon() {
     assert!(app.is_tablet_studio(&ctx), "iPadOS >= 600pt must default to Tablet Studio mode");
     assert!(app.page_rect().is_some(), "canvas page_rect must be active in Tablet Studio");
 
-    // Toggle to Classic Ribbon and back.
-    app.set_ui_layout_mode(UiLayoutMode::ClassicRibbon);
+    // Toggle to Classic Ribbon and back via `Act::ToggleStudioLayout` directly from `UiLayoutMode::Auto`!
+    app.ribbon_act_for_test(ribbon::Act::ToggleStudioLayout);
     step_frame(&ctx, &mut app, egui::RawInput::default());
-    assert!(!app.is_tablet_studio(&ctx));
+    assert!(!app.is_tablet_studio(&ctx), "ToggleStudioLayout from Auto on iOS must switch to Classic Ribbon");
 
-    app.set_ui_layout_mode(UiLayoutMode::TabletStudio);
+    app.ribbon_act_for_test(ribbon::Act::ToggleStudioLayout);
     step_frame(&ctx, &mut app, egui::RawInput::default());
-    assert!(app.is_tablet_studio(&ctx));
+    assert!(app.is_tablet_studio(&ctx), "ToggleStudioLayout from Classic Ribbon must switch back to Tablet Studio");
+
+    // Verify Pencil (rack slot 4) and Highlighter (rack slot 5) from the default 7-tool rack are selectable,
+    // and dark-panel nib colour adaptation lifts near-black `#202020` ink!
+    assert_eq!(nocturne_ink::rack::fresh().len(), 7);
+    app.ribbon_act_for_test(ribbon::Act::InkPen(4));
+    step_frame(&ctx, &mut app, egui::RawInput::default());
+    assert_eq!(app.session().ink_tool_state().rack_index, 4);
+    app.ribbon_act_for_test(ribbon::Act::InkPen(5));
+    step_frame(&ctx, &mut app, egui::RawInput::default());
+    assert_eq!(app.session().ink_tool_state().rack_index, 5);
+    let lifted = nocturne_ui_egui::inkpad::shown_colour(nocturne_ink::Rgb(0x20, 0x20, 0x20), true);
+    assert!(lifted.0 > 180 && lifted.1 > 180 && lifted.2 > 180, "dark-panel adaptation must lift near-black pen: {lifted:?}");
 }
 
 #[test]

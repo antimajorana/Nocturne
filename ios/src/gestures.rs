@@ -54,6 +54,7 @@ pub struct GestureBridgeState {
     pub finger_drawing: bool,
     pub canvas_rect: Option<GestureRect>,
     pub egui_using_pointer: bool,
+    pub canvas_overlay_blocked: bool,
     pub pan_active: bool,
     pub pinch_active: bool,
     pub pending_pan_delta: [f32; 2],
@@ -154,7 +155,7 @@ pub fn egui_overlay_blocks_native_gesture(ctx: &egui::Context, show_source: bool
     if show_source || ctx.any_popup_open() || ctx.memory(|m| m.top_modal_layer().is_some()) {
         return true;
     }
-    let pos = touch_pos.or_else(|| ctx.pointer_interact_pos()).or_else(|| ctx.pointer_latest_pos());
+    let pos = touch_pos.or_else(|| ctx.input(|i| i.pointer.any_down().then(|| i.pointer.interact_pos()).flatten()));
     if let Some(pos) = pos.filter(|p| p.is_finite()) {
         if ctx.layer_id_at(pos).is_some_and(|layer| layer.order >= egui::Order::Middle) {
             return true;
@@ -438,8 +439,8 @@ pub fn filter_pure_events_with_stylus_ids(
 #[cfg(target_os = "ios")]
 pub mod ios {
     use super::{
-        EventKind, GestureBridgeState, GestureRect, PureTouchPhase, ReleaseEventFns, SharedGestureState, filter_events_core, should_begin_native_pan,
-        should_begin_native_pinch,
+        EventKind, GestureBridgeState, GestureRect, PureTouchPhase, ReleaseEventFns, SharedGestureState, egui_overlay_blocks_native_gesture,
+        filter_events_core, should_begin_native_pan, should_begin_native_pinch,
     };
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
@@ -583,12 +584,15 @@ pub mod ios {
                 };
                 let view = gesture_recognizer.view();
                 let loc = gesture_recognizer.locationInView(view.as_deref());
-                let in_canvas = state.point_in_canvas(loc.x as f32, loc.y as f32);
+                let (lx, ly) = (loc.x as f32, loc.y as f32);
+                let in_canvas = state.point_in_canvas(lx, ly);
+                let live_blocked = egui_overlay_blocks_native_gesture(&self.ivars().egui_ctx, state.canvas_overlay_blocked, Some(egui::pos2(lx, ly)));
+                let blocked = state.egui_using_pointer || live_blocked;
                 let touch_count = gesture_recognizer.numberOfTouches();
                 if self.is_pan(gesture_recognizer) {
-                    should_begin_native_pan(touch_count, state.finger_drawing, in_canvas, state.egui_using_pointer)
+                    should_begin_native_pan(touch_count, state.finger_drawing, in_canvas, blocked)
                 } else if self.is_pinch(gesture_recognizer) {
-                    should_begin_native_pinch(touch_count, in_canvas, state.egui_using_pointer)
+                    should_begin_native_pinch(touch_count, in_canvas, blocked)
                 } else {
                     false
                 }
@@ -667,13 +671,14 @@ pub mod ios {
             Self { pan, pinch, _delegate: delegate, state }
         }
 
-        /// Synchronizes `finger_drawing`, canvas rect bounds, and egui pointer ownership each frame.
-        pub fn sync_from_app(&self, finger_drawing: bool, canvas_rect: Option<egui::Rect>, egui_using_pointer: bool) {
+        /// Synchronizes `finger_drawing`, visible canvas viewport bounds, and egui overlay ownership each frame.
+        pub fn sync_from_app(&self, finger_drawing: bool, canvas_rect: Option<egui::Rect>, egui_using_pointer: bool, canvas_overlay_blocked: bool) {
             if let Ok(mut state) = self.state.try_borrow_mut() {
                 state.finger_drawing = finger_drawing;
                 state.canvas_rect =
                     canvas_rect.filter(|r| r.is_finite()).map(|r| GestureRect { min_x: r.min.x, min_y: r.min.y, max_x: r.max.x, max_y: r.max.y });
                 state.egui_using_pointer = egui_using_pointer;
+                state.canvas_overlay_blocked = canvas_overlay_blocked;
             }
             let min_touches = if finger_drawing { 2 } else { 1 };
             if self.pan.minimumNumberOfTouches() != min_touches {
