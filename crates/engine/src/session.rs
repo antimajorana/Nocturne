@@ -1,7 +1,9 @@
 use crate::commands::{self, Output, Params};
 use crate::error::EngineError;
 use crate::sync::{SecretStore, SyncHttpClient, default_http_client, default_secret_store};
-use crate::tool_state::{DockRoster, EraserKind, EraserToggleMode, InkActiveMode, InkOptions, InkPenKind, InkToolState, StudioOptions, ToolbarDock};
+use crate::tool_state::{
+    DockRoster, EraserKind, EraserToggleMode, InkActiveMode, InkOptions, InkPenKind, InkToolState, LibraryView, StudioOptions, ToolbarDock,
+};
 use nocturne_store::tree::{self, Node};
 use nocturne_store::{Settings, StoreError};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -318,6 +320,17 @@ impl Session {
     pub fn set_dock_roster(&mut self, roster: DockRoster) {
         self.studio_options.roster = roster;
         let _ = self.settings.set(StudioOptions::DOCK_TOOLS_KEY, &roster.write());
+    }
+
+    /// How Tablet Studio presents notebooks and pages when browsing the library.
+    pub fn library_view(&self) -> LibraryView {
+        self.studio_options.library_view
+    }
+
+    /// Sets how Tablet Studio presents notebooks and pages when browsing the library, and remembers it.
+    pub fn set_library_view(&mut self, view: LibraryView) {
+        self.studio_options.library_view = view;
+        let _ = self.settings.set(StudioOptions::LIBRARY_VIEW_KEY, view.id());
     }
 }
 

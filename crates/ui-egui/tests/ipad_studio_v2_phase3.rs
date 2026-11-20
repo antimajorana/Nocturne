@@ -211,12 +211,12 @@ fn tool_settings_hides_and_reorders_the_tools_on_the_bar() {
     open_tool_settings(&mut h);
     let lasso = reveal(&mut h, "Lasso");
     click(&mut h, lasso);
-    assert_eq!(h.state().session().studio_options().roster.write(), "history,write,pens,eraser,-lasso,select,shapes");
+    assert_eq!(h.state().session().studio_options().roster.write(), "history,write,pens,eraser,-lasso,select,shapes,picture,math_ocr");
     assert_eq!(named(&h, "Lasso select"), None, "and it is off the bar");
 
     let earlier = reveal(&mut h, "Move Shapes earlier");
     click(&mut h, earlier);
-    assert_eq!(h.state().session().studio_options().roster.write(), "history,write,pens,eraser,-lasso,shapes,select");
+    assert_eq!(h.state().session().studio_options().roster.write(), "history,write,pens,eraser,-lasso,shapes,select,picture,math_ocr");
 }
 
 #[test]

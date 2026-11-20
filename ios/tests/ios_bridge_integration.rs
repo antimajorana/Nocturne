@@ -559,7 +559,8 @@ fn multiline_insert_text_and_marked_composition_preserve_blocks_in_nocturne_app(
 fn focus_block_zero(ctx: &egui::Context, app: &mut NocturneApp) {
     step_app_frame(ctx, app, egui::RawInput::default());
     let page = app.page_rect().expect("page_rect populated");
-    let tap_pos = Pos2::new(page.min.x + 24.0, page.min.y + 64.0);
+    let origin = app.editor_origin().unwrap_or(page.min);
+    let tap_pos = Pos2::new(origin.x + 24.0, origin.y + 24.0);
     let mut click_raw = egui::RawInput::default();
     click_raw.events.push(egui::Event::PointerMoved(tap_pos));
     click_raw.events.push(egui::Event::PointerButton {

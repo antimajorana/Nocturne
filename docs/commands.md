@@ -433,7 +433,7 @@ Choose the tools on the Tablet Studio tool bar.
 
 Parameters:
 
-- tools (optional): the tools in order, comma separated, a minus before one to hide it (write, pens, eraser, lasso, select, shapes, history); without it, reports the list
+- tools (optional): the tools in order, comma separated, a minus before one to hide it (write, pens, eraser, lasso, select, shapes, picture, math_ocr, history); without it, reports the list
 
 ## `ui.toolbar_dock`
 
@@ -442,6 +442,14 @@ Move the Tablet Studio tool bar to an edge.
 Parameters:
 
 - edge: bottom, top, left, or right
+
+## `ui.library_view`
+
+Choose how Tablet Studio shows the notebooks and pages.
+
+Parameters:
+
+- view (optional): studio_grid, classic_tree, or toggle; without it, reports the current view
 
 ## `sync.status`
 

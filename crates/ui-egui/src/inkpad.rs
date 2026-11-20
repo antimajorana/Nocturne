@@ -516,6 +516,45 @@ impl Pad {
         self.touched |= went;
         went
     }
+
+    /// Copies of the held strokes, in the order they sit in the drawing.
+    #[must_use]
+    pub fn held_strokes(&self) -> Vec<Stroke> {
+        let mut indices: Vec<usize> = self.held.iter().copied().filter(|&i| i < self.drawing.strokes.len()).collect();
+        indices.sort_unstable();
+        indices.dedup();
+        indices.into_iter().filter_map(|i| self.drawing.strokes.get(i).cloned()).collect()
+    }
+
+    /// The box round the held ink, `[x0, y0, x1, y1]` in page points, when any is held.
+    #[must_use]
+    pub fn held_bounds(&self) -> Option<[f32; 4]> {
+        pick::bounds(&self.drawing, &self.held).map(|(x0, y0, x1, y1)| [x0, y0, x1, y1])
+    }
+
+    /// Removes every stroke in `snapshot` one-for-one if all of them are still in the drawing
+    /// untouched. If `snapshot` is empty or any stroke was rubbed out, cut, moved, stretched or
+    /// undone in the meantime, removes nothing and returns `false`.
+    pub fn remove_exact_strokes(&mut self, snapshot: &[Stroke]) -> bool {
+        if snapshot.is_empty() {
+            return false;
+        }
+        let mut targets: Vec<usize> = Vec::with_capacity(snapshot.len());
+        for want in snapshot {
+            let Some(idx) = self.drawing.strokes.iter().enumerate().position(|(i, have)| !targets.contains(&i) && have == want) else {
+                return false;
+            };
+            targets.push(idx);
+        }
+        targets.sort_unstable();
+        for idx in targets.into_iter().rev() {
+            self.drawing.strokes.remove(idx);
+        }
+        self.let_go();
+        self.dirty = true;
+        self.touched = true;
+        true
+    }
 }
 
 /// Where held ink can be taken hold of on screen this frame, for the boxes under it: a press
@@ -862,6 +901,10 @@ pub fn show_with_input_and_handles(
         pad.shape_from = None;
         pad.eraser_last = None;
         changed |= pad.grabbed.take().is_some();
+        if !pad.held.is_empty() && update_held_hit_cache(ui.ctx(), body, origin, pad, zoom, handle_reach).is_none() {
+            pad.let_go();
+            clear_held_hit_cache(ui.ctx());
+        }
         changed |= dropped_grab;
         pad.dirty |= changed;
         pad.touched |= changed;
@@ -1159,9 +1202,18 @@ pub fn show_with_input_and_handles(
         }
         Pointer::Write | Pointer::Pan | Pointer::Laser => {}
     }
-    // Delete throws away whatever is held, however it was picked up.
-    if !pad.held.is_empty() && ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
+    // Delete throws away whatever is held, however it was picked up, unless a text field owns the keyboard.
+    if !pad.held.is_empty()
+        && !ui.ctx().egui_wants_keyboard_input()
+        && ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
+    {
         changed |= pad.delete_held();
+    }
+    if pad.held.is_empty() {
+        clear_held_hit_cache(ui.ctx());
+    } else if update_held_hit_cache(ui.ctx(), body, origin, pad, zoom, handle_reach).is_none() {
+        pad.let_go();
+        clear_held_hit_cache(ui.ctx());
     }
     changed |= dropped_grab;
     pad.dirty |= changed;

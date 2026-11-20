@@ -338,6 +338,12 @@ pub fn ink_files(dir: &Path) -> Vec<String> {
     found
 }
 
+/// Reads and parses the primary editable `ink.svg` drawing of a page folder, if present.
+pub fn load_ink_drawing(dir: &Path) -> Option<nocturne_ink::Drawing> {
+    let text = fs::read_to_string(dir.join("ink.svg")).ok()?;
+    nocturne_ink::svg::read(&text).ok().map(|(drawing, _)| drawing)
+}
+
 /// The first `want` bytes of a file, as text. Used to look at a head without reading a
 /// drawing that may be megabytes.
 fn read_head(path: &Path, want: usize) -> std::io::Result<String> {

@@ -240,12 +240,15 @@ pub enum DockTool {
     Lasso,
     Select,
     Shapes,
+    Picture,
+    MathOcr,
     History,
 }
 
 impl DockTool {
     /// Every tool, in the order a fresh install shows them.
-    pub const ALL: [Self; 7] = [Self::History, Self::Write, Self::Pens, Self::Eraser, Self::Lasso, Self::Select, Self::Shapes];
+    pub const ALL: [Self; 9] =
+        [Self::History, Self::Write, Self::Pens, Self::Eraser, Self::Lasso, Self::Select, Self::Shapes, Self::Picture, Self::MathOcr];
 
     /// The stable identifier used by commands and in the settings file.
     #[must_use]
@@ -257,6 +260,8 @@ impl DockTool {
             Self::Lasso => "lasso",
             Self::Select => "select",
             Self::Shapes => "shapes",
+            Self::Picture => "picture",
+            Self::MathOcr => "math_ocr",
             Self::History => "history",
         }
     }
@@ -265,6 +270,9 @@ impl DockTool {
     #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
         let raw = raw.trim().to_ascii_lowercase();
+        if raw == "math-ocr" {
+            return Some(Self::MathOcr);
+        }
         Self::ALL.into_iter().find(|tool| tool.id() == raw)
     }
 }
@@ -273,7 +281,7 @@ impl DockTool {
 /// a hidden tool keeps its place, so showing it again puts it back where it was.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DockRoster {
-    tools: [(DockTool, bool); 7],
+    tools: [(DockTool, bool); 9],
 }
 
 impl Default for DockRoster {
@@ -285,7 +293,7 @@ impl Default for DockRoster {
 impl DockRoster {
     /// Every tool in order, each with whether it is shown.
     #[must_use]
-    pub fn all(&self) -> [(DockTool, bool); 7] {
+    pub fn all(&self) -> [(DockTool, bool); 9] {
         self.tools
     }
 
@@ -342,22 +350,56 @@ impl DockRoster {
     }
 }
 
+/// How Tablet Studio presents notebooks and pages when browsing the library.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LibraryView {
+    #[default]
+    StudioGrid,
+    ClassicTree,
+}
+
+impl LibraryView {
+    pub const ALL: [Self; 2] = [Self::StudioGrid, Self::ClassicTree];
+
+    /// The stable identifier used by commands and in the settings file.
+    #[must_use]
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::StudioGrid => "studio_grid",
+            Self::ClassicTree => "classic_tree",
+        }
+    }
+
+    /// Parses a stable identifier (trimmed, ASCII case-insensitive).
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "studio_grid" | "studio-grid" | "studiogrid" | "grid" => Some(Self::StudioGrid),
+            "classic_tree" | "classic-tree" | "classictree" | "tree" | "classic" => Some(Self::ClassicTree),
+            _ => None,
+        }
+    }
+}
+
 /// How Tablet Studio is laid out: where the tool bar is, and what is on it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StudioOptions {
     pub toolbar_dock: ToolbarDock,
     pub roster: DockRoster,
+    pub library_view: LibraryView,
 }
 
 impl StudioOptions {
     pub(crate) const TOOLBAR_DOCK_KEY: &'static str = "toolbar_dock";
     pub(crate) const DOCK_TOOLS_KEY: &'static str = "studio_dock_tools";
+    pub(crate) const LIBRARY_VIEW_KEY: &'static str = "library_view";
 
     /// Reads the layout from the settings file. Anything missing or unreadable is the default.
     pub(crate) fn load(settings: &nocturne_store::Settings) -> Self {
         Self {
             toolbar_dock: settings.get(Self::TOOLBAR_DOCK_KEY).and_then(|v| ToolbarDock::parse(&v)).unwrap_or_default(),
             roster: settings.get(Self::DOCK_TOOLS_KEY).and_then(|v| DockRoster::parse(&v).ok()).unwrap_or_default(),
+            library_view: settings.get(Self::LIBRARY_VIEW_KEY).and_then(|v| LibraryView::parse(&v)).unwrap_or_default(),
         }
     }
 }
@@ -442,5 +484,23 @@ mod tests {
                 "writing_tool": "pen",
             })
         );
+    }
+
+    #[test]
+    fn dock_tool_and_library_view_round_trip() {
+        assert_eq!(DockTool::ALL.len(), 9);
+        for tool in DockTool::ALL {
+            assert_eq!(DockTool::parse(tool.id()), Some(tool));
+        }
+        assert_eq!(DockTool::Picture.id(), "picture");
+        assert_eq!(DockTool::MathOcr.id(), "math_ocr");
+        assert_eq!(DockTool::parse("math-ocr"), Some(DockTool::MathOcr));
+        assert_eq!(DockRoster::default().all().len(), 9);
+        for view in LibraryView::ALL {
+            assert_eq!(LibraryView::parse(view.id()), Some(view));
+        }
+        assert_eq!(LibraryView::parse("StudioGrid"), Some(LibraryView::StudioGrid));
+        assert_eq!(LibraryView::parse("classic-tree"), Some(LibraryView::ClassicTree));
+        assert_eq!(LibraryView::parse("unknown"), None);
     }
 }

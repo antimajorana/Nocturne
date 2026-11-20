@@ -12,7 +12,7 @@ use crate::ribbon::{Act, RackEdit};
 use crate::tablet_chrome::{NIB_COLOURS, shown_nib_color};
 use crate::theme::Tokens;
 use egui::{Align2, Context, Id, Order, Rect, RichText, Sense, Stroke, StrokeKind, Ui, vec2};
-use nocturne_engine::{DockTool, StudioOptions, ToolbarDock};
+use nocturne_engine::{DockTool, LibraryView, StudioOptions, ToolbarDock};
 use nocturne_ink::Tool;
 use nocturne_ink::rack::{self, Nib};
 
@@ -24,6 +24,8 @@ pub struct ToolSettingsIn<'a> {
     pub finger_drawing: bool,
     pub hold_to_straighten: bool,
     pub eraser_pixel: bool,
+    pub math_ocr_enabled: bool,
+    pub library_view: LibraryView,
     pub studio: StudioOptions,
     pub rack: &'a [Nib],
     /// The place on the rack of the pen in hand.
@@ -39,6 +41,8 @@ fn dock_tool_label(tool: DockTool) -> &'static str {
         DockTool::Lasso => crate::tl_id!("ui.dock_tool_lasso"),
         DockTool::Select => crate::tl_id!("ui.dock_tool_select"),
         DockTool::Shapes => crate::tl_id!("ui.dock_tool_shapes"),
+        DockTool::Picture => crate::tl_id!("ui.dock_tool_picture"),
+        DockTool::MathOcr => crate::tl_id!("ui.dock_tool_math_ocr"),
         DockTool::History => crate::tl_id!("ui.dock_tool_history"),
     }
 }
@@ -84,7 +88,7 @@ fn sign_button(ui: &mut Ui, icon: crate::icons::Icon, name: &str, enabled: bool,
 pub fn show(ctx: &Context, view: Rect, input: &ToolSettingsIn<'_>, t: &Tokens) -> Vec<Act> {
     let mut acts = Vec::new();
     let width = (view.width() - 48.0).clamp(280.0, 460.0);
-    egui::Area::new(Id::new("studio-tool-settings"))
+    egui::Area::new(Id::unique("studio-tool-settings"))
         .order(Order::Foreground)
         .pivot(Align2::CENTER_CENTER)
         .fixed_pos(view.center())
@@ -140,6 +144,32 @@ fn switches(ui: &mut Ui, input: &ToolSettingsIn<'_>, acts: &mut Vec<Act>, t: &To
         for dock in ToolbarDock::ALL {
             if choice(ui, edge_label(dock), input.studio.toolbar_dock == dock, t) {
                 acts.push(Act::ToolbarDock(dock));
+            }
+        }
+    });
+    ui.add_space(6.0);
+    let mut math_ocr = input.math_ocr_enabled;
+    if ui.checkbox(&mut math_ocr, crate::tl_id!("ui.recognise_handwritten_equations")).changed() {
+        acts.push(Act::ToggleMathOcr);
+    }
+    if ui
+        .add(
+            egui::Button::new(RichText::new(crate::tl_id!("ui.recognition_service_open")).color(t.text))
+                .fill(t.panel)
+                .stroke(Stroke::new(1.0, t.container_border))
+                .min_size(vec2(160.0, 32.0)),
+        )
+        .clicked()
+    {
+        acts.push(Act::OpenMathOcrSetup);
+    }
+    heading(ui, crate::tl_id!("ui.library_view_heading"), t);
+    ui.horizontal(|ui| {
+        for (view, label) in
+            [(LibraryView::StudioGrid, crate::tl_id!("ui.library_view_grid")), (LibraryView::ClassicTree, crate::tl_id!("ui.library_view_tree"))]
+        {
+            if choice(ui, label, input.library_view == view, t) {
+                acts.push(Act::LibraryView(view));
             }
         }
     });

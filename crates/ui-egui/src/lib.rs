@@ -38,11 +38,14 @@ pub mod i18n;
 pub mod icons;
 pub mod imagemenu;
 pub mod language_flag;
+pub mod library_grid;
+pub mod library_thumbs;
 pub mod turn;
 pub mod input_language {
     pub use nocturne_input_language::{Watcher, is_rtl, watch_changes};
 }
 pub mod inkpad;
+pub mod math_ocr;
 pub mod mathview;
 pub mod minimap;
 pub mod navhistory;
@@ -60,6 +63,8 @@ pub mod snippets;
 pub mod stylus;
 pub mod sync_ui;
 pub mod tablet_chrome;
+pub mod tablet_dock;
+pub mod tablet_nibs;
 pub mod telemetry_export;
 #[cfg(test)]
 mod testing_dir;

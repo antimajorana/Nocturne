@@ -495,11 +495,28 @@ fn ui_toolbar_dock(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
 
 fn ink_configure_tools(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
     if let Some(raw) = p.get("tools") {
-        let roster = crate::DockRoster::parse(raw)
-            .map_err(|why| EngineError::BadParam(format!("tools: {why}; the tools are write, pens, eraser, lasso, select, shapes, and history")))?;
+        let roster = crate::DockRoster::parse(raw).map_err(|why| {
+            EngineError::BadParam(format!("tools: {why}; the tools are write, pens, eraser, lasso, select, shapes, picture, math_ocr, and history"))
+        })?;
         s.set_dock_roster(roster);
     }
     Ok(Output::Json(serde_json::json!({ "tools": s.studio_options().roster.write() })))
+}
+
+fn ui_library_view(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
+    if let Some(raw) = p.get("view") {
+        let trimmed = raw.trim();
+        let next = if trimmed.eq_ignore_ascii_case("toggle") {
+            match s.library_view() {
+                crate::LibraryView::StudioGrid => crate::LibraryView::ClassicTree,
+                crate::LibraryView::ClassicTree => crate::LibraryView::StudioGrid,
+            }
+        } else {
+            crate::LibraryView::parse(trimmed).ok_or_else(|| EngineError::BadParam("view must be studio_grid, classic_tree, or toggle".into()))?
+        };
+        s.set_library_view(next);
+    }
+    Ok(Output::Json(serde_json::json!({ "library_view": s.library_view().id() })))
 }
 
 fn ink_hold_to_straighten(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
@@ -967,7 +984,7 @@ blocks (optional): the justified paragraphs' positions among the page's blocks, 
     CommandSpec {
         id: "ink.configure_tools",
         label: "Choose the tools on the Tablet Studio tool bar",
-        params: "tools (optional): the tools in order, comma separated, a minus before one to hide it (write, pens, eraser, lasso, select, shapes, history); without it, reports the list",
+        params: "tools (optional): the tools in order, comma separated, a minus before one to hide it (write, pens, eraser, lasso, select, shapes, picture, math_ocr, history); without it, reports the list",
         changes_tree: false,
         run: ink_configure_tools,
     },
@@ -977,6 +994,13 @@ blocks (optional): the justified paragraphs' positions among the page's blocks, 
         params: "edge: bottom, top, left, or right",
         changes_tree: false,
         run: ui_toolbar_dock,
+    },
+    CommandSpec {
+        id: "ui.library_view",
+        label: "Choose how Tablet Studio shows the notebooks and pages",
+        params: "view (optional): studio_grid, classic_tree, or toggle; without it, reports the current view",
+        changes_tree: false,
+        run: ui_library_view,
     },
     CommandSpec {
         id: "sync.status",

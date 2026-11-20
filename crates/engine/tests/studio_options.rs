@@ -1,6 +1,6 @@
 //! Where the Tablet Studio tool bar sits and what is on it: commands, limits, the settings file.
 
-use nocturne_engine::{DockRoster, DockTool, EngineError, Output, Params, Session, StudioOptions, ToolbarDock, registry};
+use nocturne_engine::{DockRoster, DockTool, EngineError, LibraryView, Output, Params, Session, StudioOptions, ToolbarDock, registry};
 use nocturne_store::Settings;
 use nocturne_store::testing::TempDir;
 use serde_json::{Value, json};
@@ -26,9 +26,10 @@ fn a_fresh_session_has_the_bar_at_the_bottom_with_every_tool_in_its_usual_order(
     let s = session(&t);
     assert_eq!(s.studio_options(), StudioOptions::default());
     assert_eq!(s.studio_options().toolbar_dock, ToolbarDock::Bottom);
+    assert_eq!(s.studio_options().library_view, LibraryView::StudioGrid);
     assert_eq!(s.studio_options().roster.shown().collect::<Vec<_>>(), DockTool::ALL.to_vec());
-    assert_eq!(s.studio_options().roster.write(), "history,write,pens,eraser,lasso,select,shapes");
-    for id in ["ui.toolbar_dock", "ink.configure_tools"] {
+    assert_eq!(s.studio_options().roster.write(), "history,write,pens,eraser,lasso,select,shapes,picture,math_ocr");
+    for id in ["ui.toolbar_dock", "ink.configure_tools", "ui.library_view"] {
         assert!(registry().iter().any(|c| c.id == id && !c.changes_tree), "{id} is a command that leaves the notebooks alone");
     }
 }
@@ -55,11 +56,20 @@ fn the_tools_are_reordered_and_hidden_and_a_hidden_tool_keeps_its_place() {
     let t = TempDir::new("studio-options-roster");
     let mut s = session(&t);
     let out = json_of(s.run("ink.configure_tools", &p(&[("tools", "pens, eraser, -lasso, write")])).expect("configure"));
-    assert_eq!(out, json!({ "tools": "pens,eraser,-lasso,write,history,select,shapes" }), "tools left out follow, shown");
+    assert_eq!(out, json!({ "tools": "pens,eraser,-lasso,write,history,select,shapes,picture,math_ocr" }), "tools left out follow, shown");
     let roster = s.studio_options().roster;
     assert_eq!(
         roster.shown().collect::<Vec<_>>(),
-        [DockTool::Pens, DockTool::Eraser, DockTool::Write, DockTool::History, DockTool::Select, DockTool::Shapes]
+        [
+            DockTool::Pens,
+            DockTool::Eraser,
+            DockTool::Write,
+            DockTool::History,
+            DockTool::Select,
+            DockTool::Shapes,
+            DockTool::Picture,
+            DockTool::MathOcr,
+        ]
     );
     assert_eq!(json_of(s.run("ink.configure_tools", &Params::new()).expect("report")), out, "without a list it reports the one it has");
 
@@ -70,13 +80,35 @@ fn the_tools_are_reordered_and_hidden_and_a_hidden_tool_keeps_its_place() {
     edited.set_shown(DockTool::Lasso, true);
     assert!(edited.shift(DockTool::Lasso, true));
     assert!(!edited.shift(DockTool::Pens, true), "the first tool cannot go earlier");
-    assert!(!edited.shift(DockTool::Shapes, false), "nor the last later");
-    assert_eq!(edited.write(), "pens,lasso,eraser,write,history,select,shapes");
+    assert!(!edited.shift(DockTool::MathOcr, false), "nor the last later");
+    assert_eq!(edited.write(), "pens,lasso,eraser,write,history,select,shapes,picture,math_ocr");
     assert_eq!(
         DockRoster::parse("pens,pens,-pens").expect("repeats").write(),
-        "pens,history,write,eraser,lasso,select,shapes",
+        "pens,history,write,eraser,lasso,select,shapes,picture,math_ocr",
         "a tool named twice counts once"
     );
+    assert_eq!(DockTool::parse("picture"), Some(DockTool::Picture));
+    assert_eq!(DockTool::parse("math_ocr"), Some(DockTool::MathOcr));
+    assert_eq!(DockTool::parse(" math-ocr "), Some(DockTool::MathOcr));
+    assert_eq!(
+        DockRoster::parse("picture,math-ocr,-shapes").expect("picture and math-ocr alias").write(),
+        "picture,math_ocr,-shapes,history,write,pens,eraser,lasso,select"
+    );
+}
+
+#[test]
+fn library_view_switches_toggles_persists_and_rejects_unknown_values() {
+    let t = TempDir::new("studio-options-library-view");
+    let mut s = session(&t);
+    assert_eq!(json_of(s.run("ui.library_view", &Params::new()).expect("initial")), json!({ "library_view": "studio_grid" }));
+    assert_eq!(json_of(s.run("ui.library_view", &p(&[("view", "classic_tree")])).expect("classic_tree")), json!({ "library_view": "classic_tree" }));
+    assert_eq!(s.library_view(), LibraryView::ClassicTree);
+    assert_eq!(json_of(s.run("ui.library_view", &p(&[("view", "toggle")])).expect("toggle 1")), json!({ "library_view": "studio_grid" }));
+    assert_eq!(json_of(s.run("ui.library_view", &p(&[("view", "toggle")])).expect("toggle 2")), json!({ "library_view": "classic_tree" }));
+    assert!(matches!(s.run("ui.library_view", &p(&[("view", "carousel")])), Err(EngineError::BadParam(_))));
+    assert_eq!(s.library_view(), LibraryView::ClassicTree, "refused view changes nothing");
+    drop(s);
+    assert_eq!(session(&t).library_view(), LibraryView::ClassicTree);
 }
 
 #[test]
@@ -85,6 +117,7 @@ fn the_layout_is_remembered_and_junk_in_the_file_is_the_default() {
     let mut s = session(&t);
     s.run("ui.toolbar_dock", &p(&[("edge", "right")])).expect("edge");
     s.run("ink.configure_tools", &p(&[("tools", "-shapes,history,pens")])).expect("tools");
+    s.run("ui.library_view", &p(&[("view", "classic_tree")])).expect("library view");
     let before = s.studio_options();
     drop(s);
     assert_eq!(session(&t).studio_options(), before);
@@ -92,6 +125,7 @@ fn the_layout_is_remembered_and_junk_in_the_file_is_the_default() {
     let settings = Settings::at(t.path().join("settings").join("s.toml"));
     settings.set("toolbar_dock", "ceiling").expect("junk edge");
     settings.set("studio_dock_tools", "pens,crayon").expect("junk tools");
+    settings.set("library_view", "carousel").expect("junk library view");
     let s = Session::new(&t.path().join("notebooks"), settings).expect("session");
     assert_eq!(s.studio_options(), StudioOptions::default());
 }

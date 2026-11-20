@@ -164,15 +164,17 @@ imports shared documents placed in `Documents/Inbox/` (Share > Nocturne), and re
     the limit were not tried by hand on a pen.
   - The window keeps drawing frames while a stroke is in progress, as it did before; nothing
     was done to rest it while the pen is still.
-- **Handwritten equations to LaTeX (2026-11-20) exist in the engine only; the window has no way
-  to use them yet.** The commands `ink.math_ocr_toggle`, `ink.math_ocr_configure` and
-  `ink.math_ocr_convert` are there and tested against a server on the loopback address: the
-  switch is off until it is turned on and nothing is sent while it is off, the picture of the
-  ink is drawn in Rust, and a key is kept per service and forgotten when that service's address
-  changes. Not done: the "Convert to LaTeX" button over lassoed ink, the preview, replacing the
-  ink with a math block as one undo step, and the settings screen. No request has been made to
-  a real service (Anthropic, Gemini, OpenAI, Mathpix): the request shapes were read from each
-  service's reference and the default model names are the ones those references use.
+- **Handwritten equations to LaTeX (2026-11-20) are tested against a loopback server only, not
+  against live services or a physical iPad.** Both the engine commands (`ink.math_ocr_toggle`,
+  `ink.math_ocr_configure`, `ink.math_ocr_convert`) and the window workflow (the "Convert to
+  LaTeX" button over held ink when enabled, the editable single-line LaTeX source with live
+  RaTeX preview, positioned `MathBlock` insertion in one Undo/Redo step, and the Tool Settings
+  toggle plus Recognition service screen) are built and tested against a loopback HTTP server:
+  recognition is off by default and sends nothing while off, the ink picture is rasterised in
+  Rust, and keys are kept per service and cleared when that service's address changes without a
+  new key. Live external services (Anthropic, Gemini, OpenAI, Mathpix) and physical iPad
+  hardware have not been exercised in the cloud; the request shapes and default model names come
+  from each service's reference documentation.
 - **The movable tool bar, Tool Settings and the floating header of Tablet Studio (2026-11-20) are
   tested on the host only, and were not looked at as pictures.** What they do, and what is open:
   - The tool bar sits on the bottom, top, left or right edge of the page view (`ui.toolbar_dock`,

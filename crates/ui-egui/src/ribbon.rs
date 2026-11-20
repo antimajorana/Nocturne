@@ -120,6 +120,14 @@ pub enum Act {
     OpenCloudSync,
     /// Switch between Tablet Studio chrome and the Classic Ribbon.
     ToggleStudioLayout,
+    /// Turn handwritten equation recognition on or off (`ink.math_ocr_toggle`).
+    ToggleMathOcr,
+    /// Open the handwritten equation recognition service dialog (`ink.math_ocr_configure`).
+    OpenMathOcrSetup,
+    /// Choose how Tablet Studio presents notebooks and pages (`ui.library_view`).
+    LibraryView(nocturne_engine::LibraryView),
+    /// Trigger the Tablet Studio dock Math OCR button action.
+    DockMathOcr,
     /// Cut or copy what is selected.
     Clipboard(&'static str),
     /// Put the clipboard into the page: a picture as a file beside it, anything else as
@@ -561,6 +569,10 @@ pub struct View<'a> {
     /// buttons show as pressed (issue #255).
     pub marks: crate::pageedit::Marks,
     pub font_size: Option<&'a str>,
+    /// Whether handwritten equation recognition (`ink.math_ocr_toggle`) is enabled.
+    pub math_ocr_enabled: bool,
+    /// Whether the active page currently has lassoed/picked ink held on the canvas.
+    pub holding_ink: bool,
 }
 
 impl View<'_> {
