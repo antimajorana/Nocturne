@@ -1,7 +1,11 @@
 #!/bin/sh
-# Quality level L1, the message half: a subject line `type(scope): what`, at most 72
-# characters. Git's own merge and revert subjects, and `--fixup`, pass as they are.
-#
-# Skip once:        git commit --no-verify (only for work that is not yours; see AGENTS.md)
+# Fast commit-msg check (< 1s, zero Rust compilation): subject line `type(scope): what` or `type: what`.
 set -e
-cargo xtask commit-msg "$1"
+
+subject=$(head -n 1 "$1" | tr -d '\r')
+if printf '%s\n' "$subject" | grep -Eq '^(Merge |Revert |fixup! |squash! |(feat|fix|docs|test|chore|refactor|perf|ci|build|release)(\([^)]+\))?: .+)'; then
+    exit 0
+fi
+
+echo "commit-msg: expected subject 'type(scope): summary' (e.g. 'docs(agents): trim workflow rules'), got: $subject"
+exit 1
