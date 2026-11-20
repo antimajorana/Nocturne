@@ -396,6 +396,37 @@ Parameters:
 
 - enabled (optional): true, false, or toggle; default: toggle
 
+## `ink.math_ocr_toggle`
+
+Turn handwritten equation recognition on or off.
+
+Parameters:
+
+- enabled (optional): true, false, or toggle; default: toggle
+
+## `ink.math_ocr_configure`
+
+Choose the service that reads handwritten equations, and give it its key.
+
+Parameters:
+
+- provider (optional): anthropic, gemini, openai, mathpix, or custom
+- endpoint (optional): the service's address, https only unless it is on this machine; default for the service's own
+- model (optional): the model to ask; default for the service's own
+- key (optional): the service's key, kept outside the settings file and never shown
+- app_id (optional): the app id Mathpix needs beside its key
+- clear_key (optional): true forgets the key
+- without parameters, reports the settings
+
+## `ink.math_ocr_convert`
+
+Read a page's handwritten equation as LaTeX (sends a picture of the ink to the chosen service).
+
+Parameters:
+
+- path (required): the page
+- strokes (optional): which strokes, by position, comma separated; default: all of them
+
 ## `ink.configure_tools`
 
 Choose the tools on the Tablet Studio tool bar.

@@ -41,7 +41,7 @@ pub struct CommandSpec {
     pub run: fn(&mut Session, &Params) -> Result<Output, EngineError>,
 }
 
-fn req<'a>(p: &'a Params, key: &'static str) -> Result<&'a str, EngineError> {
+pub(crate) fn req<'a>(p: &'a Params, key: &'static str) -> Result<&'a str, EngineError> {
     p.get(key).map(String::as_str).ok_or(EngineError::MissingParam(key))
 }
 
@@ -455,7 +455,7 @@ fn ink_finger_drawing(s: &mut Session, p: &Params) -> Result<Output, EngineError
 }
 
 /// `true`, `false`, or (when missing, empty or `toggle`) the opposite of `now`.
-fn switch_param(p: &Params, key: &str, now: bool) -> Result<bool, EngineError> {
+pub(crate) fn switch_param(p: &Params, key: &str, now: bool) -> Result<bool, EngineError> {
     match p.get(key).map(|v| v.trim().to_ascii_lowercase()).as_deref() {
         None | Some("" | "toggle") => Ok(!now),
         Some("true") => Ok(true),
@@ -519,7 +519,7 @@ fn node_format(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
     Ok(Output::None)
 }
 
-fn parse_opt_bool(p: &Params, key: &'static str) -> Result<Option<bool>, EngineError> {
+pub(crate) fn parse_opt_bool(p: &Params, key: &'static str) -> Result<Option<bool>, EngineError> {
     match p.get(key).map(|v| v.trim().to_ascii_lowercase()) {
         None => Ok(None),
         Some(v) if v.is_empty() => Ok(None),
@@ -942,6 +942,27 @@ blocks (optional): the justified paragraphs' positions among the page's blocks, 
         params: "enabled (optional): true, false, or toggle; default: toggle",
         changes_tree: false,
         run: ink_hold_to_straighten,
+    },
+    CommandSpec {
+        id: "ink.math_ocr_toggle",
+        label: "Turn handwritten equation recognition on or off",
+        params: "enabled (optional): true, false, or toggle; default: toggle",
+        changes_tree: false,
+        run: crate::ocr::commands::toggle,
+    },
+    CommandSpec {
+        id: "ink.math_ocr_configure",
+        label: "Choose the service that reads handwritten equations, and give it its key",
+        params: "provider (optional): anthropic, gemini, openai, mathpix, or custom\nendpoint (optional): the service's address, https only unless it is on this machine; default for the service's own\nmodel (optional): the model to ask; default for the service's own\nkey (optional): the service's key, kept outside the settings file and never shown\napp_id (optional): the app id Mathpix needs beside its key\nclear_key (optional): true forgets the key\nwithout parameters, reports the settings",
+        changes_tree: false,
+        run: crate::ocr::commands::configure,
+    },
+    CommandSpec {
+        id: "ink.math_ocr_convert",
+        label: "Read a page's handwritten equation as LaTeX (sends a picture of the ink to the chosen service)",
+        params: "path (required): the page\nstrokes (optional): which strokes, by position, comma separated; default: all of them",
+        changes_tree: false,
+        run: crate::ocr::commands::convert,
     },
     CommandSpec {
         id: "ink.configure_tools",

@@ -43,7 +43,7 @@ pub struct KDriveClient<'a> {
     cancel: Option<&'a AtomicBool>,
 }
 
-fn is_loopback_http(url: &str) -> bool {
+pub(crate) fn is_loopback_http(url: &str) -> bool {
     let authority = url.split("://").nth(1).and_then(|s| s.split(['/', '?', '#']).next()).unwrap_or("");
     if authority.contains('@') {
         return false;

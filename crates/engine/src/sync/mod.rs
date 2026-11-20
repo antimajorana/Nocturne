@@ -14,6 +14,7 @@
 //!    file as `<stem>.conflict-<ts>.<ext>` so neither side ever loses work.
 
 mod kdrive;
+pub(crate) use kdrive::is_loopback_http;
 mod manifest;
 mod reconcile;
 mod transport;
