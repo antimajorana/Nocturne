@@ -27,5 +27,6 @@ pub use sync::{
     SyncHttpMethod, SyncHttpRequest, SyncHttpResponse, SyncReport, apply_staged_sync, stage_sync,
 };
 pub use tool_state::{
-    ERASER_SIZES, EraserKind, EraserToggleMode, InkActiveMode, InkOptions, InkPenKind, InkToolState, MAX_ERASER_WIDTH, MIN_ERASER_WIDTH,
+    DockRoster, DockTool, ERASER_SIZES, EraserKind, EraserToggleMode, InkActiveMode, InkOptions, InkPenKind, InkToolState, MAX_ERASER_WIDTH,
+    MIN_ERASER_WIDTH, StudioOptions, ToolbarDock,
 };

@@ -1031,3 +1031,26 @@
 @id	ui.object_eraser	$$$Object eraser@@@
 @id	ui.pixel_eraser	$$$Pixel eraser@@@
 @id	ui.eraser_size_named	$$$Eraser size {size}@@@
+@id	ui.tool_settings	$$$Tool settings@@@
+@id	ui.move_tool_bar	$$$Move the tool bar@@@
+@id	ui.hold_to_straighten	$$$Hold 2 seconds to straighten a line@@@
+@id	ui.tool_settings_eraser	$$$Eraser@@@
+@id	ui.tool_bar_position	$$$Tool bar position@@@
+@id	ui.edge_bottom	$$$Bottom@@@
+@id	ui.edge_top	$$$Top@@@
+@id	ui.edge_left	$$$Left@@@
+@id	ui.edge_right	$$$Right@@@
+@id	ui.tools_on_the_bar	$$$Tools on the bar@@@
+@id	ui.dock_tool_write	$$$Text@@@
+@id	ui.dock_tool_pens	$$$Pens@@@
+@id	ui.dock_tool_eraser	$$$Eraser@@@
+@id	ui.dock_tool_lasso	$$$Lasso@@@
+@id	ui.dock_tool_select	$$$Select@@@
+@id	ui.dock_tool_shapes	$$$Shapes@@@
+@id	ui.dock_tool_history	$$$Undo and redo@@@
+@id	ui.move_earlier_named	$$$Move {tool} earlier@@@
+@id	ui.move_later_named	$$$Move {tool} later@@@
+@id	ui.pens_and_colours	$$$Pens and colours@@@
+@id	ui.add_colour_named	$$$Add a colour to {tool}@@@
+@id	ui.remove_colour_named	$$$Remove a colour from {tool}@@@
+@id	ui.colour_slot_named	$$${tool} colour {n}@@@

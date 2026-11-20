@@ -1256,6 +1256,10 @@ pub struct NocturneApp {
     /// A pen is writing while a finger or palm is also on the glass: until the pen lifts, the
     /// ink reads the pen's own touch and not the window's pointer (`stylus::StylusFrame`).
     pen_reads_own_touch: bool,
+    /// The Tool Settings screen of Tablet Studio is open.
+    tool_settings_open: bool,
+    /// Where the floating header of Tablet Studio was drawn last frame, when a page is open.
+    header_pill_rect: Option<egui::Rect>,
     /// The page the window closed on has been opened again (once per run).
     restored: bool,
     /// Recovery warnings that were already shown during this run.
@@ -1440,6 +1444,8 @@ impl NocturneApp {
             status_banner_dismissed: None,
             status_banner_drawn: false,
             pen_reads_own_touch: false,
+            tool_settings_open: false,
+            header_pill_rect: None,
             restored: false,
             icon_recovery_reported: HashSet::new(),
             icon_recovery_suppressed: false,
@@ -4105,11 +4111,16 @@ impl NocturneApp {
             .get_or_insert_with(|| self.session.sync_secrets().get_secret(nocturne_engine::KDRIVE_TOKEN_KEY).ok().flatten().is_some());
         let show_source = self.show_source;
         let mut out = crate::tablet_chrome::StudioTopBarOut::default();
-        egui::Panel::top("studio-top-bar").show_separator_line(false).show(ui, |ui| {
-            let font_sel = self.font_selection(ui.ctx());
+        // With a page open the bar across the window gives way to a small floating header at the
+        // top left of the page, so the page reaches the top of the screen. It needs to know where
+        // the page view is, which the frame before says; until then the bar is drawn.
+        let header_at = self.page_view_rect.filter(|_| self.editor.is_some() && self.backstage.is_none());
+        if let Some(view_rect) = header_at {
+            let ctx = ui.ctx().clone();
+            let font_sel = self.font_selection(&ctx);
             let mut search_buf = std::mem::take(&mut self.search);
             let mut focus_search = self.focus_search;
-            let view = self.current_view_state(ui.ctx(), None, None, font_sel.marks);
+            let view = self.current_view_state(&ctx, None, None, font_sel.marks);
             let input = crate::tablet_chrome::StudioTopBarIn {
                 drawer_open,
                 can_back,
@@ -4120,11 +4131,35 @@ impl NocturneApp {
                 show_source,
                 view,
             };
-            out = crate::tablet_chrome::show_top_bar(ui, &input, &mut search_buf, &mut focus_search, &tokens);
+            let (pill_out, rect) = crate::tablet_chrome::show_header_pill(&ctx, view_rect, &input, &mut search_buf, &mut focus_search, &tokens);
+            out = pill_out;
             self.search = search_buf;
             self.focus_search = focus_search;
-            self.band_bottom = ui.min_rect().max.y;
-        });
+            self.header_pill_rect = Some(rect);
+            self.band_bottom = ctx.content_rect().min.y;
+        } else {
+            self.header_pill_rect = None;
+            egui::Panel::top("studio-top-bar").show_separator_line(false).show(ui, |ui| {
+                let font_sel = self.font_selection(ui.ctx());
+                let mut search_buf = std::mem::take(&mut self.search);
+                let mut focus_search = self.focus_search;
+                let view = self.current_view_state(ui.ctx(), None, None, font_sel.marks);
+                let input = crate::tablet_chrome::StudioTopBarIn {
+                    drawer_open,
+                    can_back,
+                    can_forward,
+                    breadcrumb: &breadcrumb,
+                    sync_busy,
+                    sync_configured,
+                    show_source,
+                    view,
+                };
+                out = crate::tablet_chrome::show_top_bar(ui, &input, &mut search_buf, &mut focus_search, &tokens);
+                self.search = search_buf;
+                self.focus_search = focus_search;
+                self.band_bottom = ui.min_rect().max.y;
+            });
+        }
         if out.toggle_drawer {
             self.full_page = !self.full_page;
             self.compact_full_page = false;
@@ -5466,6 +5501,13 @@ impl NocturneApp {
                 self.show_minimap = !self.show_minimap;
                 let _ = self.session.settings.set("show_minimap", if self.show_minimap { "true" } else { "false" });
             }
+            ribbon::Act::ToolbarDock(dock) => self.session.set_toolbar_dock(dock),
+            ribbon::Act::DockRoster(roster) => self.session.set_dock_roster(roster),
+            ribbon::Act::ToggleToolSettings => self.tool_settings_open = !self.tool_settings_open,
+            ribbon::Act::ToggleHoldToStraighten => {
+                let on = self.session.ink_options().hold_to_straighten;
+                self.session.set_hold_to_straighten(!on);
+            }
             ribbon::Act::EraserPixel(pixel) => {
                 self.session.set_eraser_kind(if pixel { nocturne_engine::EraserKind::Pixel } else { nocturne_engine::EraserKind::Object });
             }
@@ -6572,6 +6614,11 @@ impl NocturneApp {
     /// The box around all the page's ink, `[x0, y0, x1, y1]` in page points, when there is any.
     pub fn ink_bounds(&self) -> Option<[f32; 4]> {
         self.pad.as_ref().and_then(crate::inkpad::Pad::bounds)
+    }
+
+    /// The pens on the rack, in order: each a kind of pen, a colour and a thickness.
+    pub fn pen_rack(&self) -> &[nocturne_ink::rack::Nib] {
+        &self.rack
     }
 
     /// How many pen readings each stroke on the page holds, in the order they were drawn.
@@ -9499,7 +9546,9 @@ impl NocturneApp {
                 }
                 if !canvas_overlay_open {
                     let hbar_clearance = if hbar.track.is_some() { 18.0 } else { 0.0 };
-                    let mut pill_clearance = hbar_clearance;
+                    // The minimap sits top right, clear of a tool bar docked along the top or the right.
+                    let studio = self.session.studio_options();
+                    let (mut map_top_clearance, mut map_right_clearance) = (0.0_f32, reserve);
                     if tablet_studio {
                         let pill_view = ribbon::View {
                             rules,
@@ -9517,10 +9566,42 @@ impl NocturneApp {
                             can_ink_redo: pad.as_ref().is_some_and(crate::inkpad::Pad::can_redo),
                             ..ribbon::View::default()
                         };
-                        let (acts, pill_rect) = crate::tablet_chrome::show_pencil_pill(ui.ctx(), view, hbar_clearance, &pill_view, &tokens);
+                        let edge_clearance = match studio.toolbar_dock {
+                            nocturne_engine::ToolbarDock::Bottom => hbar_clearance,
+                            nocturne_engine::ToolbarDock::Right => reserve,
+                            // Under the floating header, which is at the top left.
+                            nocturne_engine::ToolbarDock::Top | nocturne_engine::ToolbarDock::Left => {
+                                self.header_pill_rect.map_or(0.0, |r| r.height() + 6.0)
+                            }
+                        };
+                        let (acts, pill_rect) = crate::tablet_chrome::show_pencil_pill(
+                            ui.ctx(),
+                            view,
+                            edge_clearance,
+                            studio,
+                            self.tool_settings_open,
+                            &pill_view,
+                            &tokens,
+                        );
                         pill_acts = acts;
+                        if self.tool_settings_open {
+                            let options = self.session.ink_options();
+                            let input = crate::tool_settings::ToolSettingsIn {
+                                finger_drawing: self.session.finger_drawing(),
+                                hold_to_straighten: options.hold_to_straighten,
+                                eraser_pixel: options.eraser_kind == nocturne_engine::EraserKind::Pixel,
+                                studio,
+                                rack: &self.rack,
+                                nib: self.nib,
+                            };
+                            pill_acts.extend(crate::tool_settings::show(ui.ctx(), view, &input, &tokens));
+                        }
                         if let Some(pr) = pill_rect {
-                            pill_clearance = pill_clearance.max((view.max.y - pr.min.y + 8.0).max(0.0));
+                            match studio.toolbar_dock {
+                                nocturne_engine::ToolbarDock::Top => map_top_clearance = (pr.max.y - view.min.y + 8.0).max(0.0),
+                                nocturne_engine::ToolbarDock::Right => map_right_clearance = (view.max.x - pr.min.x + 8.0).max(reserve),
+                                _ => {}
+                            }
                         }
                     }
                     if self.show_minimap {
@@ -9531,8 +9612,8 @@ impl NocturneApp {
                             ed.origin,
                             current_zoom_pct,
                             self.minimap_collapsed,
-                            pill_clearance,
-                            reserve,
+                            map_top_clearance,
+                            map_right_clearance,
                             &ed.last_frames,
                             &stroke_bounds,
                             &tokens,

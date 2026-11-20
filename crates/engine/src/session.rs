@@ -1,7 +1,7 @@
 use crate::commands::{self, Output, Params};
 use crate::error::EngineError;
 use crate::sync::{SecretStore, SyncHttpClient, default_http_client, default_secret_store};
-use crate::tool_state::{EraserKind, EraserToggleMode, InkActiveMode, InkOptions, InkPenKind, InkToolState};
+use crate::tool_state::{DockRoster, EraserKind, EraserToggleMode, InkActiveMode, InkOptions, InkPenKind, InkToolState, StudioOptions, ToolbarDock};
 use nocturne_store::tree::{self, Node};
 use nocturne_store::{Settings, StoreError};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -22,6 +22,7 @@ pub struct Session {
     ink_tool: InkToolState,
     finger_drawing: bool,
     ink_options: InkOptions,
+    studio_options: StudioOptions,
     sync_http: Arc<dyn SyncHttpClient>,
     sync_secrets: Arc<dyn SecretStore>,
 }
@@ -46,6 +47,7 @@ impl Session {
         let sync_http = default_http_client();
         let sync_secrets = default_secret_store(&settings);
         let ink_options = InkOptions::load(&settings);
+        let studio_options = StudioOptions::load(&settings);
         let finger_drawing = settings.get(FINGER_DRAWING_KEY).is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
         let mut s = Session {
             root,
@@ -56,6 +58,7 @@ impl Session {
             ink_tool: InkToolState::default(),
             finger_drawing,
             ink_options,
+            studio_options,
             sync_http,
             sync_secrets,
         };
@@ -298,6 +301,23 @@ impl Session {
     pub fn set_hold_to_straighten(&mut self, enabled: bool) {
         self.ink_options.hold_to_straighten = enabled;
         let _ = self.settings.set(InkOptions::HOLD_TO_STRAIGHTEN_KEY, if enabled { "true" } else { "false" });
+    }
+
+    /// How Tablet Studio is laid out: the edge its tool bar sits on, and the tools on it.
+    pub fn studio_options(&self) -> StudioOptions {
+        self.studio_options
+    }
+
+    /// Moves the Tablet Studio tool bar to an edge of the page view, and remembers it.
+    pub fn set_toolbar_dock(&mut self, dock: ToolbarDock) {
+        self.studio_options.toolbar_dock = dock;
+        let _ = self.settings.set(StudioOptions::TOOLBAR_DOCK_KEY, dock.id());
+    }
+
+    /// Sets which tools the Tablet Studio tool bar shows and in what order, and remembers it.
+    pub fn set_dock_roster(&mut self, roster: DockRoster) {
+        self.studio_options.roster = roster;
+        let _ = self.settings.set(StudioOptions::DOCK_TOOLS_KEY, &roster.write());
     }
 }
 

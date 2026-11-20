@@ -486,6 +486,22 @@ fn ink_eraser_width(s: &mut Session, p: &Params) -> Result<Output, EngineError> 
     Ok(Output::Json(serde_json::json!({ "eraser_width": width })))
 }
 
+fn ui_toolbar_dock(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
+    let bad = || EngineError::BadParam("edge must be bottom, top, left, or right".into());
+    let dock = p.get("edge").and_then(|raw| crate::ToolbarDock::parse(raw)).ok_or_else(bad)?;
+    s.set_toolbar_dock(dock);
+    Ok(Output::Json(serde_json::json!({ "toolbar_dock": dock.id() })))
+}
+
+fn ink_configure_tools(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
+    if let Some(raw) = p.get("tools") {
+        let roster = crate::DockRoster::parse(raw)
+            .map_err(|why| EngineError::BadParam(format!("tools: {why}; the tools are write, pens, eraser, lasso, select, shapes, and history")))?;
+        s.set_dock_roster(roster);
+    }
+    Ok(Output::Json(serde_json::json!({ "tools": s.studio_options().roster.write() })))
+}
+
 fn ink_hold_to_straighten(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
     let enabled = switch_param(p, "enabled", s.ink_options().hold_to_straighten)?;
     s.set_hold_to_straighten(enabled);
@@ -926,6 +942,20 @@ blocks (optional): the justified paragraphs' positions among the page's blocks, 
         params: "enabled (optional): true, false, or toggle; default: toggle",
         changes_tree: false,
         run: ink_hold_to_straighten,
+    },
+    CommandSpec {
+        id: "ink.configure_tools",
+        label: "Choose the tools on the Tablet Studio tool bar",
+        params: "tools (optional): the tools in order, comma separated, a minus before one to hide it (write, pens, eraser, lasso, select, shapes, history); without it, reports the list",
+        changes_tree: false,
+        run: ink_configure_tools,
+    },
+    CommandSpec {
+        id: "ui.toolbar_dock",
+        label: "Move the Tablet Studio tool bar to an edge",
+        params: "edge: bottom, top, left, or right",
+        changes_tree: false,
+        run: ui_toolbar_dock,
     },
     CommandSpec {
         id: "sync.status",

@@ -93,7 +93,7 @@ pub fn compute_pan_and_scroll_for_page_center(
     (vec2(new_pan_x, new_pan_y), clamped_scroll_y)
 }
 
-/// Renders the collapsible infinite-canvas minimap at `Order::Foreground` in the bottom-right
+/// Renders the collapsible infinite-canvas minimap at `Order::Foreground` in the top-right
 /// corner of `view_rect` when no modal/overlay is open.
 #[allow(clippy::too_many_arguments)]
 pub fn show(
@@ -102,7 +102,7 @@ pub fn show(
     origin: Pos2,
     zoom_percent: u32,
     collapsed: bool,
-    bottom_clearance: f32,
+    top_clearance: f32,
     right_clearance: f32,
     container_frames: &[Rect],
     stroke_bounds: &[[f32; 4]],
@@ -123,8 +123,9 @@ pub fn show(
     let panel_w = if collapsed { 148.0 } else { MAP_W + 12.0 };
     let panel_h = if collapsed { HEADER_H + 8.0 } else { HEADER_H + MAP_H + 14.0 };
     let max_x = view_rect.max.x - 12.0 - right_clearance.max(0.0);
-    let max_y = view_rect.max.y - 12.0 - bottom_clearance.max(0.0);
-    let min_pos = pos2((max_x - panel_w).max(view_rect.min.x + 8.0), (max_y - panel_h).max(view_rect.min.y + 8.0));
+    // Top right, as the reference canvas has it: under whatever already sits along the top edge.
+    let min_y = view_rect.min.y + 12.0 + top_clearance.max(0.0);
+    let min_pos = pos2((max_x - panel_w).max(view_rect.min.x + 8.0), min_y.min((view_rect.max.y - panel_h - 8.0).max(view_rect.min.y + 8.0)));
 
     let area_resp = egui::Area::new(Id::new("infinite-canvas-minimap"))
         .order(Order::Foreground)

@@ -440,8 +440,11 @@ fn studio_has_a_labelled_draw_with_finger_switch_and_no_hand_on_the_tool_pill() 
     assert!(!h.state().is_finger_drawing(), "off by default");
     assert_eq!(labelled(&h, |l| l == "Draw with one finger instead of scrolling"), None, "the unlabelled hand is off the tool pill");
 
-    let zoom_menu = labelled(&h, |l| l.ends_with('%') && l.trim_end_matches('%').parse::<u32>().is_ok()).expect("the view menu");
-    click(&mut h, zoom_menu.center());
+    // Its home is the Tool Settings screen, behind the three dots on the tool bar.
+    let dots = labelled(&h, |l| l == "Tool settings").expect("the way to Tool Settings");
+    click(&mut h, dots.center());
+    h.step();
+    h.step();
     let switch = labelled(&h, |l| l == "Draw with finger").expect("a labelled Draw with finger switch");
     click(&mut h, switch.center());
     assert!(h.state().is_finger_drawing(), "the switch turns finger drawing on");

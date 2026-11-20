@@ -102,6 +102,14 @@ pub enum Act {
     FitAllContent,
     /// Show or fold away the infinite-canvas minimap.
     ToggleMinimap,
+    /// Move the Tablet Studio tool bar to an edge of the page view.
+    ToolbarDock(nocturne_engine::ToolbarDock),
+    /// Set which tools the Tablet Studio tool bar shows, and in what order.
+    DockRoster(nocturne_engine::DockRoster),
+    /// Open or close the Tool Settings screen.
+    ToggleToolSettings,
+    /// Turn hold to straighten on or off.
+    ToggleHoldToStraighten,
     /// Choose the pixel eraser (true) or the object eraser (false).
     EraserPixel(bool),
     /// Set how wide the eraser is, in tenths of a point across.

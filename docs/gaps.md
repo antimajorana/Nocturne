@@ -134,9 +134,8 @@ imports shared documents placed in `Documents/Inbox/` (Share > Nocturne), and re
     middle pressure, so it is taken for a pen and not a finger. Read from the winit and
     egui-winit sources; not seen on such a pencil.
   - Finger drawing is off by default, is remembered in `settings.toml`, and its switch in
-    Tablet Studio is the labelled `Draw with finger` entry in the view menu (the zoom
-    percentage). That place is temporary: the Tool Settings screen that will hold it is not
-    built yet.
+    Tablet Studio is the labelled `Draw with finger` entry of the Tool Settings screen (the
+    three dots on the tool bar).
 - **The two erasers and hold to straighten (2026-11-20) are tested on the host only.** What they
   do, and what is still open:
   - The eraser has a kind (`ink.eraser_mode`: `object` takes the whole stroke, `pixel` cuts out
@@ -163,6 +162,29 @@ imports shared documents placed in `Documents/Inbox/` (Share > Nocturne), and re
     the limit were not tried by hand on a pen.
   - The window keeps drawing frames while a stroke is in progress, as it did before; nothing
     was done to rest it while the pen is still.
+- **The movable tool bar, Tool Settings and the floating header of Tablet Studio (2026-11-20) are
+  tested on the host only, and were not looked at as pictures.** What they do, and what is open:
+  - The tool bar sits on the bottom, top, left or right edge of the page view (`ui.toolbar_dock`,
+    kept in `settings.toml`). It is moved by dragging its grip, which outlines the edge it
+    would land on, or from Tool Settings. On the left and right it runs down the page and
+    scrolls when it is taller than the view. What a tool opens (colours, the eraser's kinds,
+    shapes) is drawn on the side facing the page. The safe area and a docked keyboard are not
+    taken into account beyond what the page view already allows for.
+  - Which tools are on the bar and in what order is a setting (`ink.configure_tools`). The
+    tools are text, pens, eraser, lasso, select, shapes, and undo with redo. Picture and
+    equation recognition are not tools on the bar yet.
+  - Tool Settings (the three dots on the bar) holds Draw with finger, hold to straighten, the
+    eraser's kind, the bar's edge, the tools on the bar, and each kind of pen with its colours.
+    A pen's colours are places on the pen rack: up to 12 for one kind of pen, and 24 on the
+    rack in all, so not every kind can have 12 at once. The thickness shown is that of the pen
+    in hand. The pressure curve is still one setting for all pens.
+  - The pens on the bar are still drawn as the small pen pictures they were, not as the upright
+    colour-banded pens of the reference picture, and the pen in hand is outlined, not raised.
+  - With a page open, the bar across the top of the window is replaced by a small floating
+    header at the top left of the page: the drawer, a new page, sync, and three dots for back,
+    forward, search, the File screen and the view menu. It lies over the top left of the page,
+    title included. With no page open, the bar across the top is still drawn.
+  - The minimap is at the top right and moves clear of a tool bar docked at the top or right.
 - **Infomaniak kDrive sync (`api.infomaniak.com` on desktop and iPadOS) has only been verified against a loopback server in CI.**
   The kDrive REST v2/v3 client and two-phase 3-way reconciler (`crates/engine/src/sync/`) are
   tested against an in-process loopback HTTP server on desktop, and `ios/src/http.rs`

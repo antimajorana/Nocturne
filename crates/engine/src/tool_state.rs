@@ -192,6 +192,176 @@ impl InkOptions {
     }
 }
 
+/// The edge of the page view the Tablet Studio tool bar sits on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolbarDock {
+    #[default]
+    Bottom,
+    Top,
+    Left,
+    Right,
+}
+
+impl ToolbarDock {
+    pub const ALL: [Self; 4] = [Self::Bottom, Self::Top, Self::Left, Self::Right];
+
+    /// The stable identifier used by commands and in the settings file.
+    #[must_use]
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Bottom => "bottom",
+            Self::Top => "top",
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+
+    /// Parses a stable identifier (trimmed, ASCII case-insensitive).
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        let raw = raw.trim().to_ascii_lowercase();
+        Self::ALL.into_iter().find(|dock| dock.id() == raw)
+    }
+
+    /// A bar on the left or right edge runs down the page; on the top or bottom it runs across.
+    #[must_use]
+    pub fn is_vertical(self) -> bool {
+        matches!(self, Self::Left | Self::Right)
+    }
+}
+
+/// One of the things the Tablet Studio tool bar can hold. The pens are one entry: which pens,
+/// in what order and colours, is the pen rack's business.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DockTool {
+    Write,
+    Pens,
+    Eraser,
+    Lasso,
+    Select,
+    Shapes,
+    History,
+}
+
+impl DockTool {
+    /// Every tool, in the order a fresh install shows them.
+    pub const ALL: [Self; 7] = [Self::History, Self::Write, Self::Pens, Self::Eraser, Self::Lasso, Self::Select, Self::Shapes];
+
+    /// The stable identifier used by commands and in the settings file.
+    #[must_use]
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Write => "write",
+            Self::Pens => "pens",
+            Self::Eraser => "eraser",
+            Self::Lasso => "lasso",
+            Self::Select => "select",
+            Self::Shapes => "shapes",
+            Self::History => "history",
+        }
+    }
+
+    /// Parses a stable identifier (trimmed, ASCII case-insensitive).
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        let raw = raw.trim().to_ascii_lowercase();
+        Self::ALL.into_iter().find(|tool| tool.id() == raw)
+    }
+}
+
+/// Which tools the tool bar shows, and in what order. Every tool is always in the list once:
+/// a hidden tool keeps its place, so showing it again puts it back where it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DockRoster {
+    tools: [(DockTool, bool); 7],
+}
+
+impl Default for DockRoster {
+    fn default() -> Self {
+        Self { tools: DockTool::ALL.map(|tool| (tool, true)) }
+    }
+}
+
+impl DockRoster {
+    /// Every tool in order, each with whether it is shown.
+    #[must_use]
+    pub fn all(&self) -> [(DockTool, bool); 7] {
+        self.tools
+    }
+
+    /// The tools that are shown, in order.
+    pub fn shown(&self) -> impl Iterator<Item = DockTool> + '_ {
+        self.tools.iter().filter(|(_, shown)| *shown).map(|(tool, _)| *tool)
+    }
+
+    /// Shows or hides one tool.
+    pub fn set_shown(&mut self, tool: DockTool, shown: bool) {
+        if let Some(entry) = self.tools.iter_mut().find(|(t, _)| *t == tool) {
+            entry.1 = shown;
+        }
+    }
+
+    /// Moves one tool a place earlier or later. Returns whether it moved.
+    pub fn shift(&mut self, tool: DockTool, earlier: bool) -> bool {
+        let Some(at) = self.tools.iter().position(|(t, _)| *t == tool) else { return false };
+        let to = if earlier { at.checked_sub(1) } else { Some(at + 1).filter(|to| *to < self.tools.len()) };
+        let Some(to) = to else { return false };
+        self.tools.swap(at, to);
+        true
+    }
+
+    /// The list as it is kept in the settings file and given to `ink.configure_tools`: the
+    /// tools in order, comma separated, with a minus before a hidden one.
+    #[must_use]
+    pub fn write(&self) -> String {
+        self.tools.iter().map(|(tool, shown)| format!("{}{}", if *shown { "" } else { "-" }, tool.id())).collect::<Vec<_>>().join(",")
+    }
+
+    /// Reads such a list. A name it does not know is an error, so a command with a slip in it
+    /// changes nothing; a tool the list leaves out keeps its usual place after the ones named,
+    /// shown; a tool named twice counts the first time.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let mut named: Vec<(DockTool, bool)> = Vec::new();
+        for part in raw.split(',').map(str::trim).filter(|part| !part.is_empty()) {
+            let (shown, name) = part.strip_prefix('-').map_or((true, part), |rest| (false, rest.trim()));
+            let tool = DockTool::parse(name).ok_or_else(|| format!("{name:?} is not a tool"))?;
+            if !named.iter().any(|(t, _)| *t == tool) {
+                named.push((tool, shown));
+            }
+        }
+        for tool in DockTool::ALL {
+            if !named.iter().any(|(t, _)| *t == tool) {
+                named.push((tool, true));
+            }
+        }
+        let mut roster = Self::default();
+        for (slot, entry) in roster.tools.iter_mut().zip(named) {
+            *slot = entry;
+        }
+        Ok(roster)
+    }
+}
+
+/// How Tablet Studio is laid out: where the tool bar is, and what is on it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StudioOptions {
+    pub toolbar_dock: ToolbarDock,
+    pub roster: DockRoster,
+}
+
+impl StudioOptions {
+    pub(crate) const TOOLBAR_DOCK_KEY: &'static str = "toolbar_dock";
+    pub(crate) const DOCK_TOOLS_KEY: &'static str = "studio_dock_tools";
+
+    /// Reads the layout from the settings file. Anything missing or unreadable is the default.
+    pub(crate) fn load(settings: &nocturne_store::Settings) -> Self {
+        Self {
+            toolbar_dock: settings.get(Self::TOOLBAR_DOCK_KEY).and_then(|v| ToolbarDock::parse(&v)).unwrap_or_default(),
+            roster: settings.get(Self::DOCK_TOOLS_KEY).and_then(|v| DockRoster::parse(&v).ok()).unwrap_or_default(),
+        }
+    }
+}
+
 /// Synchronized ink tool state tracked by [`crate::Session`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InkToolState {

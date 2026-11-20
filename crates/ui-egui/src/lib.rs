@@ -64,6 +64,7 @@ pub mod telemetry_export;
 #[cfg(test)]
 mod testing_dir;
 pub mod theme;
+pub mod tool_settings;
 pub mod touch_ux;
 
 pub use app::{NocturneApp, PlatformEditAction, PlatformTextField};
