@@ -1209,7 +1209,7 @@ pub fn show_with_touch_and_handles(
             let text = nocturne_formats::render::blocks_to_text(held);
             out.copy = Some((html, text));
         }
-        let outside = ui.input(|i| i.pointer.any_click()) && !opened_now && !area.rect.contains(pointer.unwrap_or_default());
+        let outside = floating::pressed_outside(ui, opened_now, |p| area.rect.contains(p));
         if picked || outside || ui.input(|i| i.key_pressed(Key::Escape)) {
             menu_at = None;
         }

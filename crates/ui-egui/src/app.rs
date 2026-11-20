@@ -130,6 +130,41 @@ fn stay_above(ui: &Ui, backdrop: egui::LayerId) {
     ui.ctx().set_sublayer(backdrop, ui.layer_id());
 }
 
+/// The text boxes a platform keyboard types into besides the page: each has a fixed id, so the
+/// window can say which one has the keyboard ([`NocturneApp::focused_text_field`]).
+const RENAME_FIELD: &str = "rename-title-field";
+const ADD_FIELD: &str = "add-title-field";
+const NEW_NOTEBOOK_FIELD: &str = "new-notebook-name-field";
+pub(crate) const SEARCH_FIELD: &str = "search-all-pages-field";
+
+/// The one-line name box of a dialog. It asks for the keyboard when the dialog opens, and again
+/// after a click that left nothing with the keyboard, and at no other time.
+///
+/// It used to ask on every frame. That kept typing and Enter working after a click on another
+/// of the dialog's controls, which takes the keyboard from the box as a click anywhere else
+/// does. On an iPad it also made the keyboard drop and rise on every frame. So the box now
+/// gets the keyboard back once such a click is over, and a keyboard put away without a click
+/// (the iPad's own hide key) stays away.
+fn name_field(ui: &mut Ui, text: &mut String, id: &str, opened_now: bool) -> egui::Response {
+    let id = egui::Id::new(id);
+    // A window's first frame only measures it: its widgets are disabled there, and a text box
+    // that is disabled gives the keyboard straight back. So the one request waits for the
+    // first frame the box can take it.
+    let waiting = id.with("wants-keyboard");
+    if opened_now {
+        ui.data_mut(|d| d.insert_temp(waiting, true));
+    }
+    if ui.is_enabled() && !ui.is_sizing_pass() && ui.data_mut(|d| d.remove_temp::<bool>(waiting)).unwrap_or(false) {
+        ui.memory_mut(|m| m.request_focus(id));
+    }
+    let response = ui.add(egui::TextEdit::singleline(text).id(id));
+    if ui.input(|i| i.pointer.any_click()) && ui.memory(|m| m.focused().is_none()) {
+        ui.data_mut(|d| d.insert_temp(waiting, true));
+        ui.ctx().request_repaint();
+    }
+    response
+}
+
 /// Modal actions use a readable size based on their label instead of egui's compact default.
 // i18n-ui-text: label
 fn modal_button(ui: &mut Ui, tokens: &Tokens, label: &str, primary: bool) -> egui::Response {
@@ -707,7 +742,7 @@ fn page_title(ui: &mut Ui, ed: &mut Editor, tokens: &Tokens, title_id: egui::Id,
             .return_key(None)
             .show(ui);
         if ed.title_buf.contains(['\n', '\r']) {
-            ed.title_buf = one_line(&ed.title_buf);
+            ed.title_buf = line_breaks_to_spaces(&ed.title_buf);
         }
         let tapped_title = tap_at.is_some_and(|p| out.response.rect.contains(p));
         if tapped_title {
@@ -776,9 +811,12 @@ fn table_size(rows: &str, columns: &str) -> Option<(usize, usize)> {
     Some((r, c))
 }
 
-/// A title as one line: the line breaks a paste brought in become single spaces.
-fn one_line(text: &str) -> String {
-    text.split(['\n', '\r']).map(str::trim).filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" ")
+/// What is typed or pasted into a title, kept on one line: each line break becomes one space,
+/// and nothing else is touched. Spaces are not trimmed here. A space arrives from the iPad
+/// keyboard as a text of its own, and trimming it left titles with no spaces at all
+/// (two words arrived as one). The ends are trimmed once, when the title is saved.
+fn line_breaks_to_spaces(text: &str) -> String {
+    text.replace("\r\n", " ").replace(['\n', '\r'], " ")
 }
 
 /// What to do with a file the user dropped on a page.
@@ -984,6 +1022,15 @@ pub enum PlatformEditAction {
     Delete,
 }
 
+/// The one-line text field that has the keyboard, as a platform keyboard needs to see it: all
+/// of its text and where the selection is, in characters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlatformTextField {
+    pub text: String,
+    /// `(start, end)` of the selection in characters, in order. Equal when it is only a caret.
+    pub selection: (usize, usize),
+}
+
 const TOUCH_PAN_SLOP: f32 = 8.0;
 const SOFT_KEYBOARD_MIN_INSET_PTS: f32 = 80.0;
 
@@ -1057,7 +1104,6 @@ pub struct NocturneApp {
     last_ctx_is_ios: bool,
     status: String,
     status_is_error: bool,
-    status_shown_at: Option<Instant>,
     /// The host keeps notebook files only for this session, rather than on durable storage.
     session_only_storage: bool,
     search: String,
@@ -1202,6 +1248,14 @@ pub struct NocturneApp {
     page_opened: bool,
     /// Put the keyboard in the search box on the next frame.
     focus_search: bool,
+    /// The kind of dialog drawn last frame, so a dialog knows the frame it opens in.
+    dialog_shown: Option<std::mem::Discriminant<Dialog>>,
+    /// The failure banner of Tablet Studio: tapped away, and whether it was drawn last frame.
+    status_banner_dismissed: Option<String>,
+    status_banner_drawn: bool,
+    /// A pen is writing while a finger or palm is also on the glass: until the pen lifts, the
+    /// ink reads the pen's own touch and not the window's pointer (`stylus::StylusFrame`).
+    pen_reads_own_touch: bool,
     /// The page the window closed on has been opened again (once per run).
     restored: bool,
     /// Recovery warnings that were already shown during this run.
@@ -1304,7 +1358,6 @@ impl NocturneApp {
             last_ctx_is_ios: cfg!(target_os = "ios"),
             status: crate::tl_id!("ui.ready_2").into(),
             status_is_error: false,
-            status_shown_at: None,
             session_only_storage: false,
             search: String::new(),
             searched: String::new(),
@@ -1383,6 +1436,10 @@ impl NocturneApp {
             compact_full_page: false,
             page_opened: false,
             focus_search: false,
+            dialog_shown: None,
+            status_banner_dismissed: None,
+            status_banner_drawn: false,
+            pen_reads_own_touch: false,
             restored: false,
             icon_recovery_reported: HashSet::new(),
             icon_recovery_suppressed: false,
@@ -2223,7 +2280,7 @@ impl NocturneApp {
                 }
                 PlatformEditAction::Paste => {
                     if let Some(text) = self.clipboard.text() {
-                        let clean = one_line(&text);
+                        let clean = line_breaks_to_spaces(&text);
                         if let Some(ed) = self.editor.as_mut() {
                             let end = ed.title_buf.chars().count();
                             let sel = ed.title_selection.unwrap_or((end, end));
@@ -2341,10 +2398,7 @@ impl NocturneApp {
         }
         let Some(ed) = self.editor.as_mut() else { return };
         if ed.title_focused {
-            let clean = one_line(text);
-            if clean.is_empty() {
-                return;
-            }
+            let clean = line_breaks_to_spaces(text);
             let end = ed.title_buf.chars().count();
             let sel = ed.title_selection.unwrap_or((end, end));
             let (next, at) = pageedit::insert_at_caret(&ed.title_buf, sel, &clean);
@@ -2397,15 +2451,15 @@ impl NocturneApp {
                 ed.restore_format_selection = Some((c.block, c.selection.0, c.selection.1));
             }
         }
-        ed.rebuild_body();
-        Self::mark_dirty_from_blocks(ed);
         if has_open_across {
+            ed.rebuild_body();
+            Self::mark_dirty_from_blocks(ed);
             Self::remember_edit(ed);
             if across_marks.0 || across_marks.1 {
                 self.save_block_marks(across_marks);
             }
         } else {
-            Self::remember_step(ed);
+            Self::note_typing(ed);
         }
     }
 
@@ -2490,9 +2544,7 @@ impl NocturneApp {
                 ed.restore_format_selection = Some((c.block, c.selection.0, c.selection.1));
             }
         }
-        ed.rebuild_body();
-        Self::mark_dirty_from_blocks(ed);
-        Self::remember_step(ed);
+        Self::note_typing(ed);
     }
 
     /// Joins the caret's line onto the line above for [`Self::delete_backward_platform`]. The
@@ -2768,7 +2820,6 @@ impl NocturneApp {
     pub fn say(&mut self, msg: impl Into<String>) {
         self.status = msg.into();
         self.status_is_error = false;
-        self.status_shown_at = Some(Instant::now());
     }
 
     /// Says something went wrong, in our own words rather than the engine's.
@@ -2778,13 +2829,15 @@ impl NocturneApp {
     pub fn alert(&mut self, key: &str, title: &str, message: &str) {
         self.status = message.to_string();
         self.status_is_error = true;
-        self.status_shown_at = Some(Instant::now());
         if self.muted_alerts.contains(key) {
             return;
         }
         if self.session.settings.get(&format!("{key}_never")).as_deref() == Some("true") {
             return;
         }
+        // A box says it, so Tablet Studio's failure banner does not say it again once the box is
+        // closed. An alert the user has muted has no box, and the banner is then how it is seen.
+        self.status_banner_dismissed = Some(self.status.clone());
         let showing = matches!(&self.dialog, Some(Dialog::Alert { key: k, .. }) if k == key);
         let queued = self.queued_alerts.iter().any(|d| matches!(d, Dialog::Alert { key: k, .. } if k == key));
         if showing || queued {
@@ -2802,13 +2855,11 @@ impl NocturneApp {
     fn complain(&mut self, msg: &str) {
         self.status = msg.to_string();
         self.status_is_error = true;
-        self.status_shown_at = Some(Instant::now());
     }
 
     fn fail(&mut self, e: &EngineError) {
         self.status = crate::i18n::format_message_id("ui.could_not_complete_the_action_error", &[("error", &e.to_string())]);
         self.status_is_error = true;
-        self.status_shown_at = Some(Instant::now());
     }
 
     fn run(&mut self, id: &str, p: &Params) -> Option<Output> {
@@ -3578,9 +3629,9 @@ impl NocturneApp {
             Act::Add(parent, parent_kind) => {
                 let kind = parent_kind.may_contain().first().copied().unwrap_or(NodeKind::Page);
                 let kind = if parent_kind == NodeKind::Notebook || parent_kind == NodeKind::SectionGroup { NodeKind::Section } else { kind };
-                self.dialog = Some(Dialog::Add { parent, parent_kind, title: String::new(), kind, format: None });
+                self.open_add_dialog(parent, parent_kind, kind);
             }
-            Act::NewNotebook => self.dialog = Some(Dialog::NewNotebook { name: String::new(), format: None }),
+            Act::NewNotebook => self.open_new_notebook_dialog(),
             Act::CloseNotebook(path) => {
                 self.save_now();
                 let was_showing = self.editor.as_ref().is_some_and(|ed| ed.dir.starts_with(&path));
@@ -3604,7 +3655,7 @@ impl NocturneApp {
             }
             Act::ChooseRoot => self.choose_notebooks_folder(),
             Act::AddKind(parent, parent_kind, kind) => {
-                self.dialog = Some(Dialog::Add { parent, parent_kind, title: String::new(), kind, format: None });
+                self.open_add_dialog(parent, parent_kind, kind);
             }
             Act::AddPageAt(section, order) => {
                 let path = path_str(&section);
@@ -3634,7 +3685,7 @@ impl NocturneApp {
                 }
             }
             Act::NewPage(parent) => self.create_page_in(&parent),
-            Act::Rename(path, title) => self.dialog = Some(Dialog::Rename { path, title }),
+            Act::Rename(path, title) => self.open_rename_dialog(path, title),
             Act::MoveOrCopy(path) => self.open_move_or_copy(&path),
             Act::MakeSubpage(path) => self.reparent_page(&path, "node.demote"),
             Act::PromoteSubpage(path) => self.reparent_page(&path, "node.promote"),
@@ -4335,8 +4386,12 @@ impl NocturneApp {
         // on a phone it does not run over the Quick Access Toolbar.
         let left_used = left.min_rect().right() - row.left();
         let search_width = (right.available_width() - left_used - 8.0).clamp(60.0, 200.0);
-        let resp =
-            right.add(egui::TextEdit::singleline(&mut self.search).hint_text(crate::tl_id!("ui.search_all_pages")).desired_width(search_width));
+        let resp = right.add(
+            egui::TextEdit::singleline(&mut self.search)
+                .id(egui::Id::new(SEARCH_FIELD))
+                .hint_text(crate::tl_id!("ui.search_all_pages"))
+                .desired_width(search_width),
+        );
         if self.focus_search {
             resp.request_focus();
             self.focus_search = false;
@@ -6182,10 +6237,27 @@ impl NocturneApp {
     }
 
     fn remember(ed: &mut Editor, edit: bool) {
+        Self::remember_saved(ed, edit, None);
+    }
+
+    /// A letter typed or deleted by the platform keyboard, with the caret staying in its block:
+    /// the page's text is written once here, and the page as it would be saved is worked out
+    /// once and used both to say whether there is something to save and by what undo remembers.
+    /// Each of those used to work it out again, on every letter.
+    fn note_typing(ed: &mut Editor) {
+        ed.rebuild_body();
+        let saved = ed.body_to_save();
+        let file_will_hold = ed.saving.as_ref().unwrap_or(&ed.saved_body);
+        ed.dirty_since = (saved != *file_will_hold).then(Instant::now);
+        Self::remember_saved(ed, false, Some(saved));
+    }
+
+    /// [`Self::remember`], given the page as it would be saved when the caller already has it.
+    fn remember_saved(ed: &mut Editor, edit: bool, saved: Option<String>) {
         let same = ed.history.here().is_some_and(|s| s.body == ed.body && s.blocks == ed.blocks && s.boxes == ed.boxes);
         if same || {
             // Only the cursor's place on open paper came or went: the page is the one remembered.
-            let saved = ed.body_to_save();
+            let saved = saved.unwrap_or_else(|| ed.body_to_save());
             saved != ed.body && ed.history.here().is_some_and(|s| s.body == saved)
         } {
             // Nothing really changed, or the page was just put back by undo itself. A column
@@ -6482,6 +6554,72 @@ impl NocturneApp {
 
     pub fn ink_stroke_count(&self) -> usize {
         self.pad.as_ref().map_or(0, crate::inkpad::Pad::strokes)
+    }
+
+    /// The box around all the page's ink, `[x0, y0, x1, y1]` in page points, when there is any.
+    pub fn ink_bounds(&self) -> Option<[f32; 4]> {
+        self.pad.as_ref().and_then(crate::inkpad::Pad::bounds)
+    }
+
+    /// True while the page's title has the keyboard.
+    pub fn title_is_focused(&self) -> bool {
+        self.editor.as_ref().is_some_and(|ed| ed.title_focused)
+    }
+
+    /// The page's title as it is being typed, before it is saved.
+    pub fn title_draft(&self) -> Option<&str> {
+        self.editor.as_ref().map(|ed| ed.title_buf.as_str())
+    }
+
+    /// True while Tablet Studio is showing a failure in its banner.
+    pub fn status_banner_showing(&self) -> bool {
+        self.status_banner_drawn
+    }
+
+    /// The one-line field that has the keyboard, with all of its text and its selection: the
+    /// name box of Rename, Add or New notebook, the page title, or search. `None` when the
+    /// keyboard is in the page's words or nowhere.
+    ///
+    /// A platform keyboard needs the whole field. Given an empty one it believes there is
+    /// nothing to delete, and it has no words to find boundaries in for its suggestions.
+    pub fn focused_text_field(&self, ctx: &Context) -> Option<PlatformTextField> {
+        let focused = ctx.memory(|m| m.focused())?;
+        let is = |id: &str| focused == egui::Id::new(id);
+        let (text, selection) = match &self.dialog {
+            Some(Dialog::Rename { title, .. }) if is(RENAME_FIELD) => (title.as_str(), None),
+            Some(Dialog::Add { title, .. }) if is(ADD_FIELD) => (title.as_str(), None),
+            Some(Dialog::NewNotebook { name, .. }) if is(NEW_NOTEBOOK_FIELD) => (name.as_str(), None),
+            Some(_) => return None,
+            None if is(SEARCH_FIELD) => (self.search.as_str(), None),
+            None => {
+                let ed = self.editor.as_ref().filter(|ed| ed.title_focused)?;
+                (ed.title_buf.as_str(), ed.title_selection)
+            }
+        };
+        let len = text.chars().count();
+        let (a, b) = selection
+            .or_else(|| {
+                let range = egui::TextEdit::load_state(ctx, focused)?.cursor.char_range()?;
+                Some((range.primary.index.0, range.secondary.index.0))
+            })
+            .unwrap_or((len, len));
+        let (a, b) = (a.min(len), b.min(len));
+        Some(PlatformTextField { text: text.to_string(), selection: (a.min(b), a.max(b)) })
+    }
+
+    /// Asks for a new title for the notebook, section or page at `path`.
+    pub fn open_rename_dialog(&mut self, path: PathBuf, title: String) {
+        self.dialog = Some(Dialog::Rename { path, title });
+    }
+
+    /// Asks for the name of a new notebook.
+    pub fn open_new_notebook_dialog(&mut self) {
+        self.dialog = Some(Dialog::NewNotebook { name: String::new(), format: None });
+    }
+
+    /// Asks what to add inside `parent`, offering `kind` first.
+    pub fn open_add_dialog(&mut self, parent: PathBuf, parent_kind: NodeKind, kind: NodeKind) {
+        self.dialog = Some(Dialog::Add { parent, parent_kind, title: String::new(), kind, format: None });
     }
 
     pub fn ribbon_act_for_test(&mut self, act: ribbon::Act) {
@@ -8596,6 +8734,19 @@ impl NocturneApp {
         let stylus_active = self.stylus.has_active_stylus();
         let finger_count = self.stylus.active_finger_count();
         let pointer_origin = self.stylus.pointer_origin();
+        // The window's pointer follows only the first contact on the glass. With a palm resting
+        // there it is the palm's, and ink read from the pointer was drawn at the palm. So once a
+        // pen is down beside a finger or palm, and until that pen lifts, the ink reads the pen's
+        // own touch. A pen alone keeps the ordinary pointer path.
+        let pen_frame = self.stylus.stylus_frame();
+        self.pen_reads_own_touch = pen_frame.is_some() && (self.pen_reads_own_touch || finger_count > 0);
+        let pen_frame = pen_frame.filter(|_| self.pen_reads_own_touch);
+        ui.ctx().data_mut(|d| match pen_frame {
+            Some(frame) => {
+                d.insert_temp(crate::stylus::StylusFrame::id(), frame);
+            }
+            None => d.remove::<crate::stylus::StylusFrame>(crate::stylus::StylusFrame::id()),
+        });
         let multi_touch_active = !stylus_active && (finger_count >= 2 || ui.input(|i| i.multi_touch().is_some()));
         let finger_drawing = self.is_finger_drawing();
         let touch_sized = self.stylus.touch_affordance_active() || ui.ctx().os() == egui::os::OperatingSystem::IOS;
@@ -9377,13 +9528,6 @@ impl NocturneApp {
                         }
                     }
                 }
-                if tablet_studio
-                    && let Some(shown_at) = self.status_shown_at
-                    && shown_at.elapsed() < std::time::Duration::from_secs(4)
-                {
-                    crate::tablet_chrome::show_transient_notice(ui.ctx(), view, &self.status, self.status_is_error, &tokens);
-                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
-                }
             }
             if changed {
                 Self::mark_dirty(ed);
@@ -9649,7 +9793,16 @@ impl NocturneApp {
                 self.dialog = Some(next);
             }
         }
-        let Some(dialog) = self.dialog.take() else { return };
+        let Some(dialog) = self.dialog.take() else {
+            self.dialog_shown = None;
+            return;
+        };
+        // The first frame a dialog is drawn in is when its text box asks for the keyboard. Asking
+        // on every frame took the keyboard away and gave it back each frame, which on an iPad is
+        // the keyboard dropping and rising, and its suggestions starting over.
+        let kind = std::mem::discriminant(&dialog);
+        let opened_now = self.dialog_shown != Some(kind);
+        self.dialog_shown = Some(kind);
         // Page loading and native Shell icon generation can finish between the
         // recovery scan and the frame that presents this modal. Re-check the
         // filesystem so a healthy sidecar never produces a stale warning.
@@ -10141,10 +10294,8 @@ impl NocturneApp {
                         modal_title(ui, &self.tokens, crate::tl_id!("ui.new_notebook"));
                         ui.set_min_width(420.0);
                         ui.label(crate::tl_id!("ui.name_2"));
-                        let r = ui.text_edit_singleline(name);
-                        // Read Enter before asking for focus again: a new focus request hides the lost focus.
+                        let r = name_field(ui, name, NEW_NOTEBOOK_FIELD, opened_now);
                         let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                        r.request_focus();
                         format_picker(ui, format);
                         ui.add_space(12.0);
                         ui.horizontal(|ui| {
@@ -10179,6 +10330,7 @@ impl NocturneApp {
                     let kind = crate::tl!(parent_kind.label());
                     crate::i18n::format_message_id("ui.add_inside_this_kind", &[("kind", &kind.to_lowercase())])
                 };
+                let backdrop = modal_backdrop(ctx, "add-modal-backdrop");
                 egui::Window::new(heading.clone())
                     .title_bar(false)
                     .collapsible(false)
@@ -10187,6 +10339,7 @@ impl NocturneApp {
                     .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
                     .frame(modal_frame(&self.tokens))
                     .show(ctx, |ui| {
+                        stay_above(ui, backdrop);
                         modal_title(ui, &self.tokens, &heading);
                         ui.set_min_width(420.0);
                         let kinds = parent_kind.may_contain();
@@ -10199,10 +10352,8 @@ impl NocturneApp {
                             });
                         }
                         ui.label(crate::tl_id!("ui.title_2"));
-                        let r = ui.text_edit_singleline(title);
-                        // Read Enter before asking for focus again: a new focus request hides the lost focus.
+                        let r = name_field(ui, title, ADD_FIELD, opened_now);
                         let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                        r.request_focus();
                         ui.label(if *kind == NodeKind::Page {
                             crate::tl_id!("ui.format_for_this_page")
                         } else {
@@ -10359,24 +10510,32 @@ impl NocturneApp {
             }
             Dialog::Rename { path, title } => {
                 let mut go = false;
-                egui::Window::new(crate::tl_id!("ui.rename")).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(
-                    ctx,
-                    |ui| {
+                let backdrop = modal_backdrop(ctx, "rename-modal-backdrop");
+                egui::Window::new(crate::tl_id!("ui.rename"))
+                    .title_bar(false)
+                    .collapsible(false)
+                    .resizable(false)
+                    .order(egui::Order::Foreground)
+                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+                    .frame(modal_frame(&self.tokens))
+                    .show(ctx, |ui| {
+                        stay_above(ui, backdrop);
+                        modal_title(ui, &self.tokens, crate::tl_id!("ui.rename"));
+                        ui.set_min_width(420.0);
                         ui.label(crate::tl_id!("ui.title_the_folder_name_does_not_change"));
-                        let r = ui.text_edit_singleline(title);
-                        // Read Enter before asking for focus again: a new focus request hides the lost focus.
+                        let r = name_field(ui, title, RENAME_FIELD, opened_now);
                         let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                        r.request_focus();
+                        ui.add_space(12.0);
                         ui.horizontal(|ui| {
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.cancel"), false).clicked() {
+                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.cancel"), false).clicked() || ui.input(|i| i.key_pressed(Key::Escape))
+                            {
                                 keep = false;
                             }
                             if (modal_button(ui, &self.tokens, crate::tl_id!("ui.rename"), true).clicked() || enter) && !title.trim().is_empty() {
                                 go = true;
                             }
                         });
-                    },
-                );
+                    });
                 if go {
                     if self.run("node.title", &params(&[("path", &path_str(path)), ("title", title.trim())])).is_some() {
                         if self.editor.as_ref().map(|e| e.dir == *path).unwrap_or(false) {
@@ -10844,6 +11003,9 @@ impl NocturneApp {
         }
         if keep {
             self.dialog = Some(next);
+        } else {
+            // Closed: a dialog of the same kind opened next is a new one.
+            self.dialog_shown = None;
         }
     }
 
@@ -11446,13 +11608,21 @@ impl NocturneApp {
             self.page_rect = None;
             self.page_view_rect = None;
         }
-        if self.editor.is_none()
-            && self.is_tablet_studio(ctx)
-            && let Some(shown_at) = self.status_shown_at
-            && shown_at.elapsed() < std::time::Duration::from_secs(4)
-        {
-            crate::tablet_chrome::show_transient_notice(ctx, ctx.content_rect(), &self.status, self.status_is_error, &self.tokens);
-            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        // Tablet Studio has no status bar. Routine messages are not shown there; a failure is,
+        // on one line, until it is tapped. A dialog that is open says the failure itself.
+        // What was tapped away is remembered by its words, and forgotten when the next message
+        // that is not a failure arrives.
+        if !self.status_is_error {
+            self.status_banner_dismissed = None;
+        }
+        self.status_banner_drawn = self.is_tablet_studio(ctx)
+            && self.status_is_error
+            && self.dialog.is_none()
+            && !self.status.trim().is_empty()
+            && self.status_banner_dismissed.as_deref() != Some(self.status.as_str());
+        if self.status_banner_drawn && crate::tablet_chrome::show_error_banner(ctx, ctx.content_rect(), &self.status, &self.tokens) {
+            self.status_banner_dismissed = Some(self.status.clone());
+            self.status_banner_drawn = false;
         }
         self.paint_formatting(ctx);
         self.laser_keys(ctx);

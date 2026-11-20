@@ -44,6 +44,35 @@ pub fn apply_mobile_touch_style(style: &mut egui::Style) {
     style.spacing.button_padding.y = style.spacing.button_padding.y.max(6.0);
     style.spacing.item_spacing.y = style.spacing.item_spacing.y.max(6.0);
     style.spacing.scroll.bar_width = style.spacing.scroll.bar_width.max(10.0);
+    // A finger does not hover. A tooltip on a touch screen appears under the finger that is
+    // pressing the button and stays there. The delay is long, not infinite: egui makes a
+    // Duration of it.
+    style.interaction.tooltip_delay = style.interaction.tooltip_delay.max(NO_HOVER_TOOLTIP_DELAY_SECS);
+}
+
+/// A tooltip delay long enough that no tooltip is ever shown.
+pub const NO_HOVER_TOOLTIP_DELAY_SECS: f32 = 1.0e6;
+
+/// Where a pointer is sent to let go of a press without clicking what is under the finger.
+pub const OFFSCREEN_RELEASE_POS: egui::Pos2 = egui::pos2(-10_000.0, -10_000.0);
+
+/// The pressure given to a pen that reports none.
+pub const PENCIL_FALLBACK_PRESSURE: f32 = 0.5;
+
+/// Gives a pen that reports no usable pressure a middle one.
+///
+/// On an iPad a touch carries a force only when it is a Pencil (a finger carries none), and the
+/// window layer reports it as force over the most the pen can report. A Pencil with no pressure
+/// sensor reports 0 over 0, which is not a number. Left alone, that reading is thrown away and
+/// the pen is taken for a finger. Call this on the iPad's events before anything reads them.
+pub fn normalize_pencil_force(events: &mut [egui::Event]) {
+    for event in events {
+        if let egui::Event::Touch { force: Some(force), .. } = event
+            && !force.is_finite()
+        {
+            *force = PENCIL_FALLBACK_PRESSURE;
+        }
+    }
 }
 
 /// Per-frame two-finger pan, vertical scroll, and optional clamped zoom update.
@@ -81,6 +110,8 @@ struct PendingLongPress {
 pub struct TouchLongPress {
     active_touches: BTreeSet<egui::TouchId>,
     pending: Option<PendingLongPress>,
+    /// The finger whose long press became a context click, until it lifts.
+    consumed: Option<egui::TouchId>,
 }
 
 impl TouchLongPress {
@@ -120,6 +151,51 @@ impl TouchLongPress {
             return Some(pending.start_pos);
         }
         None
+    }
+
+    /// Turns the long press that [`Self::update`] just reported at `pos` into a context click,
+    /// and uses the finger up: see [`Self::filter_consumed`].
+    ///
+    /// The finger is still on the glass, so the window still holds its primary press. That press
+    /// is let go first, off screen so it clicks nothing. A secondary click made while the primary
+    /// button is down leaves egui with a press that has no start time, and the finger's lift
+    /// then counts as a click: it closed the menu this opens.
+    pub fn consume_as_context_click(&mut self, events: &mut Vec<egui::Event>, pos: egui::Pos2) {
+        let button = |button, pressed, pos| egui::Event::PointerButton { pos, button, pressed, modifiers: egui::Modifiers::NONE };
+        events.extend([
+            egui::Event::PointerMoved(OFFSCREEN_RELEASE_POS),
+            button(egui::PointerButton::Primary, false, OFFSCREEN_RELEASE_POS),
+            egui::Event::PointerMoved(pos),
+            button(egui::PointerButton::Secondary, true, pos),
+            button(egui::PointerButton::Secondary, false, pos),
+        ]);
+        self.consumed = self.pending.map(|pending| pending.id);
+    }
+
+    /// Drops what is left of a finger that [`Self::consume_as_context_click`] used up. Call it on
+    /// each frame's events before [`Self::update`].
+    ///
+    /// Until that finger lifts, its moves and the pointer events the window makes from them are
+    /// dropped, and its lift arrives as a cancelled touch: the contact is over, and it was not a
+    /// tap on the page. Other contacts are left alone.
+    pub fn filter_consumed(&mut self, events: &mut Vec<egui::Event>) {
+        let Some(consumed) = self.consumed else { return };
+        let mut lifted = false;
+        events.retain_mut(|event| match event {
+            egui::Event::Touch { id, phase, .. } if *id == consumed => match phase {
+                egui::TouchPhase::Start | egui::TouchPhase::Move => false,
+                egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+                    *phase = egui::TouchPhase::Cancel;
+                    lifted = true;
+                    true
+                }
+            },
+            egui::Event::PointerMoved(_) | egui::Event::PointerButton { button: egui::PointerButton::Primary, .. } => false,
+            _ => true,
+        });
+        if lifted {
+            self.consumed = None;
+        }
     }
 
     /// Returns the delay until the armed long press should be re-evaluated, or `None` when idle or fired.
@@ -195,6 +271,77 @@ mod tests {
         options.input_options.max_click_dist = 16.0;
         apply_mobile_touch_input_options(&mut options);
         assert_eq!(options.input_options.max_click_dist, 16.0);
+    }
+
+    fn button(primary: bool, pressed: bool, pos: Pos2) -> Event {
+        let button = if primary { egui::PointerButton::Primary } else { egui::PointerButton::Secondary };
+        Event::PointerButton { pos, button, pressed, modifiers: egui::Modifiers::NONE }
+    }
+
+    #[test]
+    fn long_press_context_click_lets_go_of_the_finger_first_and_eats_its_lift() {
+        let mut lp = TouchLongPress::default();
+        let p = pos2(120.0, 240.0);
+        let mut down = vec![touch(1, Start, p, None), Event::PointerMoved(p), button(true, true, p)];
+        lp.filter_consumed(&mut down);
+        assert_eq!(down.len(), 3, "nothing is consumed before the long press fires");
+        assert_eq!(lp.update(0.0, &down), None);
+
+        let mut held: Vec<Event> = Vec::new();
+        lp.filter_consumed(&mut held);
+        let at = lp.update(0.55, &held).expect("long press fires");
+        lp.consume_as_context_click(&mut held, at);
+        assert_eq!(
+            held,
+            vec![
+                Event::PointerMoved(OFFSCREEN_RELEASE_POS),
+                button(true, false, OFFSCREEN_RELEASE_POS),
+                Event::PointerMoved(p),
+                button(false, true, p),
+                button(false, false, p),
+            ],
+            "the primary button is let go off screen before the secondary click"
+        );
+
+        // The finger wobbles, then lifts: none of it reaches egui as a pointer, and the touch ends
+        // as a cancel, so the page does not read it as a tap.
+        let mut wobble = vec![touch(1, Move, p + vec2(2.0, 1.0), None), Event::PointerMoved(p + vec2(2.0, 1.0))];
+        lp.filter_consumed(&mut wobble);
+        assert_eq!(wobble, Vec::new());
+        let mut lift = vec![touch(1, End, p, None), button(true, false, p), Event::PointerGone];
+        lp.filter_consumed(&mut lift);
+        assert_eq!(lift, vec![touch(1, Cancel, p, None), Event::PointerGone]);
+        assert_eq!(lp.update(0.9, &lift), None);
+
+        // The next tap is an ordinary tap again.
+        let mut tap = vec![touch(2, Start, p, None), Event::PointerMoved(p), button(true, true, p)];
+        lp.filter_consumed(&mut tap);
+        assert_eq!(tap.len(), 3);
+    }
+
+    #[test]
+    fn pencil_without_pressure_gets_the_fallback_and_fingers_stay_fingers() {
+        let p = pos2(10.0, 20.0);
+        let mut events =
+            vec![touch(1, Start, p, Some(f32::NAN)), touch(1, Move, p, Some(f32::INFINITY)), touch(2, Start, p, None), touch(3, Move, p, Some(0.3))];
+        normalize_pencil_force(&mut events);
+        assert_eq!(
+            events,
+            vec![
+                touch(1, Start, p, Some(PENCIL_FALLBACK_PRESSURE)),
+                touch(1, Move, p, Some(PENCIL_FALLBACK_PRESSURE)),
+                touch(2, Start, p, None),
+                touch(3, Move, p, Some(0.3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn mobile_touch_style_never_shows_hover_tooltips() {
+        let mut style = egui::Style::default();
+        apply_mobile_touch_style(&mut style);
+        assert!(style.interaction.tooltip_delay >= 1.0e5, "a finger does not hover: {}", style.interaction.tooltip_delay);
+        assert!(style.interaction.tooltip_delay.is_finite(), "egui turns the delay into a Duration");
     }
 
     #[test]

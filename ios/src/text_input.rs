@@ -110,6 +110,23 @@ pub fn should_route_ime_to_egui(
     false
 }
 
+/// Whether the keyboard's text goes to egui's own text box this frame.
+///
+/// As [`should_route_ime_to_egui`], and the page title as well. The title is an egui text box.
+/// It used to be typed into by the app instead, through a path that trimmed each piece of
+/// text, and a space typed on its own was trimmed to nothing. The text box types its own
+/// letters, spaces included.
+#[must_use]
+pub fn route_ime_to_egui(
+    title_focused: bool,
+    ime_cursor_rect: Option<egui::Rect>,
+    caret_rect: Option<egui::Rect>,
+    page_rect: Option<egui::Rect>,
+    ctx: &egui::Context,
+) -> bool {
+    ime_cursor_rect.is_some() && (title_focused || should_route_ime_to_egui(ime_cursor_rect, caret_rect, page_rect, ctx))
+}
+
 /// Maps a [`TextEditAction`] to [`PlatformEditAction`].
 #[must_use]
 pub const fn map_text_edit_action(action: TextEditAction) -> PlatformEditAction {
@@ -257,14 +274,12 @@ pub fn dispatch_pending_text_commands_with_context(
                         return true;
                     }
                     *focus_wait_frames = 0;
+                    // All of the move in this frame. An egui text box takes its key events in
+                    // order within a frame, so the text queued behind a move lands in the same
+                    // frame. One step a frame held a typed space back behind every move.
                     let key = if delta > 0 { egui::Key::ArrowRight } else { egui::Key::ArrowLeft };
-                    push_key_press_release(&mut raw_input.events, key, egui::Modifiers::NONE);
-                    let rem = if delta > 0 { delta - 1 } else { delta + 1 };
-                    if rem != 0 {
-                        queue.push_front(TextEditCommand::MoveCursor(rem));
-                    }
-                    if !queue.is_empty() {
-                        return true;
+                    for _ in 0..delta.unsigned_abs().min(MAX_WINDOW_UTF16) {
+                        push_key_press_release(&mut raw_input.events, key, egui::Modifiers::NONE);
                     }
                 }
                 TextEditCommand::MoveCursor(_) => {
@@ -495,6 +510,11 @@ pub struct TextDocumentModel {
     marked: Option<(usize, usize)>,
     focused: bool,
     last_synced_selection: String,
+    /// The text is the whole of an egui field ([`Self::sync_document`]), not the page's selection.
+    mirrored: bool,
+    /// The field and selection last mirrored, kept only when the field was longer than the
+    /// window and had to be cut to fit it.
+    mirror_cut_from: Option<(String, (usize, usize))>,
 }
 
 impl TextDocumentModel {
@@ -575,8 +595,18 @@ impl TextDocumentModel {
             self.selection = (0, 0);
             self.marked = None;
             self.focused = false;
+            self.mirrored = false;
+            self.mirror_cut_from = None;
             self.last_synced_selection.clear();
             return changed;
+        }
+
+        // The keyboard moved from a field mirrored whole ([`Self::sync_document`]) to the page's
+        // own caret without a blur in between: the field's text is not the page's.
+        if self.mirrored {
+            self.mirrored = false;
+            self.mirror_cut_from = None;
+            self.focused = false;
         }
 
         if !self.focused {
@@ -623,6 +653,46 @@ impl TextDocumentModel {
         }
         self.last_synced_selection = selected_text.to_owned();
         changed
+    }
+
+    /// Mirrors the whole of a focused one-line field that egui owns (a name in a dialog, the page
+    /// title, search): all of its text, and its selection given in characters.
+    ///
+    /// Returns `true` when UIKit must be told the selection changed, which is only when the app
+    /// changed it: the field has just taken the keyboard, or its text or selection are no longer
+    /// what the keyboard's own edits left. Typing never is. UIKit edits this model first
+    /// (`insertText:`, `deleteBackward`), the app applies the same edit a frame later, and the
+    /// two then agree. Telling UIKit the selection changed after every letter makes it throw
+    /// away its suggestions and autocorrection.
+    ///
+    /// While `pending_commands` is true the app has not yet applied what the keyboard did, so
+    /// its text is the older one and is not taken. Marked text is the keyboard's and is left alone.
+    pub fn sync_document(&mut self, text: &str, selection_chars: (usize, usize), pending_commands: bool) -> bool {
+        let to_utf16 = |chars: usize| text.chars().take(chars).map(char::len_utf16).sum::<usize>();
+        let (a, b) = (to_utf16(selection_chars.0), to_utf16(selection_chars.1));
+        let selection = (a.min(b), a.max(b));
+        if self.focused && self.mirrored {
+            if self.marked.is_some() || pending_commands {
+                return false;
+            }
+            if self.text == text && self.selection == selection {
+                self.mirror_cut_from = None;
+                return false;
+            }
+            // A field longer than the window is cut to it below; the same field next frame is not news.
+            if self.mirror_cut_from.as_ref().is_some_and(|(seen, at)| seen == text && *at == selection) {
+                return false;
+            }
+        }
+        self.focused = true;
+        self.mirrored = true;
+        self.text = text.to_owned();
+        self.selection = selection;
+        self.marked = None;
+        self.last_synced_selection.clear();
+        self.enforce_window_bound();
+        self.mirror_cut_from = (self.text != text).then(|| (text.to_owned(), selection));
+        true
     }
 
     /// Synchronizes local buffer state when an edit action (`Cut`, `Delete`, `SelectAll`) is queued.
@@ -1891,7 +1961,22 @@ pub mod ios {
         }
 
         /// Synchronizes focus, caret geometry, selected text, and tool mode from `NocturneApp`.
-        pub fn sync_state(&self, should_focus: bool, caret_rect: Option<egui::Rect>, selected_text: &str, pointer_is_write: bool, is_writable: bool) {
+        ///
+        /// `document` is the whole text and character selection of the egui field that has the
+        /// keyboard, when one has ([`NocturneApp::focused_text_field`]); `pending_commands` says
+        /// the app has not yet applied everything the keyboard did. With no `document` the
+        /// page's own caret has the keyboard and only `selected_text` is mirrored, as before.
+        #[allow(clippy::too_many_arguments)]
+        pub fn sync_state(
+            &self,
+            should_focus: bool,
+            caret_rect: Option<egui::Rect>,
+            selected_text: &str,
+            document: Option<(&str, (usize, usize))>,
+            pending_commands: bool,
+            pointer_is_write: bool,
+            is_writable: bool,
+        ) {
             if let Some(superview) = self.view.superview() {
                 let bounds = superview.bounds();
                 self.view.setFrame(bounds);
@@ -1901,21 +1986,26 @@ pub mod ios {
 
             let caret_arr = caret_rect.filter(|r| r.is_finite()).map(|r| [r.min.x, r.min.y, r.width(), r.height()]);
 
-            let (focus_transition, doc_or_sel_changed) = {
+            let (focus_transition, selection_changed) = {
                 let mut state = self.state.borrow_mut();
                 let prev_focus = state.should_focus;
-                let prev_caret = state.caret_rect;
                 state.should_focus = should_focus;
                 state.is_writable = is_writable;
                 state.pointer_is_write = pointer_is_write;
                 state.caret_rect = caret_arr;
                 state.last_selected_text = selected_text.to_owned();
-                let doc_changed = state.document.sync_from_platform(selected_text, should_focus, is_writable);
-                let caret_changed = prev_caret != caret_arr;
-                ((prev_focus, should_focus), doc_changed || caret_changed)
+                let pending = pending_commands || !state.commands.is_empty();
+                let selection_changed = match document {
+                    Some((text, selection)) if should_focus && is_writable => state.document.sync_document(text, selection, pending),
+                    _ => state.document.sync_from_platform(selected_text, should_focus, is_writable),
+                };
+                ((prev_focus, should_focus), selection_changed)
             };
 
-            if doc_or_sel_changed {
+            // Only a change the app made to the text or the selection. Where the caret is drawn
+            // moves with every letter typed, and is not one: telling UIKit the selection changed
+            // after each keystroke made it drop its suggestions and ask for the text again.
+            if selection_changed {
                 self.view.notify_selection_changed();
             }
 
@@ -2557,6 +2647,122 @@ mod tests {
         run_egui_text_edit_queue(&ctx3, &mut app, &mut buf3, &mut preedit3, &mut queue);
         assert_eq!(buf3, "helloniXo");
         assert!(!preedit3);
+    }
+
+    // ---- iPad Studio UX v2, phase 1: the keyboard sees the whole field -------------------------
+
+    #[test]
+    fn mirrored_field_has_its_text_before_anything_is_typed_and_backspace_works() {
+        let mut doc = TextDocumentModel::new();
+        assert!(doc.sync_document("Lemon tare", (10, 10), false), "a newly focused field is news to the keyboard");
+        assert!(doc.has_text(), "a field with a name in it is not empty");
+        assert_eq!(doc.selection_utf16(), (10, 10));
+        assert_eq!(doc.text_in_range(6, 10), "tare", "the keyboard can read the word before the caret");
+
+        assert_eq!(doc.delete_backward(), vec![TextEditCommand::DeleteBackward]);
+        assert_eq!(doc.text(), "Lemon tar");
+        // The app has not drawn the frame that applies the delete yet: nothing to report.
+        assert!(!doc.sync_document("Lemon tare", (10, 10), true));
+        assert_eq!(doc.text(), "Lemon tar", "the app's older text does not undo what the keyboard just did");
+        // The app caught up and agrees: still nothing to report.
+        assert!(!doc.sync_document("Lemon tar", (9, 9), false));
+    }
+
+    #[test]
+    fn typing_into_a_mirrored_field_never_reports_a_selection_change() {
+        let mut doc = TextDocumentModel::new();
+        assert!(doc.sync_document("Blue", (4, 4), false));
+        let mut app_text = "Blue".to_string();
+        let mut reports = 0;
+        for typed in [" ", "L", "a", "g", "o", "o", "n", " ", "\u{1F600}"] {
+            assert_eq!(doc.insert_text(typed), vec![TextEditCommand::InsertText(typed.to_string())]);
+            let before = app_text.chars().count();
+            reports += usize::from(doc.sync_document(&app_text, (before, before), true));
+            app_text.push_str(typed);
+            let after = app_text.chars().count();
+            reports += usize::from(doc.sync_document(&app_text, (after, after), false));
+            // The caret's place on screen moves with every letter; that is not a selection change.
+            reports += usize::from(doc.sync_document(&app_text, (after, after), false));
+        }
+        assert_eq!(reports, 0, "selectionDidChange during typing throws away the keyboard's suggestions");
+        assert_eq!(doc.text(), "Blue Lagoon \u{1F600}");
+        let end = utf16_len(doc.text());
+        assert_eq!(doc.selection_utf16(), (end, end), "characters outside the BMP count as two UTF-16 units");
+    }
+
+    #[test]
+    fn a_caret_moved_in_the_app_is_reported_once_and_marked_text_is_left_alone() {
+        let mut doc = TextDocumentModel::new();
+        assert!(doc.sync_document("Lemon tare", (10, 10), false));
+        assert!(doc.sync_document("Lemon tare", (5, 2), false), "the user dragged a selection in the field");
+        assert_eq!(doc.selection_utf16(), (2, 5), "kept in order");
+        assert!(!doc.sync_document("Lemon tare", (5, 2), false));
+
+        let _ = doc.set_marked_text(Some("ni"), (2, 2));
+        let marked = doc.text().to_string();
+        assert!(!doc.sync_document("Lemon tare", (5, 5), false), "a composition in progress is the keyboard's");
+        assert_eq!(doc.text(), marked);
+    }
+
+    #[test]
+    fn moving_between_a_mirrored_field_and_the_page_caret_starts_afresh() {
+        let mut doc = TextDocumentModel::new();
+        assert!(doc.sync_document("Section name", (12, 12), false));
+        // The dialog closes and the page's own caret takes the keyboard without a blur in between.
+        assert!(doc.sync_from_platform("", true, true));
+        assert_eq!(doc.text(), "", "the dialog's text is not the page's");
+        // And back.
+        assert!(doc.sync_document("Section name", (12, 12), false));
+        assert_eq!(doc.text(), "Section name");
+        // Blur empties it.
+        assert!(doc.sync_from_platform("", false, true));
+        assert!(!doc.has_text());
+    }
+
+    #[test]
+    fn cursor_moves_for_an_egui_field_are_sent_in_one_frame() {
+        let dir = nocturne_store::testing::TempDir::new("ios-unit-move-batch");
+        let notebooks = dir.path().join("notebooks");
+        let _ = std::fs::create_dir_all(&notebooks);
+        let settings = nocturne_store::Settings::at(dir.path().join("settings.toml"));
+        let Ok(session) = nocturne_engine::Session::new(&notebooks, settings) else {
+            assert_eq!("session", "ok");
+            return;
+        };
+        let mut app = nocturne_ui_egui::NocturneApp::new(session);
+        // What `replaceRange:withText:` three letters back queues: moves, then the text, then moves.
+        let mut queue = std::collections::VecDeque::from(vec![
+            TextEditCommand::MoveCursor(-3),
+            TextEditCommand::InsertText(" ".to_owned()),
+            TextEditCommand::MoveCursor(2),
+        ]);
+        let mut preedit = false;
+        let mut raw = egui::RawInput::default();
+        let repaint = super::dispatch_pending_text_commands(&mut queue, true, &mut preedit, &mut app, &mut raw, || None);
+        assert!(!repaint, "nothing is left for a later frame");
+        assert!(queue.is_empty(), "the space is not held up behind the cursor moves: {queue:?}");
+        let mut expected = Vec::new();
+        for _ in 0..3 {
+            super::push_key_press_release(&mut expected, egui::Key::ArrowLeft, egui::Modifiers::NONE);
+        }
+        expected.push(egui::Event::Text(" ".to_owned()));
+        for _ in 0..2 {
+            super::push_key_press_release(&mut expected, egui::Key::ArrowRight, egui::Modifiers::NONE);
+        }
+        assert_eq!(raw.events, expected);
+    }
+
+    #[test]
+    fn the_page_title_is_typed_through_its_own_text_box() {
+        let ctx = egui::Context::default();
+        let page_rect = egui::Rect::from_min_max(egui::pos2(200.0, 120.0), egui::pos2(900.0, 720.0));
+        let title_caret = egui::Rect::from_min_size(egui::pos2(240.0, 140.0), egui::vec2(2.0, 26.0));
+        let ime_at_title = egui::Rect::from_min_size(egui::pos2(241.0, 141.0), egui::vec2(1.0, 24.0));
+        // A block's caret in the same place still belongs to the page.
+        assert!(!super::route_ime_to_egui(false, Some(ime_at_title), Some(title_caret), Some(page_rect), &ctx));
+        // The title is an egui text box: it types its own letters, spaces included.
+        assert!(super::route_ime_to_egui(true, Some(ime_at_title), Some(title_caret), Some(page_rect), &ctx));
+        assert!(!super::route_ime_to_egui(true, None, Some(title_caret), Some(page_rect), &ctx), "no text box asked for the keyboard");
     }
 
     #[test]

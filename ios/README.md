@@ -132,9 +132,11 @@ Get-Content .\nocturne-0.0.10-ios-arm64.ipa.sha256
   2-finger dragging inside the page canvas pans/scrolls smoothly via UIKit's finger-only
   `UIPanGestureRecognizer`, while pinching with two fingers zooms (`50%` to `250%`) via
   `UIPinchGestureRecognizer` ([`src/gestures.rs`](src/gestures.rs),
-  [`touch_ux.rs`](../crates/ui-egui/src/touch_ux.rs)). Enabling the **Finger drawing** toolbar
-  toggle lets 1-finger drags draw ink while 2-finger pan and pinch zoom remain active, and tapping
-  into text/boxes enters text editing.
+  [`touch_ux.rs`](../crates/ui-egui/src/touch_ux.rs)). Finger drawing is off by default and is
+  remembered in `settings.toml`. In Tablet Studio it is the **Draw with finger** switch in the
+  view menu (the zoom percentage in the top bar); in the classic ribbon it is the **Finger
+  drawing** toggle on the Draw tab. With it on, 1-finger drags draw ink while 2-finger pan and
+  pinch zoom remain active, and tapping into text/boxes enters text editing.
 - **Apple Pencil direct draw & `UIPencilInteraction` tool toggle**: Apple Pencil touches
   (`UITouchTypePencil`) bypass native pan/pinch recognizers and draw immediately with palm
   separation. [`PencilBridge`](src/pencil.rs) listens to `UIPencilInteraction` double-tap (and

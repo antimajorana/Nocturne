@@ -123,6 +123,9 @@ pub struct Pad {
     redo_steps: Vec<Vec<Stroke>>,
     /// Changed since the last finished change was kept.
     touched: bool,
+    /// A pen that writes while a palm holds the window's pointer came down on the page, and has
+    /// not lifted yet. Never written to the file.
+    pen_on_page: bool,
 }
 
 /// How many changes to the ink undo can go back through.
@@ -182,6 +185,7 @@ impl Pad {
             undo_steps: Vec::new(),
             redo_steps: Vec::new(),
             touched: false,
+            pen_on_page: false,
         }
         .with_kept()
     }
@@ -656,7 +660,14 @@ pub fn show_with_input_and_handles(
         pad.touched |= dropped_grab;
     }
     let dark_page = crate::theme::luminance(t.editor) < DARK_PAGE;
-    let live_predict = allow_stroke && pen.pointer == Pointer::Draw && ui.input(|i| i.pointer.primary_down());
+    // A pen that writes while a palm rests on the glass: the window's pointer is the palm's, so
+    // where the pen is and whether it is down are read from the pen's own touch instead.
+    let pen_frame = ui.ctx().data(|d| d.get_temp::<crate::stylus::StylusFrame>(crate::stylus::StylusFrame::id()));
+    if pen_frame.is_none() {
+        pad.pen_on_page = false;
+    }
+    let live_predict =
+        allow_stroke && pen.pointer == Pointer::Draw && pen_frame.as_ref().map_or_else(|| ui.input(|i| i.pointer.primary_down()), |pen| pen.down);
     // Painting on the layer, not through the ui, so ink outside text remains visible. Cut off
     // where the view ends as well as the page: a scrolled page reaches above the view, and this
     // layer sits above the ribbon.
@@ -795,10 +806,20 @@ pub fn show_with_input_and_handles(
     // pen (issue #9). Its press began before this layer was here, so egui gave it to whatever
     // was under it last frame: hand it to the layer, so the touch that switched the tool also
     // draws.
-    if ui.data_mut(|d| d.remove_temp::<bool>(claim_press_id())).unwrap_or(false) && ui.input(|i| i.pointer.primary_down()) && !over_foreground {
+    let claimed = ui.data_mut(|d| d.remove_temp::<bool>(claim_press_id())).unwrap_or(false);
+    if claimed && ui.input(|i| i.pointer.primary_down()) && !over_foreground {
         ui.ctx().set_dragged_id(layer);
     }
     let resp = ui.interact(hit, layer, Sense::click_and_drag());
+    // The pen's own contact, when a palm holds the pointer. The pen is on the page when it came
+    // down inside it with nothing laid over it there (a toolbar, a menu, a dialog), or when it
+    // had just picked the pen tool up by touching the page; it stays on the page until it lifts.
+    if let Some(pen) = &pen_frame {
+        let page_is_on_top = ui.ctx().layer_id_at(pen.pos).is_none_or(|l| l.order == egui::Order::Background);
+        if pen.down && ((pen.landed && hit.contains(pen.pos) && page_is_on_top) || claimed) {
+            pad.pen_on_page = true;
+        }
+    }
     if pen.pointer == Pointer::Laser {
         laser(ui, &painter, body, origin, zoom, resp.is_pointer_button_down_on() && !over_foreground);
         return dropped_grab;
@@ -815,8 +836,14 @@ pub fn show_with_input_and_handles(
     // Not egui's drag, which only begins once the pointer has travelled far enough: a pen
     // put down and lifted in one place is a dot, and a dot is ink.
     let stroke_in_flight = pad.drawing_now.is_some() || pad.eraser_last.is_some() || !pad.loop_now.is_empty() || pad.grabbed.is_some();
-    let down = resp.is_pointer_button_down_on() && (!over_foreground || stroke_in_flight);
-    let at = ui.ctx().pointer_interact_pos().filter(|p| body.contains(*p)).map(|p| ((p.x - origin.x) / zoom, (p.y - origin.y) / zoom));
+    let (down, here) = match &pen_frame {
+        Some(pen) => (pen.down && (pad.pen_on_page || stroke_in_flight), Some(pen.pos)),
+        None => (resp.is_pointer_button_down_on() && (!over_foreground || stroke_in_flight), ui.ctx().pointer_interact_pos()),
+    };
+    if pen_frame.as_ref().is_some_and(|pen| !pen.down) {
+        pad.pen_on_page = false;
+    }
+    let at = here.filter(|p| body.contains(*p)).map(|p| ((p.x - origin.x) / zoom, (p.y - origin.y) / zoom));
     if pen.pointer != Pointer::Erase {
         pad.eraser_last = None;
         pad.erased_since_press = false;
@@ -861,7 +888,15 @@ pub fn show_with_input_and_handles(
                 // quick curve into straight lines. Each keeps the force of the touch reported
                 // just before it (a pen's pressure), or the frame's pressure for a mouse. The
                 // frame the pen is lifted in still counts the movements made before it lifted.
-                let moves = frame_moves(ui, body, origin, zoom, pressure);
+                let moves = match &pen_frame {
+                    Some(pen) => pen
+                        .moves
+                        .iter()
+                        .filter(|(p, _)| body.contains(*p))
+                        .map(|(p, force)| ((p.x - origin.x) / zoom, (p.y - origin.y) / zoom, force.clamp(0.0, 1.0)))
+                        .collect(),
+                    None => frame_moves(ui, body, origin, zoom, pressure),
+                };
                 let (now_secs, stable_dt) = ui.input(|i| (i.time, f64::from(i.stable_dt).clamp(1e-4, 0.05)));
                 if !moves.is_empty() {
                     if pad.predict_history.last().is_some_and(|last| now_secs - last.time_secs > 0.1) {
@@ -950,7 +985,7 @@ pub fn show_with_input_and_handles(
             let held_box = pick::bounds(&pad.drawing, &pad.held).map(|(x0, y0, x1, y1)| {
                 egui::Rect::from_min_max(origin + vec2(x0 * zoom, y0 * zoom), origin + vec2(x1 * zoom, y1 * zoom)).expand(3.0)
             });
-            let here = ui.ctx().pointer_interact_pos().unwrap_or(egui::Pos2::ZERO);
+            let here = here.unwrap_or(egui::Pos2::ZERO);
             if down && pad.grabbed.is_none() {
                 // A press on a corner stretches, inside the box moves, on a stroke picks
                 // that stroke up, and anywhere else lets go.

@@ -108,6 +108,29 @@ pub fn menu_check_row(ui: &mut Ui, checked: bool, label: &str, t: &Tokens) -> Re
     resp
 }
 
+/// True when a press that began this frame fell outside a context menu that was already open:
+/// what closes the menu.
+///
+/// A menu used to close on any click away from it. On a touch screen the menu is opened by a
+/// finger that is held and then lifted, and that lift is a button release with no pointer left
+/// to say where it was: it read as a click at the corner of the window, away from the menu, and
+/// closed it. A new press is unambiguous. `opened_now` is the frame the menu opens in, whose
+/// own press is not a press outside it.
+///
+/// A press on a list that is open over the menu (the font and size lists of the mini toolbar)
+/// is a pick from that list, not a press away from the menu: closing on it would take the list
+/// away before the pick's release arrives.
+pub fn pressed_outside(ui: &Ui, opened_now: bool, inside: impl Fn(egui::Pos2) -> bool) -> bool {
+    if opened_now {
+        return false;
+    }
+    let Some(at) = ui.input(|i| if i.pointer.any_pressed() { i.pointer.press_origin().or_else(|| i.pointer.interact_pos()) } else { None }) else {
+        return false;
+    };
+    let on_an_open_list = crate::ribbon::any_popup_open(ui.ctx()) && ui.ctx().layer_id_at(at).is_some_and(|l| l.order >= egui::Order::Foreground);
+    !inside(at) && !on_an_open_list
+}
+
 /// A thin rule between groups of rows, starting where the words do, as Office draws it.
 pub fn menu_separator(ui: &mut Ui, t: &Tokens) {
     let width = ui.available_width().min(MENU_W);

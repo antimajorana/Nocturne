@@ -30,6 +30,8 @@ pub struct Session {
 const OPEN_KEY: &str = "open_notebooks";
 const CLOSED_KEY: &str = "closed_notebooks";
 const SEP: char = '|';
+/// Whether one finger draws. Off unless the file says `true`.
+const FINGER_DRAWING_KEY: &str = "finger_drawing";
 
 impl Session {
     /// Opens (and creates, if needed) the notebooks folder `root`.
@@ -42,17 +44,9 @@ impl Session {
             settings.get(CLOSED_KEY).map(|v| v.split(SEP).map(str::trim).filter(|p| !p.is_empty()).map(PathBuf::from).collect()).unwrap_or_default();
         let sync_http = default_http_client();
         let sync_secrets = default_secret_store(&settings);
-        let mut s = Session {
-            root,
-            extra,
-            closed,
-            settings,
-            tree: Vec::new(),
-            ink_tool: InkToolState::default(),
-            finger_drawing: false,
-            sync_http,
-            sync_secrets,
-        };
+        let finger_drawing = settings.get(FINGER_DRAWING_KEY).is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
+        let mut s =
+            Session { root, extra, closed, settings, tree: Vec::new(), ink_tool: InkToolState::default(), finger_drawing, sync_http, sync_secrets };
         s.refresh();
         Ok(s)
     }
@@ -251,14 +245,17 @@ impl Session {
         self.finger_drawing
     }
 
-    /// Explicitly sets whether single-finger touch draws on the canvas.
+    /// Explicitly sets whether single-finger touch draws on the canvas, and remembers it in the
+    /// settings file. A settings file that cannot be written does not undo the choice: it still
+    /// holds for this session, as the other remembered tool choices do.
     pub fn set_finger_drawing(&mut self, enabled: bool) {
         self.finger_drawing = enabled;
+        let _ = self.settings.set(FINGER_DRAWING_KEY, if enabled { "true" } else { "false" });
     }
 
     /// Toggles `finger_drawing` and returns the new state.
     pub fn toggle_finger_drawing(&mut self) -> bool {
-        self.finger_drawing = !self.finger_drawing;
+        self.set_finger_drawing(!self.finger_drawing);
         self.finger_drawing
     }
 }

@@ -1,5 +1,5 @@
 //! Dedicated iPadOS / Tablet Studio chrome: single ~44pt top bar, floating Apple Pencil tool
-//! pill (`Order::Foreground`), and transient non-blocking status toast banners.
+//! pill (`Order::Foreground`), and the one-line banner that shows a failure until it is tapped.
 
 use crate::icons::{self, Icon};
 use crate::ribbon::{Act, Pointer, RackEdit, RuleLines, View};
@@ -178,6 +178,13 @@ pub fn show_top_bar(ui: &mut Ui, input: &StudioTopBarIn<'_>, search: &mut String
                     if ui.checkbox(&mut minimap_on, crate::tl_id!("ui.show_minimap")).changed() {
                         out.acts.push(Act::ToggleMinimap);
                     }
+                    // Here until the Tool Settings screen exists. It is a labelled switch and not
+                    // an icon on the tool pill: the hand that stood for it there means "pan" on the
+                    // desktop, and said neither.
+                    let mut finger_on = input.view.finger_drawing;
+                    if ui.checkbox(&mut finger_on, crate::tl_id!("ui.draw_with_finger")).changed() {
+                        out.acts.push(Act::ToggleFingerDrawing);
+                    }
                     ui.separator();
                     let next_rules = match input.view.rules {
                         RuleLines::None => RuleLines::College,
@@ -233,7 +240,12 @@ pub fn show_top_bar(ui: &mut Ui, input: &StudioTopBarIn<'_>, search: &mut String
                     }
                 }
                 if search_open {
-                    let edit = ui.add(egui::TextEdit::singleline(search).hint_text(crate::tl_id!("ui.search_all_pages")).desired_width(155.0));
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(search)
+                            .id(Id::new(crate::app::SEARCH_FIELD))
+                            .hint_text(crate::tl_id!("ui.search_all_pages"))
+                            .desired_width(155.0),
+                    );
                     if std::mem::take(focus_search) {
                         edit.request_focus();
                         out.clear_page_caret = true;
@@ -504,9 +516,6 @@ pub fn show_pencil_pill(ctx: &Context, view_rect: Rect, bottom_clearance: f32, v
                             acts.push(Act::InkPointer(Pointer::Shape(Shape::Rectangle)));
                         }
                     }
-                    if studio_icon_btn(ui, Icon::Hand, view.finger_drawing, true, crate::tl_id!("ui.finger_drawing_tip"), t).clicked() {
-                        acts.push(Act::ToggleFingerDrawing);
-                    }
                     ui.separator();
                     if studio_icon_btn(ui, Icon::Undo, false, view.can_undo, crate::tl_id!("ui.undo"), t).clicked() {
                         acts.push(Act::Undo);
@@ -525,27 +534,45 @@ pub fn show_pencil_pill(ctx: &Context, view_rect: Rect, bottom_clearance: f32, v
     (acts, Some(area_resp.response.rect))
 }
 
-/// Shows a non-blocking transient toast banner when Tablet Studio hides the permanent status bar.
-pub fn show_transient_notice(ctx: &Context, view_rect: Rect, message: &str, is_error: bool, tokens: &Tokens) {
-    if message.trim().is_empty() {
-        return;
+/// The narrowest the failure banner is drawn.
+pub const ERROR_BANNER_MIN_WIDTH: f32 = 240.0;
+
+/// Shows a failure on one line at the top of the view. The caller draws it until it is tapped
+/// or a message that is not a failure takes its place. Returns true when it was tapped away
+/// this frame.
+///
+/// Tablet Studio has no status bar. It used to float every status message over the page in a box
+/// with no width of its own, which wrapped the words a few letters to a line. Routine messages
+/// ("Drawing saved, 2 strokes") are no longer shown at all; only a failure is, and it has a
+/// width: at least [`ERROR_BANNER_MIN_WIDTH`], at most the view, cut short with an ellipsis.
+pub fn show_error_banner(ctx: &Context, view_rect: Rect, message: &str, tokens: &Tokens) -> bool {
+    let message = message.trim();
+    if message.is_empty() {
+        return false;
     }
+    let margin = egui::Margin { left: 12, right: 12, top: 7, bottom: 7 };
+    let widest = (view_rect.width() - 32.0).max(ERROR_BANNER_MIN_WIDTH);
     let pos = pos2(view_rect.center().x, (view_rect.min.y + 12.0).max(52.0));
-    egui::Area::new(Id::new("studio-transient-notice")).order(Order::Tooltip).pivot(Align2::CENTER_TOP).fixed_pos(pos).interactable(false).show(
+    let mut dismissed = false;
+    egui::Area::new(Id::new("studio-error-banner")).order(Order::Foreground).pivot(Align2::CENTER_TOP).fixed_pos(pos).constrain(true).show(
         ctx,
         |ui| {
-            let stroke_col = if is_error { tokens.warn } else { tokens.container_border };
-            let text_col = if is_error { tokens.warn } else { tokens.text };
-            egui::Frame::NONE
-                .fill(tokens.panel.gamma_multiply(0.96))
-                .stroke(Stroke::new(1.0, stroke_col))
+            let frame = egui::Frame::NONE
+                .fill(tokens.panel.gamma_multiply(0.97))
+                .stroke(Stroke::new(1.0, tokens.warn))
                 .corner_radius(8.0)
-                .inner_margin(egui::Margin { left: 12, right: 12, top: 6, bottom: 6 })
+                .inner_margin(margin)
                 .show(ui, |ui| {
-                    ui.label(RichText::new(message).small().color(text_col));
+                    ui.set_min_width(ERROR_BANNER_MIN_WIDTH - f32::from(margin.left + margin.right));
+                    ui.set_max_width(widest - f32::from(margin.left + margin.right));
+                    ui.add(egui::Label::new(RichText::new(message).color(tokens.warn)).truncate().selectable(false));
                 });
+            let tap = ui.interact(frame.response.rect, Id::new("studio-error-banner-tap"), Sense::click());
+            tap.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, message));
+            dismissed = tap.clicked();
         },
     );
+    dismissed
 }
 
 #[cfg(test)]

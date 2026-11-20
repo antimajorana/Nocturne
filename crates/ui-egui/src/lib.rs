@@ -66,7 +66,7 @@ mod testing_dir;
 pub mod theme;
 pub mod touch_ux;
 
-pub use app::{NocturneApp, PlatformEditAction};
+pub use app::{NocturneApp, PlatformEditAction, PlatformTextField};
 
 /// Translate a source string supplied dynamically by an enum or a shared UI helper.
 #[macro_export]
