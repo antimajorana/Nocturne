@@ -14,7 +14,7 @@
 - [ ] Page or demo changes: `cargo xtask demo-check`, the format parity test, and a side by
       side look at both formats
 - [ ] UI changes: the pictures were looked at; `cargo xtask screenshots` if they changed
-- [ ] New files under `assets/` have a row in `ATTRIBUTION.md`
+- [ ] Existing upstream copyright and licence headers are preserved on any adapted external third-party open-source files
 
 ## How it was checked
 

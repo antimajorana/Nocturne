@@ -20,9 +20,12 @@ Nocturne is an open-source, clean-room recreation of the OneNote notebook experi
 - Prioritize compatibility with established interaction patterns and
   conventions in related suite apps where they fit Nocturne's requirements.
   Inspect available references and shared libraries before implementing a new
-  capability. Prefer reusable shared code over one-off duplication when the
-  dependency and repository boundaries allow it. Keep app-specific behavior at
-  clear edges.
+  capability. Reuse shared crates or copy and adapt code and assets directly
+  from the owner's repositories, sibling Craft/suite repositories, or
+  explicitly licensed sources when Nocturne's crate layers allow it; for
+  external third-party open-source files not owned by the owner, preserve
+  existing upstream copyright and license headers. Keep app-specific behavior
+  at clear edges.
 - Keep shared contracts and behavior platform-neutral while using useful native
   platform support through isolated implementations. Name platform-specific
   files `<feature>.<platform>.<extension>`: `.win.*` for Windows, `.mac.*` for
@@ -157,7 +160,7 @@ dialog is an in-app themed modal and persists the user's choice in the settings 
     environment, the working directory or a fixed folder. A test that cannot be isolated says so
     and runs alone.
 - **Themes.** The UI uses theme tokens only. Contrast tests must pass for all 14 themes.
-- **Assets.** Every file in `assets/` needs a row in `ATTRIBUTION.md`.
+- **Assets and source adaptation.** Code and assets from the owner's repositories, sibling Craft/suite repositories, and explicitly licensed sources may be copied and adapted directly without adding rows to `ATTRIBUTION.md` (`cargo xtask assets` is non-blocking). Keep root `ATTRIBUTION.md`, `NOTICE`, and `licenses/` intact for installer packaging, and preserve existing upstream copyright and license headers in source files adapted from external third-party open-source repositories.
 - **Honesty.** Mark what is verified and what is assumed. Do not claim coverage, platform
   support or licences that were not checked. Keep `docs/gaps.md` true.
 - **Personal data.** No owner name, email or real notebook names in tracked files. Never copy

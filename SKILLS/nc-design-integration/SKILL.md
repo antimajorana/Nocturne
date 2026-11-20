@@ -84,13 +84,13 @@ Any cross-app protocol design needs a separate, owner-approved proposal before i
 ## Design rules
 
 1. Start from Nocturne requirements in `AGENTS.md`, `nc-prod`, and `nc-arch`. Suite similarity does not authorize a product behavior change.
-2. Inspect whether a shared crate, established app pattern, builder, or platform adapter already exists. Prefer reuse when ownership, license, API, and dependency direction allow it.
+2. Inspect whether a shared crate, established app pattern, builder, or platform adapter already exists. Reuse shared crates or copy and adapt code and assets directly from the owner's repositories, sibling Craft/suite apps, or explicitly licensed sources whenever API and Nocturne's crate-layer direction allow it.
 3. Keep Nocturne-specific behavior at an explicit adapter or application edge. Do not import another app's data model or business rules into Nocturne's model or engine.
 4. Keep shared contracts platform-neutral. Use platform-native capabilities through isolated implementations, with explicit `cfg` wiring and the repository's platform filename rules.
 5. Apply the union-not-intersection rule: a platform can use a specialized implementation that fits it. Do not narrow every platform to the weakest common capability. Show an explicit UI limitation if a platform branch is missing.
 6. Treat Android builder listings as a lead to investigate. Verify the builder's current repository, supported app structure, build inputs, signing behavior, and output before relying on it. Do not claim Android support from a listing alone.
 7. Preserve Nocturne's local folder and file ownership model. A shared installer or launcher must not silently move notebook data into a service-owned store.
-8. Respect repository boundaries. Coordinate source changes in the repository that owns the code; do not copy code or assets across projects without checking license and ownership.
+8. Keep external checkouts (such as `storytold\`) read-only unless the owner asks to edit them, and never copy signing keys. Code and assets from the owner's repositories, sibling Craft/suite projects, and explicitly licensed sources may be copied and adapted directly into Nocturne without `ATTRIBUTION.md` gate friction. When adapting files from external third-party open-source repositories not owned by the owner, preserve existing upstream copyright and license headers.
 
 ## Design record
 
@@ -98,7 +98,7 @@ For each proposed integration, state:
 
 - User need and observable acceptance criteria.
 - Existing Nocturne path and candidate shared crate, pattern, or tool.
-- Source repository, owner, license, and dependency direction.
+- Source repository and crate-layer dependency direction (plus upstream copyright/license header preservation for external third-party open-source files).
 - Shared contract and Nocturne adapter boundary.
 - Platform-specific branches and user-visible gaps.
 - Failure modes, offline behavior, and local-data effects.
@@ -114,7 +114,7 @@ For substantial work, route through `nc-arch` and `nc-hl-design`, then the relev
 - Are product-specific storage and command rules still owned by Nocturne?
 - Does each platform use its useful native path where supported?
 - Are missing capabilities stated in the UI and in `docs/gaps.md`?
-- Are license, attribution, build, and test implications recorded?
+- Are build and test implications recorded, and are upstream copyright/license headers preserved on any external third-party open-source files?
 - Are directory listings kept distinct from implementation evidence?
 
 ## Reference: WordCraft and Nocturne document models

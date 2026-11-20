@@ -7,7 +7,7 @@
 //! clippy    cargo clippy --workspace --all-targets -- -D warnings
 //! test      cargo test --workspace
 //! layers    check that crates only depend on lower layers, and that nothing below the UI uses egui
-//! assets    check that every file under assets/ has a row in ATTRIBUTION.md
+//! assets    scan assets/ for regular files and report ATTRIBUTION.md coverage (non-blocking)
 //! docs      check that relative links in the Markdown files point at files that exist
 //! text      check text files: no byte order mark in source, manifests or Markdown, and plain
 //!           punctuation (no em or en dashes, no curly quotes) in Markdown, per .agents/TONE.md;
@@ -218,9 +218,12 @@ fn unattributed(attribution: &str, assets: &[String]) -> Vec<String> {
 }
 
 fn assets(root: &Path) -> Result<(), String> {
-    let attribution = fs::read_to_string(root.join("ATTRIBUTION.md")).map_err(|e| format!("ATTRIBUTION.md: {e}"))?;
+    let attribution = fs::read_to_string(root.join("ATTRIBUTION.md")).unwrap_or_default();
+    let assets_dir = root.join("assets");
     let mut files = Vec::new();
-    files_under(root, &root.join("assets"), &mut files)?;
+    if fs::symlink_metadata(&assets_dir).is_ok() {
+        files_under(root, &assets_dir, &mut files)?;
+    }
     let rel: Vec<String> = files
         .iter()
         .filter_map(|f| f.strip_prefix(root).ok())
@@ -228,8 +231,8 @@ fn assets(root: &Path) -> Result<(), String> {
         .filter(|p| !p.ends_with(".gitkeep"))
         .collect();
     let missing = unattributed(&attribution, &rel);
-    println!("assets: {} files, {} without an ATTRIBUTION.md row", rel.len(), missing.len());
-    if missing.is_empty() { Ok(()) } else { Err(format!("add a row to ATTRIBUTION.md for:\n  {}", missing.join("\n  "))) }
+    println!("assets: {} files ({} without an ATTRIBUTION.md row; attribution check relaxed)", rel.len(), missing.len());
+    Ok(())
 }
 
 /// Relative link targets in Markdown text: `[text](target)` where the target is not a web
@@ -768,6 +771,18 @@ mod tests {
     fn attribution_rows_are_matched_by_path() {
         let a = "| `assets/brand/a.png` | x |\n";
         assert_eq!(unattributed(a, &["assets/brand/a.png".into(), "assets/brand/b.png".into()]), vec!["assets/brand/b.png"]);
+    }
+
+    #[test]
+    fn assets_gate_succeeds_when_files_have_no_attribution_row() {
+        let tree = TestTree::new();
+        fs::create_dir_all(tree.0.join("assets/brand")).expect("create assets/brand");
+        fs::write(tree.0.join("assets/brand/unlisted.png"), b"png").expect("write unlisted asset");
+        fs::write(tree.0.join("ATTRIBUTION.md"), "# Attribution\n").expect("write ATTRIBUTION.md");
+        assert_eq!(assets(&tree.0), Ok(()));
+
+        fs::remove_file(tree.0.join("ATTRIBUTION.md")).expect("remove ATTRIBUTION.md");
+        assert_eq!(assets(&tree.0), Ok(()));
     }
 
     #[test]

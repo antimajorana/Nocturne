@@ -230,7 +230,7 @@ cargo xtask ci
 | Rebuild docs/images | `cargo xtask screenshots` (capture mechanics: [`nc-uiux-testing`](../nc-uiux-testing/SKILL.md)) |
 | Check text style | `cargo xtask text` |
 | Verify layers | `cargo xtask layers` |
-| Check assets/ATTRIBUTION.md | `cargo xtask assets` |
+| Scan assets/ (non-blocking attribution report) | `cargo xtask assets` |
 
 ---
 
@@ -430,7 +430,7 @@ Hooks are in `.githooks/` and run automatically after `git config core.hooksPath
 **Checks:**
 - `cargo fmt --check` (code style)
 - `cargo xtask layers` (crate boundaries)
-- `cargo xtask assets` (ATTRIBUTION.md)
+- `cargo xtask assets` (scans `assets/`, non-blocking for `ATTRIBUTION.md` rows)
 - `cargo xtask docs` (link validity)
 - `cargo xtask text` (plain ASCII, no fancy quotes)
 

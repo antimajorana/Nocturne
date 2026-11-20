@@ -27,7 +27,7 @@ or the demo.
   `NOCTURNE_ICON_SOURCE`. Read that file before searching for upstream source assets. The value
   points to a local developer-only clone and must never become a runtime dependency or a network
   download path.
-- Add every vendored icon and its license to `ATTRIBUTION.md`.
+- Icons from the owner's repositories, sibling Craft/suite apps, Fluent UI, Tabler Icons, or other licensed sources may be vendored directly without adding rows to `ATTRIBUTION.md`; preserve upstream copyright/license headers or notice files for external third-party open-source icon sets.
 - Monochrome icons live in `crates/ui-egui/assets/fluent/` and are tinted to the theme colour.
 - Colour icons live in `crates/ui-egui/assets/fluent-color/`, with the same file name as their
   monochrome twin. Draw them untinted, because a tint would wash out their colours. Only fade them
@@ -50,7 +50,7 @@ or the demo.
    exists before selecting assets.
 3. Select one stroke/fill style and optical size for the control group. Choose the colour
    version when the group is coloured, and say so if a group mixes colour and monochrome icons.
-4. Vendor only the selected assets and record attribution.
+4. Vendor only the selected assets (recording rows in `ATTRIBUTION.md` is optional).
 5. Integrate through the shared icon mapping, not scattered raw paths.
 6. Check hit targets, labels, hover states, and screenshots at the target scale.
 7. Run `cargo fmt --all`, focused UI tests, and `cargo xtask ci` when the change is release-bound.
