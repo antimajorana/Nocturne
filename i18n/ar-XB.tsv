@@ -1028,3 +1028,6 @@
 @id	ui.toggle_minimap_tip	[[RLI]]$$$Show or hide the collapsible infinite-canvas minimap@@@[[PDI]]
 @id	ui.toggle_studio_layout_btn	[[RLI]]$$$Switch Tablet Studio / Classic Ribbon@@@[[PDI]]
 @id	ui.draw_with_finger	[[RLI]]$$$Draw with finger@@@[[PDI]]
+@id	ui.object_eraser	[[RLI]]$$$Object eraser@@@[[PDI]]
+@id	ui.pixel_eraser	[[RLI]]$$$Pixel eraser@@@[[PDI]]
+@id	ui.eraser_size_named	[[RLI]]$$$Eraser size {size}@@@[[PDI]]

@@ -53,7 +53,7 @@ pub fn centre(stroke: &Stroke) -> Vec<Dab> {
 
 /// Catmull-Rom between `p1` and `p2`, with `p0` and `p3` giving the curve its lean.
 /// Pressure rides along the same curve, so it swells and fades as smoothly as the line.
-fn spline(p0: Dab, p1: Dab, p2: Dab, p3: Dab, t: f32) -> Dab {
+pub(crate) fn spline(p0: Dab, p1: Dab, p2: Dab, p3: Dab, t: f32) -> Dab {
     let (t2, t3) = (t * t, t * t * t);
     let f = |a: f32, b: f32, c: f32, d: f32| {
         0.5 * ((2.0 * b) + (-a + c) * t + (2.0 * a - 5.0 * b + 4.0 * c - d) * t2 + (-a + 3.0 * b - 3.0 * c + d) * t3)
@@ -184,7 +184,7 @@ pub fn touches(stroke: &Stroke, x: f32, y: f32, radius: f32) -> bool {
 /// A Catmull-Rom segment stays inside the hull of its equivalent Bezier controls.
 /// Unlike the raw readings' box, this also contains the curve's overshoot. Rejecting
 /// distant eraser movements here avoids building every stroke's outline each frame.
-fn curve_bounds(stroke: &Stroke) -> Option<(f32, f32, f32, f32)> {
+pub(crate) fn curve_bounds(stroke: &Stroke) -> Option<(f32, f32, f32, f32)> {
     let first = stroke.dabs.first()?;
     let (mut x0, mut y0, mut x1, mut y1) = (first.x, first.y, first.x, first.y);
     for (i, pair) in stroke.dabs.windows(2).enumerate() {
@@ -204,7 +204,7 @@ fn curve_bounds(stroke: &Stroke) -> Option<(f32, f32, f32, f32)> {
 }
 
 /// How far (`x`, `y`) is from one edge of the ink outline.
-fn distance_to_segment(x: f32, y: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
+pub(crate) fn distance_to_segment(x: f32, y: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
     let (vx, vy) = (b.0 - a.0, b.1 - a.1);
     let len2 = vx * vx + vy * vy;
     if len2 <= f32::EPSILON {

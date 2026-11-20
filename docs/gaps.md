@@ -137,6 +137,32 @@ imports shared documents placed in `Documents/Inbox/` (Share > Nocturne), and re
     Tablet Studio is the labelled `Draw with finger` entry in the view menu (the zoom
     percentage). That place is temporary: the Tool Settings screen that will hold it is not
     built yet.
+- **The two erasers and hold to straighten (2026-11-20) are tested on the host only.** What they
+  do, and what is still open:
+  - The eraser has a kind (`ink.eraser_mode`: `object` takes the whole stroke, `pixel` cuts out
+    what is under it) and a width of its own (`ink.eraser_width`: `s` 6, `m` 12, `l` 24, `xl` 40
+    points across, or a number from 2 to 80). Both are kept in `settings.toml`. A fresh install
+    has the object eraser at 6 points, which is what the eraser was when it took its width
+    from a thin pen. With a thick pen or a highlighter in hand the eraser used to be wider than
+    that; it no longer follows the pen.
+  - The pixel eraser cuts where the middle of the stroke is the eraser's radius plus half the
+    stroke's width away, so the round end of each piece meets the eraser's edge. Points are
+    added to a stroke only near a cut, more thinly the further from it. A sheet already holding
+    20,000 strokes keeps only as many pieces as there is room for, and the rest of the cut
+    stroke is lost; nothing says so on screen.
+  - A drag of either eraser is one step to undo. The eraser shows a ring as wide as itself
+    while it is over the page.
+  - In Tablet Studio a tap on the eraser already in hand opens its kind and size above the tool
+    pill. The classic ribbon has no control for them yet: there they are set by command only.
+  - A pen held still for two seconds (within 5 points on the screen) at the end of a stroke
+    makes it the straight line between its ends, whose end then follows the pen until it lifts
+    (`ink.hold_to_straighten`, on by default, in `settings.toml`). Only a stroke at least 12
+    points long that is at most 1.35 times as long as the straight way between its ends is
+    straightened, so a loop, a zigzag or a letter is left alone; what the pen reports while it
+    rests is not counted. It applies to a mouse on the desktop as well. The two seconds and
+    the limit were not tried by hand on a pen.
+  - The window keeps drawing frames while a stroke is in progress, as it did before; nothing
+    was done to rest it while the pen is still.
 - **Infomaniak kDrive sync (`api.infomaniak.com` on desktop and iPadOS) has only been verified against a loopback server in CI.**
   The kDrive REST v2/v3 client and two-phase 3-way reconciler (`crates/engine/src/sync/`) are
   tested against an in-process loopback HTTP server on desktop, and `ios/src/http.rs`

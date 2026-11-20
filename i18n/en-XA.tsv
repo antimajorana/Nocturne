@@ -1028,3 +1028,6 @@
 @id	ui.toggle_minimap_tip	$$$Show or hide the collapsible infinite-canvas minimap@@@
 @id	ui.toggle_studio_layout_btn	$$$Switch Tablet Studio / Classic Ribbon@@@
 @id	ui.draw_with_finger	$$$Draw with finger@@@
+@id	ui.object_eraser	$$$Object eraser@@@
+@id	ui.pixel_eraser	$$$Pixel eraser@@@
+@id	ui.eraser_size_named	$$$Eraser size {size}@@@

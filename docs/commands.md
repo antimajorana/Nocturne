@@ -372,6 +372,30 @@ Parameters:
 
 - enabled (optional): true, false, or toggle; default: toggle
 
+## `ink.eraser_mode`
+
+Choose what the eraser takes.
+
+Parameters:
+
+- mode (optional): object (the whole stroke), pixel (only what is under the eraser), or toggle; default: toggle
+
+## `ink.eraser_width`
+
+Set the eraser's size.
+
+Parameters:
+
+- width: s, m, l, xl, or points across from 2 to 80
+
+## `ink.hold_to_straighten`
+
+Straighten a stroke when the pen is held still.
+
+Parameters:
+
+- enabled (optional): true, false, or toggle; default: toggle
+
 ## `sync.status`
 
 Show Infomaniak kDrive sync settings and last sync summary.

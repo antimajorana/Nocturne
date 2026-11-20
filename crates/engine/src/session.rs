@@ -1,7 +1,7 @@
 use crate::commands::{self, Output, Params};
 use crate::error::EngineError;
 use crate::sync::{SecretStore, SyncHttpClient, default_http_client, default_secret_store};
-use crate::tool_state::{EraserToggleMode, InkActiveMode, InkPenKind, InkToolState};
+use crate::tool_state::{EraserKind, EraserToggleMode, InkActiveMode, InkOptions, InkPenKind, InkToolState};
 use nocturne_store::tree::{self, Node};
 use nocturne_store::{Settings, StoreError};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -21,6 +21,7 @@ pub struct Session {
     tree: Vec<Node>,
     ink_tool: InkToolState,
     finger_drawing: bool,
+    ink_options: InkOptions,
     sync_http: Arc<dyn SyncHttpClient>,
     sync_secrets: Arc<dyn SecretStore>,
 }
@@ -44,9 +45,20 @@ impl Session {
             settings.get(CLOSED_KEY).map(|v| v.split(SEP).map(str::trim).filter(|p| !p.is_empty()).map(PathBuf::from).collect()).unwrap_or_default();
         let sync_http = default_http_client();
         let sync_secrets = default_secret_store(&settings);
+        let ink_options = InkOptions::load(&settings);
         let finger_drawing = settings.get(FINGER_DRAWING_KEY).is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
-        let mut s =
-            Session { root, extra, closed, settings, tree: Vec::new(), ink_tool: InkToolState::default(), finger_drawing, sync_http, sync_secrets };
+        let mut s = Session {
+            root,
+            extra,
+            closed,
+            settings,
+            tree: Vec::new(),
+            ink_tool: InkToolState::default(),
+            finger_drawing,
+            ink_options,
+            sync_http,
+            sync_secrets,
+        };
         s.refresh();
         Ok(s)
     }
@@ -257,6 +269,35 @@ impl Session {
     pub fn toggle_finger_drawing(&mut self) -> bool {
         self.set_finger_drawing(!self.finger_drawing);
         self.finger_drawing
+    }
+
+    /// The ink choices that are not a pen: what the eraser takes, how wide it is, and whether a
+    /// held pen straightens its stroke.
+    pub fn ink_options(&self) -> InkOptions {
+        self.ink_options
+    }
+
+    /// Sets what the eraser takes, and remembers it in the settings file.
+    pub fn set_eraser_kind(&mut self, kind: EraserKind) {
+        self.ink_options.eraser_kind = kind;
+        let _ = self.settings.set(InkOptions::ERASER_MODE_KEY, kind.id());
+    }
+
+    /// Sets how wide the eraser is, in points across, and remembers it. A width outside the
+    /// limits, or one that is not a number, is refused and changes nothing.
+    pub fn set_eraser_width(&mut self, width: f32) -> bool {
+        if !width.is_finite() || !(crate::tool_state::MIN_ERASER_WIDTH..=crate::tool_state::MAX_ERASER_WIDTH).contains(&width) {
+            return false;
+        }
+        self.ink_options.eraser_width = width;
+        let _ = self.settings.set(InkOptions::ERASER_WIDTH_KEY, &width.to_string());
+        true
+    }
+
+    /// Sets whether a pen held still at the end of a stroke straightens it, and remembers it.
+    pub fn set_hold_to_straighten(&mut self, enabled: bool) {
+        self.ink_options.hold_to_straighten = enabled;
+        let _ = self.settings.set(InkOptions::HOLD_TO_STRAIGHTEN_KEY, if enabled { "true" } else { "false" });
     }
 }
 

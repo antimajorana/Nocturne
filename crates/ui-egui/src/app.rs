@@ -4069,6 +4069,8 @@ impl NocturneApp {
             space_tool: self.space_tool,
             finger_drawing: self.is_finger_drawing(),
             eraser_auto_return: self.eraser_auto_return,
+            eraser_pixel: self.session.ink_options().eraser_kind == nocturne_engine::EraserKind::Pixel,
+            eraser_width: self.session.ink_options().eraser_width,
             show_minimap: self.show_minimap,
             table_borders: self.caret_table_has_borders(),
             table_align: self.caret_cells_align(),
@@ -5009,6 +5011,8 @@ impl NocturneApp {
             space_tool: self.space_tool,
             finger_drawing: self.is_finger_drawing(),
             eraser_auto_return: self.eraser_auto_return,
+            eraser_pixel: self.session.ink_options().eraser_kind == nocturne_engine::EraserKind::Pixel,
+            eraser_width: self.session.ink_options().eraser_width,
             show_minimap: self.show_minimap,
             table_borders: self.caret_table_has_borders(),
             table_align: self.caret_cells_align(),
@@ -5462,6 +5466,12 @@ impl NocturneApp {
                 self.show_minimap = !self.show_minimap;
                 let _ = self.session.settings.set("show_minimap", if self.show_minimap { "true" } else { "false" });
             }
+            ribbon::Act::EraserPixel(pixel) => {
+                self.session.set_eraser_kind(if pixel { nocturne_engine::EraserKind::Pixel } else { nocturne_engine::EraserKind::Object });
+            }
+            ribbon::Act::EraserWidthTenths(tenths) => {
+                self.session.set_eraser_width(f32::from(tenths) / 10.0);
+            }
             ribbon::Act::ToggleEraserAutoReturn => {
                 self.eraser_auto_return = !self.eraser_auto_return;
                 let _ = self.session.settings.set("eraser_auto_return", if self.eraser_auto_return { "true" } else { "false" });
@@ -5899,6 +5909,9 @@ impl NocturneApp {
             width: nib.width() * Self::sensitivity_width(self.sensitivity),
             gain: self.gain(),
             curve: self.pressure_curve,
+            pixel_eraser: self.session.ink_options().eraser_kind == nocturne_engine::EraserKind::Pixel,
+            eraser_width: self.session.ink_options().eraser_width,
+            hold_to_straighten: self.session.ink_options().hold_to_straighten,
         }
     }
 
@@ -6559,6 +6572,16 @@ impl NocturneApp {
     /// The box around all the page's ink, `[x0, y0, x1, y1]` in page points, when there is any.
     pub fn ink_bounds(&self) -> Option<[f32; 4]> {
         self.pad.as_ref().and_then(crate::inkpad::Pad::bounds)
+    }
+
+    /// How many pen readings each stroke on the page holds, in the order they were drawn.
+    pub fn ink_dab_counts(&self) -> Vec<usize> {
+        self.pad.as_ref().map(crate::inkpad::Pad::dab_counts).unwrap_or_default()
+    }
+
+    /// The pressure each stroke on the page begins with, in the order they were drawn.
+    pub fn ink_pressures(&self) -> Vec<f32> {
+        self.pad.as_ref().map(crate::inkpad::Pad::first_pressures).unwrap_or_default()
     }
 
     /// True while the page's title has the keyboard.
@@ -9486,6 +9509,8 @@ impl NocturneApp {
                             nib: self.nib,
                             finger_drawing: self.session.finger_drawing(),
                             eraser_auto_return: self.eraser_auto_return,
+                            eraser_pixel: self.session.ink_options().eraser_kind == nocturne_engine::EraserKind::Pixel,
+                            eraser_width: self.session.ink_options().eraser_width,
                             show_minimap: self.show_minimap,
                             can_undo: ed.history.can_undo() || pad.as_ref().is_some_and(crate::inkpad::Pad::can_undo),
                             can_redo: !self.undone.is_empty(),

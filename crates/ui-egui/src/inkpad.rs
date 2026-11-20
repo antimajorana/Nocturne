@@ -30,12 +30,71 @@ pub struct Pen {
     pub gain: f32,
     /// Monotonic pressure-response curve applied before `gain`.
     pub curve: PressureCurve,
+    /// The eraser rubs out only what is under it, cutting strokes, and does not take them whole.
+    pub pixel_eraser: bool,
+    /// How wide the eraser is, in points across. It is the eraser's own, not the pen's.
+    pub eraser_width: f32,
+    /// A pen held still at the end of a nearly straight stroke makes the stroke straight.
+    pub hold_to_straighten: bool,
 }
 
 impl Default for Pen {
     fn default() -> Self {
-        Self { pointer: crate::ribbon::Pointer::Write, tool: Tool::Pen, colour: Rgb::BLACK, width: 3.0, gain: 1.0, curve: PressureCurve::Linear }
+        Self {
+            pointer: crate::ribbon::Pointer::Write,
+            tool: Tool::Pen,
+            colour: Rgb::BLACK,
+            width: 3.0,
+            gain: 1.0,
+            curve: PressureCurve::Linear,
+            pixel_eraser: false,
+            eraser_width: 6.0,
+            hold_to_straighten: true,
+        }
     }
+}
+
+/// How long a pen has to rest for its stroke to be made straight, in seconds.
+pub const HOLD_TO_STRAIGHTEN_SECS: f64 = 2.0;
+
+/// How far the pen may wander while it rests, in points on the screen.
+const HOLD_DRIFT: f32 = 5.0;
+
+/// A pen resting while it draws: where it came to rest, in page points, when, and how many
+/// readings the stroke held then. Readings made while it rests are not part of the line it
+/// drew: a real pen goes on reporting small shifts and changes of pressure for as long as it
+/// is down.
+#[derive(Clone, Copy, Debug)]
+struct Rest {
+    at: (f32, f32),
+    since: f64,
+    drawn: usize,
+}
+
+/// Whether what was drawn before the pen came to rest is near enough to a straight line to be
+/// made one, with `zoom` turning its page points into points on the screen.
+///
+/// It has to be long enough to be a line at all, and not much longer than the straight way
+/// between its ends. A circle, a loop, a zigzag or a written letter is a good deal longer than
+/// that, however small it is: resting the pen after one of those must not flatten it.
+fn nearly_straight(drawn: &[Dab], zoom: f32) -> bool {
+    let (Some(first), Some(last)) = (drawn.first(), drawn.last()) else { return false };
+    let chord = (last.x - first.x).hypot(last.y - first.y);
+    if chord * zoom < 12.0 {
+        return false;
+    }
+    let path: f32 = drawn.windows(2).map(|w| (w[1].x - w[0].x).hypot(w[1].y - w[0].y)).sum();
+    path <= 1.35 * chord
+}
+
+/// Makes `stroke` the straight line from where it began to `to`, at the pressure the pen held
+/// for most of what it drew before it came to rest (the middle one of those readings).
+fn straighten(stroke: &mut Stroke, drawn: usize, to: (f32, f32)) {
+    let Some(first) = stroke.dabs.first().copied() else { return };
+    let mut pressures: Vec<f32> = stroke.dabs.iter().take(drawn.max(1)).map(|d| d.pressure).collect();
+    pressures.sort_by(f32::total_cmp);
+    let pressure = pressures.get(pressures.len() / 2).copied().unwrap_or(1.0);
+    stroke.dabs = vec![Dab::new(first.x, first.y, pressure), Dab::new(to.0, to.1, pressure)];
 }
 
 /// The file a page's ink lives in, inside the page's own folder.
@@ -126,6 +185,10 @@ pub struct Pad {
     /// A pen that writes while a palm holds the window's pointer came down on the page, and has
     /// not lifted yet. Never written to the file.
     pen_on_page: bool,
+    /// Where the pen has come to rest in the stroke being drawn, and since when.
+    rest: Option<Rest>,
+    /// The stroke being drawn was made straight: its end follows the pen until it lifts.
+    straight: bool,
 }
 
 /// How many changes to the ink undo can go back through.
@@ -186,6 +249,8 @@ impl Pad {
             redo_steps: Vec::new(),
             touched: false,
             pen_on_page: false,
+            rest: None,
+            straight: false,
         }
         .with_kept()
     }
@@ -316,6 +381,16 @@ impl Pad {
 
     pub fn strokes(&self) -> usize {
         self.drawing.strokes.len()
+    }
+
+    /// How many pen readings each stroke holds, in the order they were drawn.
+    pub fn dab_counts(&self) -> Vec<usize> {
+        self.drawing.strokes.iter().map(|s| s.dabs.len()).collect()
+    }
+
+    /// The pressure each stroke begins with, in the order they were drawn.
+    pub fn first_pressures(&self) -> Vec<f32> {
+        self.drawing.strokes.iter().filter_map(|s| s.dabs.first().map(|d| d.pressure)).collect()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -650,6 +725,8 @@ pub fn show_with_input_and_handles(
     let mut dropped_grab = false;
     if cancel_uncommitted {
         pad.drawing_now = None;
+        pad.rest = None;
+        pad.straight = false;
         pad.predict_history.clear();
         pad.shape_from = None;
         pad.eraser_last = None;
@@ -844,6 +921,14 @@ pub fn show_with_input_and_handles(
         pad.pen_on_page = false;
     }
     let at = here.filter(|p| body.contains(*p)).map(|p| ((p.x - origin.x) / zoom, (p.y - origin.y) / zoom));
+    // The eraser shows how much it covers, while it is on the page.
+    if pen.pointer == Pointer::Erase
+        && let Some(centre) = here.filter(|p| body.contains(*p) && (down || !over_foreground))
+    {
+        let radius = (pen.eraser_width / 2.0).max(0.5) * zoom;
+        painter.circle_filled(centre, radius, t.accent.gamma_multiply(if down { 0.16 } else { 0.07 }));
+        painter.circle_stroke(centre, radius, egui::Stroke::new(1.0, t.accent.gamma_multiply(0.8)));
+    }
     if pen.pointer != Pointer::Erase {
         pad.eraser_last = None;
         pad.erased_since_press = false;
@@ -852,8 +937,15 @@ pub fn show_with_input_and_handles(
     match pen.pointer {
         Pointer::Erase => {
             if let Some((x, y)) = at.filter(|_| down) {
-                let radius = pen.width.max(6.0) / 2.0;
-                if let Some((lx, ly)) = pad.eraser_last {
+                // The eraser has a width of its own. It used to take the pen's, so a thin pen
+                // made an eraser too small to aim and a highlighter made a huge one.
+                let radius = (pen.eraser_width / 2.0).max(0.5);
+                let (lx, ly) = pad.eraser_last.unwrap_or((x, y));
+                if pen.pixel_eraser {
+                    // Only what the eraser passed over since the last frame goes: the strokes
+                    // it crossed are cut into what is left either side.
+                    changed = pad.drawing.erase_pixel_segment((lx, ly), (x, y), radius);
+                } else {
                     let (dx, dy) = (x - lx, y - ly);
                     let dist = (dx * dx + dy * dy).sqrt();
                     let step = (radius * 0.5).max(1.0);
@@ -864,8 +956,6 @@ pub fn show_with_input_and_handles(
                         let frac = s as f32 / steps as f32;
                         changed |= pad.drawing.erase_at(lx + dx * frac, ly + dy * frac, radius) > 0;
                     }
-                } else {
-                    changed = pad.drawing.erase_at(x, y, radius) > 0;
                 }
                 pad.erased_since_press |= changed;
                 pad.eraser_last = Some((x, y));
@@ -880,6 +970,8 @@ pub fn show_with_input_and_handles(
         Pointer::Draw => {
             if down && pad.drawing_now.is_none() {
                 pad.predict_history.clear();
+                pad.rest = None;
+                pad.straight = false;
                 pad.drawing_now = Some(Stroke::with_curve(pen.tool, pen.colour, pen.width, pen.gain, pen.curve));
             }
             if let Some(stroke) = pad.drawing_now.as_mut() {
@@ -888,7 +980,9 @@ pub fn show_with_input_and_handles(
                 // quick curve into straight lines. Each keeps the force of the touch reported
                 // just before it (a pen's pressure), or the frame's pressure for a mouse. The
                 // frame the pen is lifted in still counts the movements made before it lifted.
+                // A stroke that was made straight takes no more readings: only its end moves.
                 let moves = match &pen_frame {
+                    _ if pad.straight => Vec::new(),
                     Some(pen) => pen
                         .moves
                         .iter()
@@ -924,7 +1018,7 @@ pub fn show_with_input_and_handles(
                     }
                 }
                 // A pen put down and held still moves nowhere: where it rests is the point.
-                if let Some((x, y)) = at.filter(|_| down && moves.is_empty()) {
+                if let Some((x, y)) = at.filter(|_| down && moves.is_empty() && !pad.straight) {
                     let dab = Dab::new(x, y, pressure);
                     stroke.add(dab);
                     let t_secs = pad.predict_history.last().map_or(now_secs, |prev| now_secs.max(prev.time_secs + 1.1e-4));
@@ -934,12 +1028,40 @@ pub fn show_with_input_and_handles(
                         pad.predict_history.drain(..drop);
                     }
                 }
+                // Hold to straighten. A pen that rests for two seconds at the end of a nearly
+                // straight stroke makes it the straight line between its ends, and that line's
+                // end then follows the pen until it lifts. No guess is drawn ahead of a
+                // straight stroke.
+                if pad.straight {
+                    if let (Some((x, y)), Some(first)) = (at.filter(|_| down), stroke.dabs.first().copied()) {
+                        stroke.dabs = vec![first, Dab::new(x, y, first.pressure)];
+                    }
+                    pad.predict_history.clear();
+                } else if pen.hold_to_straighten
+                    && down
+                    && let Some((x, y)) = at
+                {
+                    match pad.rest.filter(|rest| (rest.at.0 - x).hypot(rest.at.1 - y) * zoom <= HOLD_DRIFT) {
+                        Some(rest) if now_secs - rest.since >= HOLD_TO_STRAIGHTEN_SECS => {
+                            let drawn = rest.drawn.clamp(2, stroke.dabs.len().max(2));
+                            if nearly_straight(stroke.dabs.get(..drawn.min(stroke.dabs.len())).unwrap_or_default(), zoom) {
+                                straighten(stroke, drawn, (x, y));
+                                pad.straight = true;
+                                pad.predict_history.clear();
+                            }
+                        }
+                        Some(_) => {}
+                        None => pad.rest = Some(Rest { at: (x, y), since: now_secs, drawn: stroke.dabs.len() }),
+                    }
+                }
                 // The stroke is painted as it grows, so the line follows the pen rather than
                 // appearing when it is lifted.
                 ui.ctx().request_repaint();
             }
             if !down {
                 pad.predict_history.clear();
+                pad.rest = None;
+                pad.straight = false;
                 if let Some(stroke) = pad.drawing_now.take() {
                     changed = pad.drawing.add(stroke);
                 }

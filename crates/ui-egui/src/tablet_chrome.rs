@@ -271,6 +271,8 @@ pub fn show_pencil_pill(ctx: &Context, view_rect: Rect, bottom_clearance: f32, v
     let shapes_open_id = Id::new("studio-shapes-palette-open");
     let mut palette_for = ctx.data(|d| d.get_temp::<Option<usize>>(palette_id)).flatten();
     let mut shapes_open = ctx.data(|d| d.get_temp::<bool>(shapes_open_id)).unwrap_or(false);
+    let eraser_open_id = Id::new("studio-eraser-options-open");
+    let mut eraser_open = ctx.data(|d| d.get_temp::<bool>(eraser_open_id)).unwrap_or(false) && view.pointer == Pointer::Erase;
     if !matches!(view.pointer, Pointer::Shape(_)) {
         shapes_open = false;
     }
@@ -358,6 +360,43 @@ pub fn show_pencil_pill(ctx: &Context, view_rect: Rect, bottom_clearance: f32, v
                     ui.separator();
                 } else if palette_for.is_some() {
                     palette_for = None;
+                }
+
+                if eraser_open {
+                    crate::ribbon::mark_popup_open(ui.ctx());
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        for (pixel, label) in [(false, crate::tl_id!("ui.object_eraser")), (true, crate::tl_id!("ui.pixel_eraser"))] {
+                            let chosen = view.eraser_pixel == pixel;
+                            let button = egui::Button::new(RichText::new(label).small().color(if chosen { t.accent } else { t.text }))
+                                .selected(chosen)
+                                .min_size(vec2(86.0, 28.0));
+                            if ui.add(button).clicked() && !chosen {
+                                acts.push(Act::EraserPixel(pixel));
+                            }
+                        }
+                        ui.separator();
+                        for (name, width) in nocturne_engine::ERASER_SIZES {
+                            let chosen = (view.eraser_width - width).abs() < 0.05;
+                            let size = name.to_ascii_uppercase();
+                            let label = crate::i18n::format_message_id("ui.eraser_size_named", &[("size", &size)]);
+                            let (rect, resp) = ui.allocate_exact_size(vec2(30.0, 28.0), Sense::click());
+                            resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, chosen, &label));
+                            if chosen {
+                                ui.painter().rect_filled(rect, 6.0, t.accent.gamma_multiply(0.18));
+                                ui.painter().rect_stroke(rect, 6.0, Stroke::new(1.2, t.accent), StrokeKind::Inside);
+                            } else if resp.hovered() {
+                                ui.painter().rect_filled(rect, 6.0, t.row_hover);
+                            }
+                            // A dot as wide as the eraser, as far as the button has room for it.
+                            ui.painter().circle_filled(rect.center(), (width / 4.0).clamp(1.5, 11.0), if chosen { t.accent } else { t.text });
+                            if resp.clicked() {
+                                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                                acts.push(Act::EraserWidthTenths((width * 10.0).round() as u16));
+                            }
+                        }
+                    });
+                    ui.separator();
                 }
 
                 if shapes_open && let Pointer::Shape(current_shape) = view.pointer {
@@ -476,10 +515,17 @@ pub fn show_pencil_pill(ctx: &Context, view_rect: Rect, bottom_clearance: f32, v
                         }
                     }
 
+                    // The first tap picks the eraser up; a tap on the eraser already in hand opens
+                    // its choices (object or pixel, and its size) above the pill.
                     if studio_icon_btn(ui, Icon::Eraser, view.pointer == Pointer::Erase, true, crate::tl_id!("ui.toggle_eraser_tip"), t).clicked() {
                         palette_for = None;
                         shapes_open = false;
-                        acts.push(Act::InkPointer(Pointer::Erase));
+                        if view.pointer == Pointer::Erase {
+                            eraser_open = !eraser_open;
+                        } else {
+                            eraser_open = false;
+                            acts.push(Act::InkPointer(Pointer::Erase));
+                        }
                     }
                     let auto_btn = ui
                         .add(
@@ -530,6 +576,7 @@ pub fn show_pencil_pill(ctx: &Context, view_rect: Rect, bottom_clearance: f32, v
     ctx.data_mut(|d| {
         d.insert_temp(palette_id, palette_for);
         d.insert_temp(shapes_open_id, shapes_open);
+        d.insert_temp(eraser_open_id, eraser_open);
     });
     (acts, Some(area_resp.response.rect))
 }

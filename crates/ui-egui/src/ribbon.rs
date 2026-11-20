@@ -102,6 +102,10 @@ pub enum Act {
     FitAllContent,
     /// Show or fold away the infinite-canvas minimap.
     ToggleMinimap,
+    /// Choose the pixel eraser (true) or the object eraser (false).
+    EraserPixel(bool),
+    /// Set how wide the eraser is, in tenths of a point across.
+    EraserWidthTenths(u16),
     /// Toggle automatic return from the eraser to the last writing tool after rubbing ink out.
     ToggleEraserAutoReturn,
     /// Open the Infomaniak kDrive sync setup and status dialog.
@@ -505,6 +509,10 @@ pub struct View<'a> {
     pub finger_drawing: bool,
     /// Whether lifting the eraser after erasing ink switches back to the previous writing tool.
     pub eraser_auto_return: bool,
+    /// The eraser cuts strokes (pixel) and does not take them whole (object).
+    pub eraser_pixel: bool,
+    /// How wide the eraser is, in points across.
+    pub eraser_width: f32,
     /// Whether the infinite-canvas minimap is currently shown.
     pub show_minimap: bool,
     /// True while the caret is in a table, which is when the Table tab is offered.

@@ -109,6 +109,89 @@ impl EraserToggleMode {
     }
 }
 
+/// What the eraser takes when it touches a stroke.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EraserKind {
+    /// The whole stroke.
+    #[default]
+    Object,
+    /// Only the part under the eraser; the stroke is cut into what is left either side.
+    Pixel,
+}
+
+impl EraserKind {
+    /// The stable identifier used by commands and in the settings file.
+    #[must_use]
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Object => "object",
+            Self::Pixel => "pixel",
+        }
+    }
+
+    /// Parses a stable identifier (trimmed, ASCII case-insensitive).
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "object" => Some(Self::Object),
+            "pixel" => Some(Self::Pixel),
+            _ => None,
+        }
+    }
+}
+
+/// The eraser's named sizes and how wide each is, in points across.
+pub const ERASER_SIZES: [(&str, f32); 4] = [("s", 6.0), ("m", 12.0), ("l", 24.0), ("xl", 40.0)];
+
+/// The narrowest and widest the eraser may be, in points across.
+pub const MIN_ERASER_WIDTH: f32 = 2.0;
+pub const MAX_ERASER_WIDTH: f32 = 80.0;
+
+/// The ink choices that are not a pen: remembered in the settings file, the same on every page.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InkOptions {
+    pub eraser_kind: EraserKind,
+    /// How wide the eraser is, in points across. It is the eraser's own, not the pen's.
+    pub eraser_width: f32,
+    /// A pen held still for two seconds at the end of a nearly straight stroke makes it straight.
+    pub hold_to_straighten: bool,
+}
+
+impl Default for InkOptions {
+    fn default() -> Self {
+        // The small eraser is the size the eraser had when it took its width from a thin pen.
+        Self { eraser_kind: EraserKind::Object, eraser_width: ERASER_SIZES[0].1, hold_to_straighten: true }
+    }
+}
+
+impl InkOptions {
+    pub(crate) const ERASER_MODE_KEY: &'static str = "eraser_mode";
+    pub(crate) const ERASER_WIDTH_KEY: &'static str = "eraser_width";
+    pub(crate) const HOLD_TO_STRAIGHTEN_KEY: &'static str = "hold_to_straighten";
+
+    /// Reads the choices from the settings file. Anything missing or unreadable is the default.
+    pub(crate) fn load(settings: &nocturne_store::Settings) -> Self {
+        let fresh = Self::default();
+        Self {
+            eraser_kind: settings.get(Self::ERASER_MODE_KEY).and_then(|v| EraserKind::parse(&v)).unwrap_or(fresh.eraser_kind),
+            eraser_width: settings.get(Self::ERASER_WIDTH_KEY).and_then(|v| Self::parse_width(&v)).unwrap_or(fresh.eraser_width),
+            hold_to_straighten: settings
+                .get(Self::HOLD_TO_STRAIGHTEN_KEY)
+                .map_or(fresh.hold_to_straighten, |v| !v.trim().eq_ignore_ascii_case("false")),
+        }
+    }
+
+    /// A width given as a named size (`s`, `m`, `l`, `xl`) or as points across, within the limits.
+    #[must_use]
+    pub fn parse_width(raw: &str) -> Option<f32> {
+        let raw = raw.trim().to_ascii_lowercase();
+        if let Some((_, width)) = ERASER_SIZES.iter().find(|(name, _)| *name == raw) {
+            return Some(*width);
+        }
+        raw.parse::<f32>().ok().filter(|w| w.is_finite() && (MIN_ERASER_WIDTH..=MAX_ERASER_WIDTH).contains(w))
+    }
+}
+
 /// Synchronized ink tool state tracked by [`crate::Session`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InkToolState {

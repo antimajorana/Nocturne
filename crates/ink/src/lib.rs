@@ -27,6 +27,7 @@
 #![doc(test(attr(deny(warnings))))]
 
 pub mod curve;
+pub mod erase;
 pub mod pick;
 pub mod predict;
 pub mod rack;

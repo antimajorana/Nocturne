@@ -454,6 +454,44 @@ fn ink_finger_drawing(s: &mut Session, p: &Params) -> Result<Output, EngineError
     Ok(Output::Json(serde_json::json!({ "finger_drawing": enabled })))
 }
 
+/// `true`, `false`, or (when missing, empty or `toggle`) the opposite of `now`.
+fn switch_param(p: &Params, key: &str, now: bool) -> Result<bool, EngineError> {
+    match p.get(key).map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("" | "toggle") => Ok(!now),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(_) => Err(EngineError::BadParam(format!("{key} must be true, false, or toggle"))),
+    }
+}
+
+fn ink_eraser_mode(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
+    let now = s.ink_options().eraser_kind;
+    let kind = match p.get("mode").map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("" | "toggle") => match now {
+            crate::EraserKind::Object => crate::EraserKind::Pixel,
+            crate::EraserKind::Pixel => crate::EraserKind::Object,
+        },
+        Some(raw) => crate::EraserKind::parse(raw).ok_or_else(|| EngineError::BadParam("mode must be object, pixel, or toggle".into()))?,
+    };
+    s.set_eraser_kind(kind);
+    Ok(Output::Json(serde_json::json!({ "eraser_mode": kind.id() })))
+}
+
+fn ink_eraser_width(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
+    let bad = || EngineError::BadParam("width must be s, m, l, xl, or points from 2 to 80".into());
+    let width = p.get("width").and_then(|raw| crate::InkOptions::parse_width(raw)).ok_or_else(bad)?;
+    if !s.set_eraser_width(width) {
+        return Err(bad());
+    }
+    Ok(Output::Json(serde_json::json!({ "eraser_width": width })))
+}
+
+fn ink_hold_to_straighten(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
+    let enabled = switch_param(p, "enabled", s.ink_options().hold_to_straighten)?;
+    s.set_hold_to_straighten(enabled);
+    Ok(Output::Json(serde_json::json!({ "hold_to_straighten": enabled })))
+}
+
 fn node_format(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
     let dir = s.resolve(req(p, "path")?)?;
     let raw = req(p, "format")?.trim().to_ascii_lowercase();
@@ -867,6 +905,27 @@ blocks (optional): the justified paragraphs' positions among the page's blocks, 
         params: "enabled (optional): true, false, or toggle; default: toggle",
         changes_tree: false,
         run: ink_finger_drawing,
+    },
+    CommandSpec {
+        id: "ink.eraser_mode",
+        label: "Choose what the eraser takes",
+        params: "mode (optional): object (the whole stroke), pixel (only what is under the eraser), or toggle; default: toggle",
+        changes_tree: false,
+        run: ink_eraser_mode,
+    },
+    CommandSpec {
+        id: "ink.eraser_width",
+        label: "Set the eraser's size",
+        params: "width: s, m, l, xl, or points across from 2 to 80",
+        changes_tree: false,
+        run: ink_eraser_width,
+    },
+    CommandSpec {
+        id: "ink.hold_to_straighten",
+        label: "Straighten a stroke when the pen is held still",
+        params: "enabled (optional): true, false, or toggle; default: toggle",
+        changes_tree: false,
+        run: ink_hold_to_straighten,
     },
     CommandSpec {
         id: "sync.status",
