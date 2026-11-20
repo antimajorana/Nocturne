@@ -118,7 +118,9 @@ imports shared documents placed in `Documents/Inbox/` (Share > Nocturne), and re
     finger lifts (they use the same rule as the page menu, which is tested), and a failure that
     was shown in an alert box not being repeated in the banner.
   - Tablet Studio no longer floats a status box over the page for routine messages, so a
-    message such as a finished save is not shown there at all. A failure is shown on one line
+    message such as a finished save is not shown there at all. The one exception is a sync the
+    user started by hand: its result is shown on one line for six seconds or until it is tapped
+    (a sync that ran by itself stays quiet). A failure is shown on one line
     until it is tapped or the next routine message takes its place. Hover tooltips are off on a
     touch screen. None of this was looked at as a picture: the banner, the Rename box and the
     view menu were measured by tests, not seen.

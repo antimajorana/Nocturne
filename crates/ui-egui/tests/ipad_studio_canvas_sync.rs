@@ -346,7 +346,9 @@ fn background_sync_flushes_dirty_open_page_and_uploads_cleanly() {
     // Dirty the open page in memory WITHOUT manually saving, then start background sync!
     app.set_body("Fresh iPad Pencil + Markdown note");
     step_frame(&ctx, &mut app, egui::RawInput::default());
-    app.start_background_sync(&ctx);
+    // Started by hand, as Sync now does: the user is told when it is done.
+    app.sync_now(&ctx);
+    assert_eq!(app.studio_notice(), None, "nothing is announced before the sync ends");
 
     for _ in 0..80 {
         step_frame(&ctx, &mut app, egui::RawInput::default());
@@ -355,9 +357,23 @@ fn background_sync_flushes_dirty_open_page_and_uploads_cleanly() {
         }
         thread::sleep(std::time::Duration::from_millis(15));
     }
+    // The sync the user started says that it finished, on one line, in Tablet Studio.
+    for _ in 0..200 {
+        step_frame(&ctx, &mut app, egui::RawInput::default());
+        if app.studio_notice().is_some() || app.status_banner_showing() {
+            break;
+        }
+        thread::sleep(std::time::Duration::from_millis(15));
+    }
+    let said = app.studio_notice().map(str::to_string);
     stop.store(true, Ordering::Relaxed);
     let _ = srv_thread.join();
 
     let uploaded = uploaded_body.lock().expect("lock").clone().expect("dirty open page must be flushed and uploaded by start_background_sync");
     assert!(uploaded.contains("Fresh iPad Pencil + Markdown note"), "uploaded markdown missing in-memory edit: {uploaded}");
+    assert!(said.is_some(), "a sync started by hand announces its result when it ends (status: {:?})", app.status());
+    assert!(
+        ctx.memory(|m| m.area_rect(egui::Id::unique("studio-error-banner"))).is_some_and(|r| r.width() >= 240.0 && r.height() <= 48.0),
+        "on one line"
+    );
 }

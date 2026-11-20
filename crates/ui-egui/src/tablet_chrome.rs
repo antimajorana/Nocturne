@@ -753,7 +753,7 @@ pub const ERROR_BANNER_MIN_WIDTH: f32 = 240.0;
 /// with no width of its own, which wrapped the words a few letters to a line. Routine messages
 /// ("Drawing saved, 2 strokes") are no longer shown at all; only a failure is, and it has a
 /// width: at least [`ERROR_BANNER_MIN_WIDTH`], at most the view, cut short with an ellipsis.
-pub fn show_error_banner(ctx: &Context, view_rect: Rect, message: &str, tokens: &Tokens) -> bool {
+pub fn show_error_banner(ctx: &Context, view_rect: Rect, message: &str, is_error: bool, tokens: &Tokens) -> bool {
     let message = message.trim();
     if message.is_empty() {
         return false;
@@ -767,13 +767,15 @@ pub fn show_error_banner(ctx: &Context, view_rect: Rect, message: &str, tokens: 
         |ui| {
             let frame = egui::Frame::NONE
                 .fill(tokens.panel.gamma_multiply(0.97))
-                .stroke(Stroke::new(1.0, tokens.warn))
+                .stroke(Stroke::new(1.0, if is_error { tokens.warn } else { tokens.container_border }))
                 .corner_radius(8.0)
                 .inner_margin(margin)
                 .show(ui, |ui| {
                     ui.set_min_width(ERROR_BANNER_MIN_WIDTH - f32::from(margin.left + margin.right));
                     ui.set_max_width(widest - f32::from(margin.left + margin.right));
-                    ui.add(egui::Label::new(RichText::new(message).color(tokens.warn)).truncate().selectable(false));
+                    ui.add(
+                        egui::Label::new(RichText::new(message).color(if is_error { tokens.warn } else { tokens.text })).truncate().selectable(false),
+                    );
                 });
             let tap = ui.interact(frame.response.rect, Id::new("studio-error-banner-tap"), Sense::click());
             tap.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, message));

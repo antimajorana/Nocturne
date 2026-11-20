@@ -1260,6 +1260,10 @@ pub struct NocturneApp {
     tool_settings_open: bool,
     /// Where the floating header of Tablet Studio was drawn last frame, when a page is open.
     header_pill_rect: Option<egui::Rect>,
+    /// The sync now running was started by hand, so its result is shown when it ends.
+    sync_by_hand: bool,
+    /// A result the user asked for, shown on one line in Tablet Studio for a few seconds.
+    studio_notice: Option<(String, Instant)>,
     /// The page the window closed on has been opened again (once per run).
     restored: bool,
     /// Recovery warnings that were already shown during this run.
@@ -1446,6 +1450,8 @@ impl NocturneApp {
             pen_reads_own_touch: false,
             tool_settings_open: false,
             header_pill_rect: None,
+            sync_by_hand: false,
+            studio_notice: None,
             restored: false,
             icon_recovery_reported: HashSet::new(),
             icon_recovery_suppressed: false,
@@ -4197,6 +4203,17 @@ impl NocturneApp {
         self.dialog = Some(Dialog::CloudSync(crate::sync_ui::CloudSyncForm::from_session(&self.session)));
     }
 
+    /// Starts a sync because the user asked for one: its result is shown when it ends.
+    pub fn sync_now(&mut self, ctx: &Context) {
+        self.sync_by_hand = true;
+        self.start_background_sync(ctx);
+    }
+
+    /// The result Tablet Studio is showing for something the user asked for, while it shows.
+    pub fn studio_notice(&self) -> Option<&str> {
+        self.studio_notice.as_ref().map(|(message, _)| message.as_str())
+    }
+
     pub fn start_background_sync(&mut self, ctx: &Context) {
         if self.sync_job.is_some() {
             return;
@@ -4267,6 +4284,8 @@ impl NocturneApp {
             return;
         };
         self.sync_job = None;
+        // A sync the user started says when it is done; one that ran by itself stays quiet.
+        let by_hand = std::mem::take(&mut self.sync_by_hand);
         match outcome {
             Ok(staged) => {
                 // Flush any edits made while the sync worker was in flight BEFORE applying staged downloads!
@@ -4305,6 +4324,9 @@ impl NocturneApp {
                             form.last_message = Some((msg.clone(), !report.conflicts.is_empty()));
                         }
                         self.say(msg);
+                        if by_hand {
+                            self.studio_notice = Some((self.status.clone(), Instant::now()));
+                        }
                     }
                     Err(err) => {
                         self.sync_dirty_since_last = true;
@@ -11094,6 +11116,7 @@ impl NocturneApp {
                             self.sync_has_token = None;
                         }
                         if out.save_and_sync_now {
+                            self.sync_by_hand = true; // by hand: Save and sync now
                             self.start_background_sync(ctx);
                         } else {
                             form.last_message = Some((crate::tl_id!("ui.kdrive_settings_saved").to_string(), false));
@@ -11726,9 +11749,23 @@ impl NocturneApp {
             && self.dialog.is_none()
             && !self.status.trim().is_empty()
             && self.status_banner_dismissed.as_deref() != Some(self.status.as_str());
-        if self.status_banner_drawn && crate::tablet_chrome::show_error_banner(ctx, ctx.content_rect(), &self.status, &self.tokens) {
+        if self.status_banner_drawn && crate::tablet_chrome::show_error_banner(ctx, ctx.content_rect(), &self.status, true, &self.tokens) {
             self.status_banner_dismissed = Some(self.status.clone());
             self.status_banner_drawn = false;
+        }
+        // A result the user asked for (a sync started by hand) is shown the same way, in the
+        // ordinary colours, for a few seconds or until it is tapped. A failure takes its place.
+        const NOTICE_SECS: u64 = 6;
+        if let Some((message, since)) = self.studio_notice.clone() {
+            let left = std::time::Duration::from_secs(NOTICE_SECS).saturating_sub(since.elapsed());
+            if left.is_zero() || self.status_banner_drawn || !self.is_tablet_studio(ctx) {
+                self.studio_notice = None;
+            } else if self.dialog.is_none() {
+                if crate::tablet_chrome::show_error_banner(ctx, ctx.content_rect(), &message, false, &self.tokens) {
+                    self.studio_notice = None;
+                }
+                ctx.request_repaint_after(left);
+            }
         }
         self.paint_formatting(ctx);
         self.laser_keys(ctx);
