@@ -372,6 +372,85 @@ Parameters:
 
 - enabled (optional): true, false, or toggle; default: toggle
 
+## `ink.eraser_mode`
+
+Choose what the eraser takes.
+
+Parameters:
+
+- mode (optional): object (the whole stroke), pixel (only what is under the eraser), or toggle; default: toggle
+
+## `ink.eraser_width`
+
+Set the eraser's size.
+
+Parameters:
+
+- width: s, m, l, xl, or points across from 2 to 80
+
+## `ink.hold_to_straighten`
+
+Straighten a stroke when the pen is held still.
+
+Parameters:
+
+- enabled (optional): true, false, or toggle; default: toggle
+
+## `ink.math_ocr_toggle`
+
+Turn handwritten equation recognition on or off.
+
+Parameters:
+
+- enabled (optional): true, false, or toggle; default: toggle
+
+## `ink.math_ocr_configure`
+
+Choose the service that reads handwritten equations, and give it its key.
+
+Parameters:
+
+- provider (optional): anthropic, gemini, openai, mathpix, or custom
+- endpoint (optional): the service's address, https only unless it is on this machine; default for the service's own
+- model (optional): the model to ask; default for the service's own
+- key (optional): the service's key, kept outside the settings file and never shown
+- app_id (optional): the app id Mathpix needs beside its key
+- clear_key (optional): true forgets the key
+- without parameters, reports the settings
+
+## `ink.math_ocr_convert`
+
+Read a page's handwritten equation as LaTeX (sends a picture of the ink to the chosen service).
+
+Parameters:
+
+- path (required): the page
+- strokes (optional): which strokes, by position, comma separated; default: all of them
+
+## `ink.configure_tools`
+
+Choose the tools on the Tablet Studio tool bar.
+
+Parameters:
+
+- tools (optional): the tools in order, comma separated, a minus before one to hide it (write, pens, eraser, lasso, select, shapes, picture, math_ocr, history); without it, reports the list
+
+## `ui.toolbar_dock`
+
+Move the Tablet Studio tool bar to an edge.
+
+Parameters:
+
+- edge: bottom, top, left, or right
+
+## `ui.library_view`
+
+Choose how Tablet Studio shows the notebooks and pages.
+
+Parameters:
+
+- view (optional): studio_grid, classic_tree, or toggle; without it, reports the current view
+
 ## `sync.status`
 
 Show Infomaniak kDrive sync settings and last sync summary.

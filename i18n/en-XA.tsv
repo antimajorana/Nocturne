@@ -1027,3 +1027,84 @@
 @id	ui.toggle_minimap	$$$Canvas Minimap@@@
 @id	ui.toggle_minimap_tip	$$$Show or hide the collapsible infinite-canvas minimap@@@
 @id	ui.toggle_studio_layout_btn	$$$Switch Tablet Studio / Classic Ribbon@@@
+@id	ui.draw_with_finger	$$$Draw with finger@@@
+@id	ui.object_eraser	$$$Object eraser@@@
+@id	ui.pixel_eraser	$$$Pixel eraser@@@
+@id	ui.eraser_size_named	$$$Eraser size {size}@@@
+@id	ui.tool_settings	$$$Tool settings@@@
+@id	ui.move_tool_bar	$$$Move the tool bar@@@
+@id	ui.hold_to_straighten	$$$Hold 2 seconds to straighten a line@@@
+@id	ui.tool_settings_eraser	$$$Eraser@@@
+@id	ui.tool_bar_position	$$$Tool bar position@@@
+@id	ui.edge_bottom	$$$Bottom@@@
+@id	ui.edge_top	$$$Top@@@
+@id	ui.edge_left	$$$Left@@@
+@id	ui.edge_right	$$$Right@@@
+@id	ui.tools_on_the_bar	$$$Tools on the bar@@@
+@id	ui.dock_tool_write	$$$Text@@@
+@id	ui.dock_tool_pens	$$$Pens@@@
+@id	ui.dock_tool_eraser	$$$Eraser@@@
+@id	ui.dock_tool_lasso	$$$Lasso@@@
+@id	ui.dock_tool_select	$$$Select@@@
+@id	ui.dock_tool_shapes	$$$Shapes@@@
+@id	ui.dock_tool_history	$$$Undo and redo@@@
+@id	ui.move_earlier_named	$$$Move {tool} earlier@@@
+@id	ui.move_later_named	$$$Move {tool} later@@@
+@id	ui.pens_and_colours	$$$Pens and colours@@@
+@id	ui.add_colour_named	$$$Add a colour to {tool}@@@
+@id	ui.remove_colour_named	$$$Remove a colour from {tool}@@@
+@id	ui.colour_slot_named	$$${tool} colour {n}@@@
+@id	ui.convert_to_latex	$$$Convert to LaTeX@@@
+@id	ui.reading_the_handwriting	$$$Reading the handwriting...@@@
+@id	ui.latex_source	$$$LaTeX@@@
+@id	ui.insert_equation	$$$Insert equation@@@
+@id	ui.latex_not_typeset	$$$This LaTeX cannot be typeset as it stands. It will be kept as written.@@@
+@id	ui.ink_changed_not_converted	$$$The ink changed while it was being read, so nothing was replaced.@@@
+@id	ui.equation_inserted	$$$The handwriting was replaced by an equation. Undo brings the ink back.@@@
+@id	ui.recognise_handwritten_equations	$$$Recognise handwritten equations@@@
+@id	ui.recognition_service	$$$Recognition service@@@
+@id	ui.recognition_service_open	$$$Recognition service...@@@
+@id	ui.recognition_sends_picture	$$$Converting sends a picture of the ink you picked to the service chosen here, and nothing else. Nothing is sent while recognition is off.@@@
+@id	ui.service_address	$$$Address@@@
+@id	ui.model_name	$$$Model@@@
+@id	ui.service_key	$$$Key@@@
+@id	ui.app_id	$$$App id@@@
+@id	ui.key_is_kept	$$$A key is kept for this service.@@@
+@id	ui.no_key_kept	$$$No key is kept for this service.@@@
+@id	ui.forget_key	$$$Forget key@@@
+@id	ui.save_service	$$$Save@@@
+@id	ui.recognition_service_saved	$$$Recognition service saved.@@@
+@id	ui.ocr_provider_anthropic	$$$Anthropic@@@
+@id	ui.ocr_provider_gemini	$$$Gemini@@@
+@id	ui.ocr_provider_openai	$$$OpenAI@@@
+@id	ui.ocr_provider_mathpix	$$$Mathpix@@@
+@id	ui.ocr_provider_custom	$$$Custom@@@
+@id	ui.ocr_error_disabled	$$$Equation recognition is turned off.@@@
+@id	ui.ocr_error_not_configured	$$$Equation recognition needs a service and its key first. Open Tool Settings.@@@
+@id	ui.ocr_error_unsupported	$$$Equation recognition is not available in this build.@@@
+@id	ui.ocr_error_no_ink	$$$There is no ink to read.@@@
+@id	ui.ocr_error_auth	$$$The recognition service did not accept the key.@@@
+@id	ui.ocr_error_busy	$$$The recognition service is busy. Try again shortly.@@@
+@id	ui.ocr_error_refused	$$$The recognition service declined to read this.@@@
+@id	ui.ocr_error_cut_off	$$$The recognition service's answer was cut off.@@@
+@id	ui.ocr_error_status	$$$The recognition service answered with status {code}.@@@
+@id	ui.ocr_error_transport	$$$The recognition service could not be reached.@@@
+@id	ui.ocr_error_bad_reply	$$$The recognition service sent no LaTeX.@@@
+@id	ui.library_recents	$$$Recents@@@
+@id	ui.library_handwrite	$$$Handwrite@@@
+@id	ui.library_type	$$$Type@@@
+@id	ui.library_import	$$$Import@@@
+@id	ui.library_import_document	$$$Import document@@@
+@id	ui.library_import_picture	$$$Import picture@@@
+@id	ui.library_clear_search	$$$Clear search@@@
+@id	ui.library_no_recent_pages	$$$No recent pages yet.@@@
+@id	ui.back_to_library	$$$Back to library@@@
+@id	ui.library_view_heading	$$$Library view@@@
+@id	ui.library_view_grid	$$$Library grid@@@
+@id	ui.library_view_tree	$$$Classic tree@@@
+@id	ui.use_classic_tree	$$$Use classic tree@@@
+@id	ui.use_library_grid	$$$Use library grid@@@
+@id	ui.dock_tool_picture	$$$Picture@@@
+@id	ui.dock_tool_math_ocr	$$$Math OCR@@@
+@id	ui.dock_insert_picture	$$$Insert picture@@@
+@id	ui.dock_math_ocr	$$$Recognise equation@@@

@@ -65,8 +65,7 @@ pub fn show(ui: &mut Ui, body: egui::Rect, acts: &mut Vec<Act>, t: &Tokens) {
     let bar = floating::show_bar(ui.ctx(), id().with("bar"), area.rect, &floating::text_bar_with_fonts(fonts), t, acts);
     picked |= bar.picked;
 
-    let away = |p: egui::Pos2| !area.rect.contains(p) && !bar.rect.contains(p);
-    let out = ui.input(|i| i.pointer.any_click()) && !opened_now && away(pointer.unwrap_or_default());
+    let out = floating::pressed_outside(ui, opened_now, |p| area.rect.contains(p) || bar.rect.contains(p));
     if picked || out || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         ui.data_mut(|d| d.remove::<egui::Pos2>(id()));
     }

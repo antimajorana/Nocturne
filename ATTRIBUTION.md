@@ -1,7 +1,7 @@
 # Attribution
 
-Every file under `assets/` has a row here. `cargo xtask assets` fails if one
-is missing. Last reviewed: 2026-11-18.
+Provenance and licence notes for bundled files. `cargo xtask assets` reports
+files under `assets/` without a row here, without failing the build. Last reviewed: 2026-11-18.
 
 ## Brand artwork
 

@@ -61,6 +61,9 @@ pub struct GestureBridgeState {
     pub pending_pinch: Option<(f32, Option<[f32; 2]>)>,
     pub needs_pointer_release: bool,
     pub known_stylus_ids: BTreeSet<u64>,
+    /// The contact the window layer is turning into the pointer: the first one down, until it
+    /// lifts. Followed here because pointer events do not say which contact made them.
+    pub pointer_touch: Option<u64>,
 }
 
 impl GestureBridgeState {
@@ -303,8 +306,27 @@ fn filter_events_core<E, M, R, G>(
     let mut suppressed_non_stylus_pointer = false;
     let mut kept_non_stylus_primary_press = false;
     let mut already_released_in_frame = false;
+    // The window layer makes a pointer of the first contact alone. A palm that landed before
+    // the pen is that contact: while the pen writes, the palm's pointer must not move or press
+    // anything. Which contact owns the pointer is followed from the touches themselves, in the
+    // order the window layer sends them (a touch, then the pointer events made from it), and
+    // not from positions: a contact's lift can be reported a little away from its last move.
+    let mut pointer_owner = state.pointer_touch;
 
     for ev in events.drain(..) {
+        if let EventKind::Touch { id, phase, .. } = classify(&ev) {
+            match phase {
+                PureTouchPhase::Start if state.pointer_touch.is_none() => {
+                    state.pointer_touch = Some(id);
+                    pointer_owner = Some(id);
+                }
+                // The pointer events of a lift come after its touch, so the owner is remembered
+                // until the frame ends.
+                PureTouchPhase::End | PureTouchPhase::Cancel if state.pointer_touch == Some(id) => state.pointer_touch = None,
+                _ => {}
+            }
+        }
+        let palm_owns_pointer = stylus_active && pointer_owner.is_some_and(|id| !frame_stylus_ids.contains(&id));
         match classify(&ev) {
             EventKind::Touch { id, is_stylus_force, .. } => {
                 let is_stylus = is_stylus_force || frame_stylus_ids.contains(&id);
@@ -327,14 +349,15 @@ fn filter_events_core<E, M, R, G>(
                 }
             }
             EventKind::PointerMoved(pos) => {
-                if should_suppress_pointer(pos) {
+                if should_suppress_pointer(pos) || palm_owns_pointer {
                     suppressed_non_stylus_pointer = true;
                 } else {
                     filtered.push(ev);
                 }
             }
             EventKind::PointerButton { primary: true, pressed, pos } => {
-                if should_suppress_pointer(pos) {
+                // A palm's release is let through: it only lets go of the palm's own press.
+                if should_suppress_pointer(pos) || (palm_owns_pointer && pressed) {
                     suppressed_non_stylus_pointer = true;
                 } else {
                     if pressed {
@@ -977,6 +1000,68 @@ mod tests {
         let mut events = vec![finger_end, PureInputEvent::PointerMoved([120.0, 220.0])];
         filter_pure_events(&mut events, &mut state, false, false);
         assert_eq!(events, vec![finger_end]);
+    }
+
+    /// iPad Studio UX v2, phase 1. The window layer turns only the first contact into a pointer.
+    /// A palm that lands before the pen is that contact: while the pen writes, the palm's
+    /// pointer must not reach the page, native gesture or not.
+    #[test]
+    fn palm_pointer_is_suppressed_while_a_stylus_writes_without_a_native_gesture() {
+        let press = |pos, pressed| PureInputEvent::PointerButton { pos, primary: true, pressed };
+        let mut state = GestureBridgeState::default();
+        let none = BTreeSet::new();
+        let stylus_ids = BTreeSet::from([2]);
+
+        // The palm lands first and becomes the pointer. Nothing is held back yet.
+        let palm_start = touch_event(1, PureTouchPhase::Start, [20.0, 20.0], None);
+        let mut landing = vec![palm_start, PureInputEvent::PointerMoved([20.0, 20.0]), press([20.0, 20.0], true)];
+        filter_pure_events_with_stylus_ids(&mut landing, &mut state, false, &none);
+        assert_eq!(landing.len(), 3);
+        assert_eq!(state.pointer_touch, Some(1));
+
+        // The pen lands and writes; the palm rolls. The palm's pointer move is dropped, both touches stay.
+        let pen_start = touch_event(2, PureTouchPhase::Start, [300.0, 300.0], Some(0.5));
+        let pen_move = touch_event(2, PureTouchPhase::Move, [305.0, 300.0], Some(0.5));
+        let palm_move = touch_event(1, PureTouchPhase::Move, [20.0, 21.0], None);
+        let mut frame = vec![pen_start, palm_move, PureInputEvent::PointerMoved([20.0, 21.0]), pen_move];
+        filter_pure_events_with_stylus_ids(&mut frame, &mut state, true, &stylus_ids);
+        assert_eq!(frame, vec![pen_start, palm_move, pen_move]);
+        assert_eq!(state.pointer_touch, Some(1), "the pen did not take the pointer from the palm");
+
+        // The palm lifts while the pen still writes: its release goes through, so nothing is left pressed.
+        let palm_end = touch_event(1, PureTouchPhase::End, [20.0, 21.0], None);
+        let mut lift = vec![palm_end, press([20.0, 21.0], false), PureInputEvent::PointerGone, pen_move];
+        filter_pure_events_with_stylus_ids(&mut lift, &mut state, true, &stylus_ids);
+        assert_eq!(lift, vec![palm_end, press([20.0, 21.0], false), PureInputEvent::PointerGone, pen_move]);
+        assert!(!state.needs_pointer_release);
+        assert_eq!(state.pointer_touch, None);
+    }
+
+    /// A pen that lands first is the pointer itself. All of its pointer events are kept, the
+    /// release too when the lift is reported a little away from the last move.
+    #[test]
+    fn a_pen_that_owns_the_pointer_keeps_every_pointer_event_of_its_own() {
+        let press = |pos, pressed| PureInputEvent::PointerButton { pos, primary: true, pressed };
+        let mut state = GestureBridgeState::default();
+        let stylus_ids = BTreeSet::from([7]);
+        let (a, b) = ([300.0, 300.0], [300.6, 300.4]);
+        let pen_start = touch_event(7, PureTouchPhase::Start, a, Some(0.4));
+        let mut landing = vec![pen_start, PureInputEvent::PointerMoved(a), press(a, true)];
+        filter_pure_events_with_stylus_ids(&mut landing, &mut state, false, &stylus_ids);
+        assert_eq!(landing, vec![pen_start, PureInputEvent::PointerMoved(a), press(a, true)]);
+
+        // A palm comes down afterwards: it makes no pointer, and changes nothing.
+        let palm_start = touch_event(1, PureTouchPhase::Start, [20.0, 20.0], None);
+        let mut palm = vec![palm_start];
+        filter_pure_events_with_stylus_ids(&mut palm, &mut state, true, &stylus_ids);
+        assert_eq!(state.pointer_touch, Some(7));
+
+        // The lift is at `b`; the window layer sends the release at the last move, `a`.
+        let pen_end = touch_event(7, PureTouchPhase::End, b, Some(0.0));
+        let mut lift = vec![pen_end, press(a, false), PureInputEvent::PointerGone];
+        filter_pure_events_with_stylus_ids(&mut lift, &mut state, true, &stylus_ids);
+        assert_eq!(lift, vec![pen_end, press(a, false), PureInputEvent::PointerGone], "the pen's own release is never dropped");
+        assert!(!state.needs_pointer_release);
     }
 
     #[test]

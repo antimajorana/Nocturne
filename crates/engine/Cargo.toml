@@ -14,6 +14,8 @@ workspace = true
 nocturne-model = { workspace = true }
 nocturne-formats = { workspace = true }
 nocturne-store = { workspace = true }
+nocturne-ink = { workspace = true }
+image = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
 web-time = { workspace = true }

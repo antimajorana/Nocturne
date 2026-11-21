@@ -559,7 +559,8 @@ fn multiline_insert_text_and_marked_composition_preserve_blocks_in_nocturne_app(
 fn focus_block_zero(ctx: &egui::Context, app: &mut NocturneApp) {
     step_app_frame(ctx, app, egui::RawInput::default());
     let page = app.page_rect().expect("page_rect populated");
-    let tap_pos = Pos2::new(page.min.x + 24.0, page.min.y + 64.0);
+    let origin = app.editor_origin().unwrap_or(page.min);
+    let tap_pos = Pos2::new(origin.x + 24.0, origin.y + 24.0);
     let mut click_raw = egui::RawInput::default();
     click_raw.events.push(egui::Event::PointerMoved(tap_pos));
     click_raw.events.push(egui::Event::PointerButton {
@@ -1182,9 +1183,18 @@ fn scrolled_page_view_rect_and_foreground_pill_do_not_steal_or_poison_native_ges
     let view_page = app.page_view_rect().expect("page_view_rect");
     assert!(raw_page.min.y < view_page.min.y, "scrolling down shifts page_rect above page_view_rect: {raw_page:?} vs {view_page:?}");
 
-    // A touch in the Studio top bar (`y = 20.0`) must be OUTSIDE the visible canvas `GestureRect`!
+    // With a page open Tablet Studio has no bar across the window any more: the page view reaches
+    // the top, and a small header floats over its top left corner. A touch above the visible
+    // page view is still outside the canvas, and a touch on the floating header is inside it but
+    // must block the native pan, as a touch on the tool bar does.
     let visible_rect = nocturne_ios::gestures::GestureRect::from_bounds([view_page.min.x, view_page.min.y, view_page.max.x, view_page.max.y]);
-    assert!(!visible_rect.contains(view_page.center().x, 20.0), "top-bar touch must not count as in_canvas when scrolled");
+    assert!(!visible_rect.contains(view_page.center().x, view_page.min.y - 4.0), "a touch above the page view is not in the canvas");
+    assert!(view_page.min.y < 40.0, "the page view reaches the top of the window: {view_page:?}");
+    let header_pos = Pos2::new(view_page.min.x + 36.0, view_page.min.y + 34.0);
+    assert!(
+        nocturne_ios::gestures::egui_overlay_blocks_native_gesture(&ctx, app.has_canvas_blocking_overlay(), Some(header_pos)),
+        "touching the floating header must block UIKit native pan"
+    );
 
     // Touching directly on the floating Order::Foreground Pencil pill MUST block native pan,
     // and once released (`None` touch_pos on next idle frame), open canvas MUST NOT remain poisoned!

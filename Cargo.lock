@@ -3039,7 +3039,9 @@ dependencies = [
 name = "nocturne-engine"
 version = "0.0.13"
 dependencies = [
+ "image",
  "nocturne-formats",
+ "nocturne-ink",
  "nocturne-model",
  "nocturne-store",
  "serde_json",

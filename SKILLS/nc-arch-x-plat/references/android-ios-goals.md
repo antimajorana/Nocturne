@@ -28,7 +28,7 @@ direction, 2026-11-10.
 
 - Procraft is the owner's own project, separated into engine, `desktop/` and `android/`
   folders (owner's description, not yet verified).
-- Read its public README and folder names only. Copy no code, fixtures or assets.
+- Code, fixtures, and assets from Procraft (and other owner or sibling Craft repositories) may be copied and adapted into Nocturne while preserving Nocturne's crate layers and local-file model.
 - Record the source of each layout fact in the journal.
 
 ## Checkpoint

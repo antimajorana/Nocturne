@@ -1,7 +1,9 @@
 use crate::commands::{self, Output, Params};
 use crate::error::EngineError;
 use crate::sync::{SecretStore, SyncHttpClient, default_http_client, default_secret_store};
-use crate::tool_state::{EraserToggleMode, InkActiveMode, InkPenKind, InkToolState};
+use crate::tool_state::{
+    DockRoster, EraserKind, EraserToggleMode, InkActiveMode, InkOptions, InkPenKind, InkToolState, LibraryView, StudioOptions, ToolbarDock,
+};
 use nocturne_store::tree::{self, Node};
 use nocturne_store::{Settings, StoreError};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -21,6 +23,8 @@ pub struct Session {
     tree: Vec<Node>,
     ink_tool: InkToolState,
     finger_drawing: bool,
+    ink_options: InkOptions,
+    studio_options: StudioOptions,
     sync_http: Arc<dyn SyncHttpClient>,
     sync_secrets: Arc<dyn SecretStore>,
 }
@@ -30,6 +34,8 @@ pub struct Session {
 const OPEN_KEY: &str = "open_notebooks";
 const CLOSED_KEY: &str = "closed_notebooks";
 const SEP: char = '|';
+/// Whether one finger draws. Off unless the file says `true`.
+const FINGER_DRAWING_KEY: &str = "finger_drawing";
 
 impl Session {
     /// Opens (and creates, if needed) the notebooks folder `root`.
@@ -42,6 +48,9 @@ impl Session {
             settings.get(CLOSED_KEY).map(|v| v.split(SEP).map(str::trim).filter(|p| !p.is_empty()).map(PathBuf::from).collect()).unwrap_or_default();
         let sync_http = default_http_client();
         let sync_secrets = default_secret_store(&settings);
+        let ink_options = InkOptions::load(&settings);
+        let studio_options = StudioOptions::load(&settings);
+        let finger_drawing = settings.get(FINGER_DRAWING_KEY).is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
         let mut s = Session {
             root,
             extra,
@@ -49,7 +58,9 @@ impl Session {
             settings,
             tree: Vec::new(),
             ink_tool: InkToolState::default(),
-            finger_drawing: false,
+            finger_drawing,
+            ink_options,
+            studio_options,
             sync_http,
             sync_secrets,
         };
@@ -251,15 +262,75 @@ impl Session {
         self.finger_drawing
     }
 
-    /// Explicitly sets whether single-finger touch draws on the canvas.
+    /// Explicitly sets whether single-finger touch draws on the canvas, and remembers it in the
+    /// settings file. A settings file that cannot be written does not undo the choice: it still
+    /// holds for this session, as the other remembered tool choices do.
     pub fn set_finger_drawing(&mut self, enabled: bool) {
         self.finger_drawing = enabled;
+        let _ = self.settings.set(FINGER_DRAWING_KEY, if enabled { "true" } else { "false" });
     }
 
     /// Toggles `finger_drawing` and returns the new state.
     pub fn toggle_finger_drawing(&mut self) -> bool {
-        self.finger_drawing = !self.finger_drawing;
+        self.set_finger_drawing(!self.finger_drawing);
         self.finger_drawing
+    }
+
+    /// The ink choices that are not a pen: what the eraser takes, how wide it is, and whether a
+    /// held pen straightens its stroke.
+    pub fn ink_options(&self) -> InkOptions {
+        self.ink_options
+    }
+
+    /// Sets what the eraser takes, and remembers it in the settings file.
+    pub fn set_eraser_kind(&mut self, kind: EraserKind) {
+        self.ink_options.eraser_kind = kind;
+        let _ = self.settings.set(InkOptions::ERASER_MODE_KEY, kind.id());
+    }
+
+    /// Sets how wide the eraser is, in points across, and remembers it. A width outside the
+    /// limits, or one that is not a number, is refused and changes nothing.
+    pub fn set_eraser_width(&mut self, width: f32) -> bool {
+        if !width.is_finite() || !(crate::tool_state::MIN_ERASER_WIDTH..=crate::tool_state::MAX_ERASER_WIDTH).contains(&width) {
+            return false;
+        }
+        self.ink_options.eraser_width = width;
+        let _ = self.settings.set(InkOptions::ERASER_WIDTH_KEY, &width.to_string());
+        true
+    }
+
+    /// Sets whether a pen held still at the end of a stroke straightens it, and remembers it.
+    pub fn set_hold_to_straighten(&mut self, enabled: bool) {
+        self.ink_options.hold_to_straighten = enabled;
+        let _ = self.settings.set(InkOptions::HOLD_TO_STRAIGHTEN_KEY, if enabled { "true" } else { "false" });
+    }
+
+    /// How Tablet Studio is laid out: the edge its tool bar sits on, and the tools on it.
+    pub fn studio_options(&self) -> StudioOptions {
+        self.studio_options
+    }
+
+    /// Moves the Tablet Studio tool bar to an edge of the page view, and remembers it.
+    pub fn set_toolbar_dock(&mut self, dock: ToolbarDock) {
+        self.studio_options.toolbar_dock = dock;
+        let _ = self.settings.set(StudioOptions::TOOLBAR_DOCK_KEY, dock.id());
+    }
+
+    /// Sets which tools the Tablet Studio tool bar shows and in what order, and remembers it.
+    pub fn set_dock_roster(&mut self, roster: DockRoster) {
+        self.studio_options.roster = roster;
+        let _ = self.settings.set(StudioOptions::DOCK_TOOLS_KEY, &roster.write());
+    }
+
+    /// How Tablet Studio presents notebooks and pages when browsing the library.
+    pub fn library_view(&self) -> LibraryView {
+        self.studio_options.library_view
+    }
+
+    /// Sets how Tablet Studio presents notebooks and pages when browsing the library, and remembers it.
+    pub fn set_library_view(&mut self, view: LibraryView) {
+        self.studio_options.library_view = view;
+        let _ = self.settings.set(StudioOptions::LIBRARY_VIEW_KEY, view.id());
     }
 }
 

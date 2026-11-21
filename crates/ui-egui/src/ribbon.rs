@@ -102,12 +102,32 @@ pub enum Act {
     FitAllContent,
     /// Show or fold away the infinite-canvas minimap.
     ToggleMinimap,
+    /// Move the Tablet Studio tool bar to an edge of the page view.
+    ToolbarDock(nocturne_engine::ToolbarDock),
+    /// Set which tools the Tablet Studio tool bar shows, and in what order.
+    DockRoster(nocturne_engine::DockRoster),
+    /// Open or close the Tool Settings screen.
+    ToggleToolSettings,
+    /// Turn hold to straighten on or off.
+    ToggleHoldToStraighten,
+    /// Choose the pixel eraser (true) or the object eraser (false).
+    EraserPixel(bool),
+    /// Set how wide the eraser is, in tenths of a point across.
+    EraserWidthTenths(u16),
     /// Toggle automatic return from the eraser to the last writing tool after rubbing ink out.
     ToggleEraserAutoReturn,
     /// Open the Infomaniak kDrive sync setup and status dialog.
     OpenCloudSync,
     /// Switch between Tablet Studio chrome and the Classic Ribbon.
     ToggleStudioLayout,
+    /// Turn handwritten equation recognition on or off (`ink.math_ocr_toggle`).
+    ToggleMathOcr,
+    /// Open the handwritten equation recognition service dialog (`ink.math_ocr_configure`).
+    OpenMathOcrSetup,
+    /// Choose how Tablet Studio presents notebooks and pages (`ui.library_view`).
+    LibraryView(nocturne_engine::LibraryView),
+    /// Trigger the Tablet Studio dock Math OCR button action.
+    DockMathOcr,
     /// Cut or copy what is selected.
     Clipboard(&'static str),
     /// Put the clipboard into the page: a picture as a file beside it, anything else as
@@ -505,6 +525,10 @@ pub struct View<'a> {
     pub finger_drawing: bool,
     /// Whether lifting the eraser after erasing ink switches back to the previous writing tool.
     pub eraser_auto_return: bool,
+    /// The eraser cuts strokes (pixel) and does not take them whole (object).
+    pub eraser_pixel: bool,
+    /// How wide the eraser is, in points across.
+    pub eraser_width: f32,
     /// Whether the infinite-canvas minimap is currently shown.
     pub show_minimap: bool,
     /// True while the caret is in a table, which is when the Table tab is offered.
@@ -545,6 +569,10 @@ pub struct View<'a> {
     /// buttons show as pressed (issue #255).
     pub marks: crate::pageedit::Marks,
     pub font_size: Option<&'a str>,
+    /// Whether handwritten equation recognition (`ink.math_ocr_toggle`) is enabled.
+    pub math_ocr_enabled: bool,
+    /// Whether the active page currently has lassoed/picked ink held on the canvas.
+    pub holding_ink: bool,
 }
 
 impl View<'_> {

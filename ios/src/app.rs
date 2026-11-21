@@ -4,7 +4,7 @@ use crate::{clipboard, diagnostics, edit_menu, gestures, http, inbox, keyboard, 
 use nocturne_engine::Session;
 use nocturne_store::Settings;
 use nocturne_ui_egui::clipboard::Board as _;
-use nocturne_ui_egui::touch_ux::{TouchLongPress, apply_mobile_touch_input_options, apply_mobile_touch_style};
+use nocturne_ui_egui::touch_ux::{TouchLongPress, apply_mobile_touch_input_options, apply_mobile_touch_style, normalize_pencil_force};
 use nocturne_ui_egui::{NocturneApp, PlatformEditAction};
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
@@ -364,6 +364,10 @@ impl eframe::App for Shell {
             kb.apply_to_raw_input(screen_h, raw_input);
         }
 
+        // A Pencil with no pressure sensor (USB-C) reports 0 of a possible 0, which arrives here
+        // as a force that is not a number. It is still a pen, so it gets a middle pressure
+        // before anything asks whether this contact is a pen or a finger.
+        normalize_pencil_force(&mut raw_input.events);
         let frame_stylus_ids = self.prepare_stylus_ids_for_frame(&raw_input.events);
         let pointer_was_down = ctx.input(|i| i.pointer.primary_down());
 
@@ -432,6 +436,9 @@ impl eframe::App for Shell {
         }
 
         let now_secs = raw_input.time.unwrap_or_else(|| ctx.input(|i| i.time));
+        // What is left of a finger whose long press already became a context click: its lift
+        // must not click the menu shut, nor count as a tap on the page under it.
+        self.long_press.filter_consumed(&mut raw_input.events);
         if let Some(long_press_pos) = self.long_press.update(now_secs, &raw_input.events) {
             let page_rect = self.app.page_rect();
             let canvas_view = self.app.page_view_rect().or(page_rect);
@@ -441,8 +448,10 @@ impl eframe::App for Shell {
                 let page_arr = page_rect.map(|r| [r.min.x, r.min.y, r.width(), r.height()]);
                 let near_caret = edit_menu::is_long_press_near_caret([long_press_pos.x, long_press_pos.y], caret_arr, page_arr);
                 let is_writable = caret_rect.is_some() && !self.app.show_source();
+                // The title is typed through egui's text box, and still gets the native edit menu.
+                let app_caret = caret_rect.is_some() && (!self.egui_wants_ime || self.app.title_is_focused());
                 if let Some(bridge) = self.bridge.as_ref()
-                    && edit_menu::should_present_native_edit_menu(caret_rect.is_some() && !self.egui_wants_ime && near_caret, true)
+                    && edit_menu::should_present_native_edit_menu(app_caret && near_caret, true)
                 {
                     let target_arr = edit_menu::compute_menu_target_rect(caret_arr, Some([long_press_pos.x, long_press_pos.y]));
                     let target_rect = egui::Rect::from_min_size(egui::pos2(target_arr[0], target_arr[1]), egui::vec2(target_arr[2], target_arr[3]));
@@ -453,19 +462,7 @@ impl eframe::App for Shell {
                     };
                     bridge.edit_menu.present(&bridge.view, target_rect, has_selection, can_paste, is_writable);
                 } else {
-                    raw_input.events.push(egui::Event::PointerMoved(long_press_pos));
-                    raw_input.events.push(egui::Event::PointerButton {
-                        pos: long_press_pos,
-                        button: egui::PointerButton::Secondary,
-                        pressed: true,
-                        modifiers: egui::Modifiers::NONE,
-                    });
-                    raw_input.events.push(egui::Event::PointerButton {
-                        pos: long_press_pos,
-                        button: egui::PointerButton::Secondary,
-                        pressed: false,
-                        modifiers: egui::Modifiers::NONE,
-                    });
+                    self.long_press.consume_as_context_click(&mut raw_input.events, long_press_pos);
                 }
                 ctx.request_repaint();
             }
@@ -513,7 +510,7 @@ impl eframe::App for Shell {
         // and steals focus from `NocturneTextInputView`.
         let ime_cursor_rect = ctx.output_mut(|o| o.ime.take().map(|ime| ime.cursor_rect));
         let caret_rect = self.app.keyboard_caret_rect();
-        self.egui_wants_ime = text_input::should_route_ime_to_egui(ime_cursor_rect, caret_rect, self.app.page_rect(), &ctx);
+        self.egui_wants_ime = text_input::route_ime_to_egui(self.app.title_is_focused(), ime_cursor_rect, caret_rect, self.app.page_rect(), &ctx);
         if !self.egui_wants_ime {
             self.egui_ime_preedit = false;
         } else {
@@ -541,7 +538,13 @@ impl eframe::App for Shell {
             let selected_text = if self.egui_wants_ime { String::new() } else { self.app.selected_text_for_platform() };
             let pointer_is_write = caret_rect.is_some() || self.egui_wants_ime;
             let is_writable = should_focus;
-            bridge.text_input.sync_state(should_focus, effective_caret, &selected_text, pointer_is_write, is_writable);
+            // A one-line field egui owns (a name in a dialog, the page title, search) is shown to
+            // the keyboard whole, with its real selection: an empty field cannot be deleted
+            // from, and gives the keyboard no words to make suggestions from.
+            let field = if self.egui_wants_ime { self.app.focused_text_field(&ctx) } else { None };
+            let document = field.as_ref().map(|f| (f.text.as_str(), f.selection));
+            let pending = !self.pending_text_commands.is_empty();
+            bridge.text_input.sync_state(should_focus, effective_caret, &selected_text, document, pending, pointer_is_write, is_writable);
         }
     }
 

@@ -70,14 +70,16 @@ imports shared documents placed in `Documents/Inbox/` (Share > Nocturne), and re
   helps:
   - Moving the caret from UIKit (arrow keys on a Magic Keyboard, the trackpad, a tap that
     UIKit's text system handles) updates only the bridge's own text model:
-    `setSelectedTextRange:` in `text_input.rs` does not move the app's caret. The bridge's text
-    window is also not reset when the app's caret moves, a paste lands, or input switches
-    between the page and an egui field.
+    `setSelectedTextRange:` in `text_input.rs` does not move the app's caret. For the page's own
+    caret the bridge's text window is also not reset when the app's caret moves or a paste
+    lands. For a one-line egui field (a dialog's name box, the page title, search) the window
+    is the whole field since 2026-11-20 and follows the app, so a caret moved from UIKit there
+    is put back to where the app has it on the next frame. Switching between the page and such
+    a field starts the window afresh.
   - `gestures.rs` mixes UIKit points with egui points, which differ when the Interface size
     setting is not 100%.
-  - A resting palm can start the native one-finger pan while the Pencil draws, and the Pencil
-    cannot start a stroke while a finger or palm that touched first is still down
-    (`inkpad.rs`, Write mode switching inks at the palm's position).
+  - A resting palm can start the native one-finger pan while the Pencil draws. The ink itself no
+    longer follows the palm: see the 2026-11-20 entry below.
   - The pinch-zoom anchor treats the page column's origin as fixed, but it moves with zoom.
   - The first-responder request is made only when focus is first wanted and is not retried.
   - The edit menu's anchor rect is given in egui points where UIKit expects view points, and
@@ -92,6 +94,110 @@ imports shared documents placed in `Documents/Inbox/` (Share > Nocturne), and re
     click injection (`TouchLongPress` at 0.50 s) is gated to the open page canvas when no modal,
     dialog, backstage screen, or foreground overlay is active, so deliberate taps on dialog and
     toolbar buttons still click.
+- **iPad fixes of 2026-11-20 are tested on the host and compile for the iPad, and have not run on
+  one.** Each is tested with the events the iPad sends, replayed against the real window on a
+  desktop host; the UIKit glue that feeds them (`ios/src/app.rs`, the `ios` module of
+  `ios/src/text_input.rs`) is only compile-checked for `aarch64-apple-ios`. What was fixed, and
+  what the device still has to show:
+  - Spaces typed in the page title were dropped, because a space on its own was trimmed away.
+    The title is now typed through its own text box and keeps every space; only the saved title
+    is trimmed at its ends.
+  - A name field in a dialog (Rename, Add, New notebook), the page title and search are shown to
+    the keyboard whole, with the real selection (`NocturneApp::focused_text_field`). The
+    keyboard is told the selection changed only when the app changed it, not after every
+    letter. Whether suggestions, autocorrect and the two-language keyboard now behave is for
+    the device to show.
+  - Those dialogs ask for the keyboard when they open, and again after a click that left
+    nothing with the keyboard, where they used to ask on every frame. Rename and Add sit on a
+    modal backdrop as New notebook does, and Rename closes on Escape.
+  - Typing in the page through the platform keyboard works out the page as it would be saved
+    once per letter and uses it twice, where it was worked out twice. The page text is still
+    written once per letter, and undo still copies the page's blocks. No test counts this, and
+    the lag was not measured on the iPad, so whether typing feels faster there is not known.
+  - Not covered by a test: the picture menu and the container menu staying open when a held
+    finger lifts (they use the same rule as the page menu, which is tested), and a failure that
+    was shown in an alert box not being repeated in the banner.
+  - Tablet Studio no longer floats a status box over the page for routine messages, so a
+    message such as a finished save is not shown there at all. The one exception is a sync the
+    user started by hand: its result is shown on one line for six seconds or until it is tapped
+    (a sync that ran by itself stays quiet). A failure is shown on one line
+    until it is tapped or the next routine message takes its place. Hover tooltips are off on a
+    touch screen. None of this was looked at as a picture: the banner, the Rename box and the
+    view menu were measured by tests, not seen.
+  - A menu opened by holding a finger stays open when the finger lifts
+    (`TouchLongPress::consume_as_context_click`). The page, picture and container menus close on
+    a new press outside them, not on any click.
+  - A palm that lands before the Pencil no longer draws, and the stroke follows the Pencil
+    (`Stylus::stylus_frame`). This path is used only while a finger or palm is down with the
+    pen; a pen alone still draws through the window's pointer as before. On the iPad the
+    palm's pointer moves are also dropped while the Pencil is down (`gestures.rs`, which follows
+    which contact owns the pointer).
+  - A Pencil that reports no pressure (the USB-C model reports 0 of a possible 0) is given a
+    middle pressure, so it is taken for a pen and not a finger. Read from the winit and
+    egui-winit sources; not seen on such a pencil.
+  - Finger drawing is off by default, is remembered in `settings.toml`, and its switch in
+    Tablet Studio is the labelled `Draw with finger` entry of the Tool Settings screen (the
+    three dots on the tool bar).
+- **The two erasers and hold to straighten (2026-11-20) are tested on the host only.** What they
+  do, and what is still open:
+  - The eraser has a kind (`ink.eraser_mode`: `object` takes the whole stroke, `pixel` cuts out
+    what is under it) and a width of its own (`ink.eraser_width`: `s` 6, `m` 12, `l` 24, `xl` 40
+    points across, or a number from 2 to 80). Both are kept in `settings.toml`. A fresh install
+    has the object eraser at 6 points, which is what the eraser was when it took its width
+    from a thin pen. With a thick pen or a highlighter in hand the eraser used to be wider than
+    that; it no longer follows the pen.
+  - The pixel eraser cuts where the middle of the stroke is the eraser's radius plus half the
+    stroke's width away, so the round end of each piece meets the eraser's edge. Points are
+    added to a stroke only near a cut, more thinly the further from it. A sheet already holding
+    20,000 strokes keeps only as many pieces as there is room for, and the rest of the cut
+    stroke is lost; nothing says so on screen.
+  - A drag of either eraser is one step to undo. The eraser shows a ring as wide as itself
+    while it is over the page.
+  - In Tablet Studio a tap on the eraser already in hand opens its kind and size above the tool
+    pill. The classic ribbon has no control for them yet: there they are set by command only.
+  - A pen held still for two seconds (within 5 points on the screen) at the end of a stroke
+    makes it the straight line between its ends, whose end then follows the pen until it lifts
+    (`ink.hold_to_straighten`, on by default, in `settings.toml`). Only a stroke at least 12
+    points long that is at most 1.35 times as long as the straight way between its ends is
+    straightened, so a loop, a zigzag or a letter is left alone; what the pen reports while it
+    rests is not counted. It applies to a mouse on the desktop as well. The two seconds and
+    the limit were not tried by hand on a pen.
+  - The window keeps drawing frames while a stroke is in progress, as it did before; nothing
+    was done to rest it while the pen is still.
+- **Handwritten equations to LaTeX (2026-11-20) are tested against a loopback server only, not
+  against live services or a physical iPad.** Both the engine commands (`ink.math_ocr_toggle`,
+  `ink.math_ocr_configure`, `ink.math_ocr_convert`) and the window workflow (the "Convert to
+  LaTeX" button over held ink when enabled, the editable single-line LaTeX source with live
+  RaTeX preview, positioned `MathBlock` insertion in one Undo/Redo step, and the Tool Settings
+  toggle plus Recognition service screen) are built and tested against a loopback HTTP server:
+  recognition is off by default and sends nothing while off, the ink picture is rasterised in
+  Rust, and keys are kept per service and cleared when that service's address changes without a
+  new key. Live external services (Anthropic, Gemini, OpenAI, Mathpix) and physical iPad
+  hardware have not been exercised in the cloud; the request shapes and default model names come
+  from each service's reference documentation.
+- **The movable tool bar, Tool Settings and the floating header of Tablet Studio (2026-11-20) are
+  tested on the host only, and were not looked at as pictures.** What they do, and what is open:
+  - The tool bar sits on the bottom, top, left or right edge of the page view (`ui.toolbar_dock`,
+    kept in `settings.toml`). It is moved by dragging its grip, which outlines the edge it
+    would land on, or from Tool Settings. On the left and right it runs down the page and
+    scrolls when it is taller than the view. What a tool opens (colours, the eraser's kinds,
+    shapes) is drawn on the side facing the page. The safe area and a docked keyboard are not
+    taken into account beyond what the page view already allows for.
+  - Which tools are on the bar and in what order is a setting (`ink.configure_tools`). The
+    tools are text, pens, eraser, lasso, select, shapes, and undo with redo. Picture and
+    equation recognition are not tools on the bar yet.
+  - Tool Settings (the three dots on the bar) holds Draw with finger, hold to straighten, the
+    eraser's kind, the bar's edge, the tools on the bar, and each kind of pen with its colours.
+    A pen's colours are places on the pen rack: up to 12 for one kind of pen, and 24 on the
+    rack in all, so not every kind can have 12 at once. The thickness shown is that of the pen
+    in hand. The pressure curve is still one setting for all pens.
+  - The pens on the bar are still drawn as the small pen pictures they were, not as the upright
+    colour-banded pens of the reference picture, and the pen in hand is outlined, not raised.
+  - With a page open, the bar across the top of the window is replaced by a small floating
+    header at the top left of the page: the drawer, a new page, sync, and three dots for back,
+    forward, search, the File screen and the view menu. It lies over the top left of the page,
+    title included. With no page open, the bar across the top is still drawn.
+  - The minimap is at the top right and moves clear of a tool bar docked at the top or right.
 - **Infomaniak kDrive sync (`api.infomaniak.com` on desktop and iPadOS) has only been verified against a loopback server in CI.**
   The kDrive REST v2/v3 client and two-phase 3-way reconciler (`crates/engine/src/sync/`) are
   tested against an in-process loopback HTTP server on desktop, and `ios/src/http.rs`

@@ -130,6 +130,41 @@ fn stay_above(ui: &Ui, backdrop: egui::LayerId) {
     ui.ctx().set_sublayer(backdrop, ui.layer_id());
 }
 
+/// The text boxes a platform keyboard types into besides the page: each has a fixed id, so the
+/// window can say which one has the keyboard ([`NocturneApp::focused_text_field`]).
+const RENAME_FIELD: &str = "rename-title-field";
+const ADD_FIELD: &str = "add-title-field";
+const NEW_NOTEBOOK_FIELD: &str = "new-notebook-name-field";
+pub(crate) const SEARCH_FIELD: &str = "search-all-pages-field";
+
+/// The one-line name box of a dialog. It asks for the keyboard when the dialog opens, and again
+/// after a click that left nothing with the keyboard, and at no other time.
+///
+/// It used to ask on every frame. That kept typing and Enter working after a click on another
+/// of the dialog's controls, which takes the keyboard from the box as a click anywhere else
+/// does. On an iPad it also made the keyboard drop and rise on every frame. So the box now
+/// gets the keyboard back once such a click is over, and a keyboard put away without a click
+/// (the iPad's own hide key) stays away.
+fn name_field(ui: &mut Ui, text: &mut String, id: &str, opened_now: bool) -> egui::Response {
+    let id = egui::Id::new(id);
+    // A window's first frame only measures it: its widgets are disabled there, and a text box
+    // that is disabled gives the keyboard straight back. So the one request waits for the
+    // first frame the box can take it.
+    let waiting = id.with("wants-keyboard");
+    if opened_now {
+        ui.data_mut(|d| d.insert_temp(waiting, true));
+    }
+    if ui.is_enabled() && !ui.is_sizing_pass() && ui.data_mut(|d| d.remove_temp::<bool>(waiting)).unwrap_or(false) {
+        ui.memory_mut(|m| m.request_focus(id));
+    }
+    let response = ui.add(egui::TextEdit::singleline(text).id(id));
+    if ui.input(|i| i.pointer.any_click()) && ui.memory(|m| m.focused().is_none()) {
+        ui.data_mut(|d| d.insert_temp(waiting, true));
+        ui.ctx().request_repaint();
+    }
+    response
+}
+
 /// Modal actions use a readable size based on their label instead of egui's compact default.
 // i18n-ui-text: label
 fn modal_button(ui: &mut Ui, tokens: &Tokens, label: &str, primary: bool) -> egui::Response {
@@ -707,7 +742,7 @@ fn page_title(ui: &mut Ui, ed: &mut Editor, tokens: &Tokens, title_id: egui::Id,
             .return_key(None)
             .show(ui);
         if ed.title_buf.contains(['\n', '\r']) {
-            ed.title_buf = one_line(&ed.title_buf);
+            ed.title_buf = line_breaks_to_spaces(&ed.title_buf);
         }
         let tapped_title = tap_at.is_some_and(|p| out.response.rect.contains(p));
         if tapped_title {
@@ -776,9 +811,12 @@ fn table_size(rows: &str, columns: &str) -> Option<(usize, usize)> {
     Some((r, c))
 }
 
-/// A title as one line: the line breaks a paste brought in become single spaces.
-fn one_line(text: &str) -> String {
-    text.split(['\n', '\r']).map(str::trim).filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" ")
+/// What is typed or pasted into a title, kept on one line: each line break becomes one space,
+/// and nothing else is touched. Spaces are not trimmed here. A space arrives from the iPad
+/// keyboard as a text of its own, and trimming it left titles with no spaces at all
+/// (two words arrived as one). The ends are trimmed once, when the title is saved.
+fn line_breaks_to_spaces(text: &str) -> String {
+    text.replace("\r\n", " ").replace(['\n', '\r'], " ")
 }
 
 /// What to do with a file the user dropped on a page.
@@ -910,6 +948,7 @@ enum Dialog {
         name: String,
     },
     CloudSync(crate::sync_ui::CloudSyncForm),
+    MathOcrSetup(crate::math_ocr::Setup),
 }
 
 struct ImportJob {
@@ -982,6 +1021,15 @@ pub enum PlatformEditAction {
     Paste,
     SelectAll,
     Delete,
+}
+
+/// The one-line text field that has the keyboard, as a platform keyboard needs to see it: all
+/// of its text and where the selection is, in characters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlatformTextField {
+    pub text: String,
+    /// `(start, end)` of the selection in characters, in order. Equal when it is only a caret.
+    pub selection: (usize, usize),
 }
 
 const TOUCH_PAN_SLOP: f32 = 8.0;
@@ -1057,7 +1105,6 @@ pub struct NocturneApp {
     last_ctx_is_ios: bool,
     status: String,
     status_is_error: bool,
-    status_shown_at: Option<Instant>,
     /// The host keeps notebook files only for this session, rather than on durable storage.
     session_only_storage: bool,
     search: String,
@@ -1202,6 +1249,26 @@ pub struct NocturneApp {
     page_opened: bool,
     /// Put the keyboard in the search box on the next frame.
     focus_search: bool,
+    /// The kind of dialog drawn last frame, so a dialog knows the frame it opens in.
+    dialog_shown: Option<std::mem::Discriminant<Dialog>>,
+    /// The failure banner of Tablet Studio: tapped away, and whether it was drawn last frame.
+    status_banner_dismissed: Option<String>,
+    status_banner_drawn: bool,
+    /// A pen is writing while a finger or palm is also on the glass: until the pen lifts, the
+    /// ink reads the pen's own touch and not the window's pointer (`stylus::StylusFrame`).
+    pen_reads_own_touch: bool,
+    /// The Tool Settings screen of Tablet Studio is open.
+    tool_settings_open: bool,
+    /// Where the floating header of Tablet Studio was drawn last frame, when a page is open.
+    header_pill_rect: Option<egui::Rect>,
+    pencil_pill_rect: Option<egui::Rect>,
+    math_ocr: Option<crate::math_ocr::Conversion>,
+    pending_math_ocr_start: bool,
+    library_grid: crate::library_grid::LibraryGrid,
+    /// The sync now running was started by hand, so its result is shown when it ends.
+    sync_by_hand: bool,
+    /// A result the user asked for, shown on one line in Tablet Studio for a few seconds.
+    studio_notice: Option<(String, Instant)>,
     /// The page the window closed on has been opened again (once per run).
     restored: bool,
     /// Recovery warnings that were already shown during this run.
@@ -1273,6 +1340,7 @@ impl NocturneApp {
         let show_minimap = session.settings.get("show_minimap").map(|v| !v.trim().eq_ignore_ascii_case("false")).unwrap_or(true);
         let minimap_collapsed = session.settings.get("minimap_collapsed").map(|v| !v.trim().eq_ignore_ascii_case("false")).unwrap_or(true);
         let eraser_auto_return = session.settings.get("eraser_auto_return").is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
+        let library_grid = crate::library_grid::LibraryGrid::load(&session.settings);
         let mut app = NocturneApp {
             session,
             saver: crate::saver::Saver::default(),
@@ -1304,7 +1372,6 @@ impl NocturneApp {
             last_ctx_is_ios: cfg!(target_os = "ios"),
             status: crate::tl_id!("ui.ready_2").into(),
             status_is_error: false,
-            status_shown_at: None,
             session_only_storage: false,
             search: String::new(),
             searched: String::new(),
@@ -1383,6 +1450,18 @@ impl NocturneApp {
             compact_full_page: false,
             page_opened: false,
             focus_search: false,
+            dialog_shown: None,
+            status_banner_dismissed: None,
+            status_banner_drawn: false,
+            pen_reads_own_touch: false,
+            tool_settings_open: false,
+            header_pill_rect: None,
+            pencil_pill_rect: None,
+            math_ocr: None,
+            pending_math_ocr_start: false,
+            library_grid,
+            sync_by_hand: false,
+            studio_notice: None,
             restored: false,
             icon_recovery_reported: HashSet::new(),
             icon_recovery_suppressed: false,
@@ -1476,7 +1555,7 @@ impl NocturneApp {
             return;
         }
         self.restored = true;
-        let Some(saved) = self.session.settings.get("last_page") else { return };
+        let Some(saved) = self.session.settings.get("last_page").filter(|s| !s.trim().is_empty()) else { return };
         let path = self.session.root().join(saved.trim().replace('/', std::path::MAIN_SEPARATOR_STR));
         if !path.is_dir() {
             return;
@@ -2011,7 +2090,12 @@ impl NocturneApp {
     /// Returns `true` when a modal dialog, backstage screen, source view, or floating window blocks
     /// raw canvas long-press injection (`TouchLongPress` on iPadOS).
     pub fn has_canvas_blocking_overlay(&self) -> bool {
-        self.external_gesture_blocked() || self.ribbon_peek || self.theme_window || self.import_job.is_some()
+        self.external_gesture_blocked()
+            || self.ribbon_peek
+            || self.theme_window
+            || self.import_job.is_some()
+            || self.tool_settings_open
+            || matches!(self.math_ocr.as_ref().map(|c| &c.stage), Some(crate::math_ocr::Stage::Preview { .. }))
     }
 
     /// Returns `true` when the window renders the simplified Tablet Studio chrome instead of the
@@ -2044,6 +2128,14 @@ impl NocturneApp {
             } else {
                 self.dialog = None;
             }
+            return true;
+        }
+        if self.math_ocr.is_some() {
+            self.math_ocr = None;
+            return true;
+        }
+        if self.tool_settings_open {
+            self.tool_settings_open = false;
             return true;
         }
         if self.ribbon_peek || self.painter.is_some() {
@@ -2223,7 +2315,7 @@ impl NocturneApp {
                 }
                 PlatformEditAction::Paste => {
                     if let Some(text) = self.clipboard.text() {
-                        let clean = one_line(&text);
+                        let clean = line_breaks_to_spaces(&text);
                         if let Some(ed) = self.editor.as_mut() {
                             let end = ed.title_buf.chars().count();
                             let sel = ed.title_selection.unwrap_or((end, end));
@@ -2341,10 +2433,7 @@ impl NocturneApp {
         }
         let Some(ed) = self.editor.as_mut() else { return };
         if ed.title_focused {
-            let clean = one_line(text);
-            if clean.is_empty() {
-                return;
-            }
+            let clean = line_breaks_to_spaces(text);
             let end = ed.title_buf.chars().count();
             let sel = ed.title_selection.unwrap_or((end, end));
             let (next, at) = pageedit::insert_at_caret(&ed.title_buf, sel, &clean);
@@ -2397,15 +2486,15 @@ impl NocturneApp {
                 ed.restore_format_selection = Some((c.block, c.selection.0, c.selection.1));
             }
         }
-        ed.rebuild_body();
-        Self::mark_dirty_from_blocks(ed);
         if has_open_across {
+            ed.rebuild_body();
+            Self::mark_dirty_from_blocks(ed);
             Self::remember_edit(ed);
             if across_marks.0 || across_marks.1 {
                 self.save_block_marks(across_marks);
             }
         } else {
-            Self::remember_step(ed);
+            Self::note_typing(ed);
         }
     }
 
@@ -2490,9 +2579,7 @@ impl NocturneApp {
                 ed.restore_format_selection = Some((c.block, c.selection.0, c.selection.1));
             }
         }
-        ed.rebuild_body();
-        Self::mark_dirty_from_blocks(ed);
-        Self::remember_step(ed);
+        Self::note_typing(ed);
     }
 
     /// Joins the caret's line onto the line above for [`Self::delete_backward_platform`]. The
@@ -2768,7 +2855,6 @@ impl NocturneApp {
     pub fn say(&mut self, msg: impl Into<String>) {
         self.status = msg.into();
         self.status_is_error = false;
-        self.status_shown_at = Some(Instant::now());
     }
 
     /// Says something went wrong, in our own words rather than the engine's.
@@ -2778,13 +2864,15 @@ impl NocturneApp {
     pub fn alert(&mut self, key: &str, title: &str, message: &str) {
         self.status = message.to_string();
         self.status_is_error = true;
-        self.status_shown_at = Some(Instant::now());
         if self.muted_alerts.contains(key) {
             return;
         }
         if self.session.settings.get(&format!("{key}_never")).as_deref() == Some("true") {
             return;
         }
+        // A box says it, so Tablet Studio's failure banner does not say it again once the box is
+        // closed. An alert the user has muted has no box, and the banner is then how it is seen.
+        self.status_banner_dismissed = Some(self.status.clone());
         let showing = matches!(&self.dialog, Some(Dialog::Alert { key: k, .. }) if k == key);
         let queued = self.queued_alerts.iter().any(|d| matches!(d, Dialog::Alert { key: k, .. } if k == key));
         if showing || queued {
@@ -2802,13 +2890,11 @@ impl NocturneApp {
     fn complain(&mut self, msg: &str) {
         self.status = msg.to_string();
         self.status_is_error = true;
-        self.status_shown_at = Some(Instant::now());
     }
 
     fn fail(&mut self, e: &EngineError) {
         self.status = crate::i18n::format_message_id("ui.could_not_complete_the_action_error", &[("error", &e.to_string())]);
         self.status_is_error = true;
-        self.status_shown_at = Some(Instant::now());
     }
 
     fn run(&mut self, id: &str, p: &Params) -> Option<Output> {
@@ -2840,6 +2926,7 @@ impl NocturneApp {
         let editor_path = self.editor.as_ref().map(|editor| editor.dir.clone());
         let Some(Output::Path(new_path)) = self.run(command, &params(&[("path", &path_str(path))])) else { return };
         self.nav.relocate(path, &new_path);
+        self.library_grid.relocate(path, &new_path, &self.session.settings);
         let remap = |candidate: &Path| candidate.strip_prefix(path).map_or_else(|_| candidate.to_path_buf(), |suffix| new_path.join(suffix));
         self.open = self.open.iter().map(|branch| remap(branch)).collect();
         self.selected = self.selected.as_deref().map(remap);
@@ -2902,6 +2989,7 @@ impl NocturneApp {
             return;
         }
         self.nav.relocate(path, &new_path);
+        self.library_grid.relocate(path, &new_path, &self.session.settings);
         let remap = |candidate: &Path| candidate.strip_prefix(path).map_or_else(|_| candidate.to_path_buf(), |suffix| new_path.join(suffix));
         self.open = self.open.iter().map(|branch| remap(branch)).collect();
         self.selected = self.selected.as_deref().map(remap);
@@ -3007,6 +3095,8 @@ impl NocturneApp {
             self.remember_recent_notebook(&notebook);
         }
         self.nav.visit(dir);
+        self.library_grid.record_recent_page(dir, &self.session.settings);
+        self.library_grid.select_for_page(dir);
         self.open_page_inner(dir);
     }
 
@@ -3118,6 +3208,9 @@ impl NocturneApp {
             self.pad = Some(crate::inkpad::Pad::of_page(dir));
             // Another page, another history: nothing undone on the last one is redone here.
             self.undone.clear();
+            if self.math_ocr.as_ref().is_some_and(|c| c.page != dir) {
+                self.math_ocr = None;
+            }
             self.absorb_old_sheets(dir);
             self.sync_ink_reference();
             self.selected = Some(dir.to_path_buf());
@@ -3208,6 +3301,7 @@ impl NocturneApp {
                     ed.last_saved = Some(ts);
                     ed.saved_body = body;
                 }
+                self.library_grid.invalidate_page(&dir);
                 self.sync_dirty_since_last = true;
                 self.last_local_edit_at = Some(Instant::now());
                 self.say(self.saved_caption(None));
@@ -3251,6 +3345,7 @@ impl NocturneApp {
                         }
                         ed.saved_body = saved.body;
                     }
+                    self.library_grid.invalidate_page(&saved.dir);
                     self.sync_dirty_since_last = true;
                     self.last_local_edit_at = Some(Instant::now());
                     self.say(self.saved_caption(None));
@@ -3578,9 +3673,9 @@ impl NocturneApp {
             Act::Add(parent, parent_kind) => {
                 let kind = parent_kind.may_contain().first().copied().unwrap_or(NodeKind::Page);
                 let kind = if parent_kind == NodeKind::Notebook || parent_kind == NodeKind::SectionGroup { NodeKind::Section } else { kind };
-                self.dialog = Some(Dialog::Add { parent, parent_kind, title: String::new(), kind, format: None });
+                self.open_add_dialog(parent, parent_kind, kind);
             }
-            Act::NewNotebook => self.dialog = Some(Dialog::NewNotebook { name: String::new(), format: None }),
+            Act::NewNotebook => self.open_new_notebook_dialog(),
             Act::CloseNotebook(path) => {
                 self.save_now();
                 let was_showing = self.editor.as_ref().is_some_and(|ed| ed.dir.starts_with(&path));
@@ -3604,7 +3699,7 @@ impl NocturneApp {
             }
             Act::ChooseRoot => self.choose_notebooks_folder(),
             Act::AddKind(parent, parent_kind, kind) => {
-                self.dialog = Some(Dialog::Add { parent, parent_kind, title: String::new(), kind, format: None });
+                self.open_add_dialog(parent, parent_kind, kind);
             }
             Act::AddPageAt(section, order) => {
                 let path = path_str(&section);
@@ -3634,7 +3729,7 @@ impl NocturneApp {
                 }
             }
             Act::NewPage(parent) => self.create_page_in(&parent),
-            Act::Rename(path, title) => self.dialog = Some(Dialog::Rename { path, title }),
+            Act::Rename(path, title) => self.open_rename_dialog(path, title),
             Act::MoveOrCopy(path) => self.open_move_or_copy(&path),
             Act::MakeSubpage(path) => self.reparent_page(&path, "node.demote"),
             Act::PromoteSubpage(path) => self.reparent_page(&path, "node.promote"),
@@ -4018,6 +4113,8 @@ impl NocturneApp {
             space_tool: self.space_tool,
             finger_drawing: self.is_finger_drawing(),
             eraser_auto_return: self.eraser_auto_return,
+            eraser_pixel: self.session.ink_options().eraser_kind == nocturne_engine::EraserKind::Pixel,
+            eraser_width: self.session.ink_options().eraser_width,
             show_minimap: self.show_minimap,
             table_borders: self.caret_table_has_borders(),
             table_align: self.caret_cells_align(),
@@ -4037,12 +4134,20 @@ impl NocturneApp {
             font_family: family,
             font_size: size,
             marks,
+            math_ocr_enabled: self.session.ocr_config().enabled,
+            holding_ink: self.pad.as_ref().is_some_and(|p| p.holding() > 0),
         }
     }
 
     fn studio_top_bar(&mut self, ui: &mut Ui) {
+        if self.is_studio_grid(ui.ctx()) && self.editor.is_none() && self.backstage.is_none() {
+            self.header_pill_rect = None;
+            self.band_bottom = ui.ctx().content_rect().min.y;
+            return;
+        }
         let tokens = self.tokens;
         let drawer_open = !self.full_page;
+        let library_view = self.session.library_view();
         let can_back = self.nav.can_back();
         let can_forward = self.nav.can_forward();
         let breadcrumb = self.editor.as_ref().map(|ed| ed.title.clone()).unwrap_or_default();
@@ -4052,13 +4157,23 @@ impl NocturneApp {
             .get_or_insert_with(|| self.session.sync_secrets().get_secret(nocturne_engine::KDRIVE_TOKEN_KEY).ok().flatten().is_some());
         let show_source = self.show_source;
         let mut out = crate::tablet_chrome::StudioTopBarOut::default();
-        egui::Panel::top("studio-top-bar").show_separator_line(false).show(ui, |ui| {
-            let font_sel = self.font_selection(ui.ctx());
+        // With a page open the bar across the window gives way to a small floating header at the
+        // top left of the page, so the page reaches the top of the screen. In StudioGrid there is
+        // no side drawer, so the content rect serves on the very first frame as well.
+        let header_at = if self.editor.is_some() && self.backstage.is_none() {
+            if self.is_studio_grid(ui.ctx()) { Some(self.page_view_rect.unwrap_or_else(|| ui.ctx().content_rect())) } else { self.page_view_rect }
+        } else {
+            None
+        };
+        if let Some(view_rect) = header_at {
+            let ctx = ui.ctx().clone();
+            let font_sel = self.font_selection(&ctx);
             let mut search_buf = std::mem::take(&mut self.search);
             let mut focus_search = self.focus_search;
-            let view = self.current_view_state(ui.ctx(), None, None, font_sel.marks);
+            let view = self.current_view_state(&ctx, None, None, font_sel.marks);
             let input = crate::tablet_chrome::StudioTopBarIn {
                 drawer_open,
+                library_view,
                 can_back,
                 can_forward,
                 breadcrumb: &breadcrumb,
@@ -4067,14 +4182,42 @@ impl NocturneApp {
                 show_source,
                 view,
             };
-            out = crate::tablet_chrome::show_top_bar(ui, &input, &mut search_buf, &mut focus_search, &tokens);
+            let (pill_out, rect) = crate::tablet_chrome::show_header_pill(&ctx, view_rect, &input, &mut search_buf, &mut focus_search, &tokens);
+            out = pill_out;
             self.search = search_buf;
             self.focus_search = focus_search;
-            self.band_bottom = ui.min_rect().max.y;
-        });
+            self.header_pill_rect = Some(rect);
+            self.band_bottom = ctx.content_rect().min.y;
+        } else {
+            self.header_pill_rect = None;
+            egui::Panel::top("studio-top-bar").show_separator_line(false).show(ui, |ui| {
+                let font_sel = self.font_selection(ui.ctx());
+                let mut search_buf = std::mem::take(&mut self.search);
+                let mut focus_search = self.focus_search;
+                let view = self.current_view_state(ui.ctx(), None, None, font_sel.marks);
+                let input = crate::tablet_chrome::StudioTopBarIn {
+                    drawer_open,
+                    library_view,
+                    can_back,
+                    can_forward,
+                    breadcrumb: &breadcrumb,
+                    sync_busy,
+                    sync_configured,
+                    show_source,
+                    view,
+                };
+                out = crate::tablet_chrome::show_top_bar(ui, &input, &mut search_buf, &mut focus_search, &tokens);
+                self.search = search_buf;
+                self.focus_search = focus_search;
+                self.band_bottom = ui.min_rect().max.y;
+            });
+        }
         if out.toggle_drawer {
             self.full_page = !self.full_page;
             self.compact_full_page = false;
+        }
+        if out.back_to_library {
+            self.close_to_library();
         }
         if out.nav_back {
             self.go_back();
@@ -4107,6 +4250,17 @@ impl NocturneApp {
 
     pub fn open_cloud_sync_dialog(&mut self) {
         self.dialog = Some(Dialog::CloudSync(crate::sync_ui::CloudSyncForm::from_session(&self.session)));
+    }
+
+    /// Starts a sync because the user asked for one: its result is shown when it ends.
+    pub fn sync_now(&mut self, ctx: &Context) {
+        self.sync_by_hand = true;
+        self.start_background_sync(ctx);
+    }
+
+    /// The result Tablet Studio is showing for something the user asked for, while it shows.
+    pub fn studio_notice(&self) -> Option<&str> {
+        self.studio_notice.as_ref().map(|(message, _)| message.as_str())
     }
 
     pub fn start_background_sync(&mut self, ctx: &Context) {
@@ -4179,6 +4333,8 @@ impl NocturneApp {
             return;
         };
         self.sync_job = None;
+        // A sync the user started says when it is done; one that ran by itself stays quiet.
+        let by_hand = std::mem::take(&mut self.sync_by_hand);
         match outcome {
             Ok(staged) => {
                 // Flush any edits made while the sync worker was in flight BEFORE applying staged downloads!
@@ -4203,6 +4359,7 @@ impl NocturneApp {
                 match nocturne_engine::apply_staged_sync(staged, &self.session.settings) {
                     Ok(report) => {
                         self.session.refresh();
+                        self.library_grid.invalidate_all();
                         if reload_open
                             && let Some(dir) = self.editor.as_ref().map(|e| e.dir.clone())
                             && dir.is_dir()
@@ -4217,6 +4374,9 @@ impl NocturneApp {
                             form.last_message = Some((msg.clone(), !report.conflicts.is_empty()));
                         }
                         self.say(msg);
+                        if by_hand {
+                            self.studio_notice = Some((self.status.clone(), Instant::now()));
+                        }
                     }
                     Err(err) => {
                         self.sync_dirty_since_last = true;
@@ -4335,8 +4495,12 @@ impl NocturneApp {
         // on a phone it does not run over the Quick Access Toolbar.
         let left_used = left.min_rect().right() - row.left();
         let search_width = (right.available_width() - left_used - 8.0).clamp(60.0, 200.0);
-        let resp =
-            right.add(egui::TextEdit::singleline(&mut self.search).hint_text(crate::tl_id!("ui.search_all_pages")).desired_width(search_width));
+        let resp = right.add(
+            egui::TextEdit::singleline(&mut self.search)
+                .id(egui::Id::new(SEARCH_FIELD))
+                .hint_text(crate::tl_id!("ui.search_all_pages"))
+                .desired_width(search_width),
+        );
         if self.focus_search {
             resp.request_focus();
             self.focus_search = false;
@@ -4954,6 +5118,8 @@ impl NocturneApp {
             space_tool: self.space_tool,
             finger_drawing: self.is_finger_drawing(),
             eraser_auto_return: self.eraser_auto_return,
+            eraser_pixel: self.session.ink_options().eraser_kind == nocturne_engine::EraserKind::Pixel,
+            eraser_width: self.session.ink_options().eraser_width,
             show_minimap: self.show_minimap,
             table_borders: self.caret_table_has_borders(),
             table_align: self.caret_cells_align(),
@@ -4973,6 +5139,8 @@ impl NocturneApp {
             font_family: family.as_deref(),
             font_size: size.as_deref(),
             marks: font_selection.marks,
+            math_ocr_enabled: self.session.ocr_config().enabled,
+            holding_ink: self.pad.as_ref().is_some_and(|p| p.holding() > 0),
         };
         let format = self.editor.as_ref().map(|e| e.format);
         let mut acts = Vec::new();
@@ -5406,6 +5574,41 @@ impl NocturneApp {
             ribbon::Act::ToggleMinimap => {
                 self.show_minimap = !self.show_minimap;
                 let _ = self.session.settings.set("show_minimap", if self.show_minimap { "true" } else { "false" });
+            }
+            ribbon::Act::ToolbarDock(dock) => self.session.set_toolbar_dock(dock),
+            ribbon::Act::DockRoster(roster) => self.session.set_dock_roster(roster),
+            ribbon::Act::ToggleToolSettings => self.tool_settings_open = !self.tool_settings_open,
+            ribbon::Act::ToggleMathOcr => {
+                let next = if self.session.ocr_config().enabled { "false" } else { "true" };
+                let _ = self.run("ink.math_ocr_toggle", &params(&[("enabled", next)]));
+                if !self.session.ocr_config().enabled {
+                    self.math_ocr = None;
+                }
+            }
+            ribbon::Act::OpenMathOcrSetup => {
+                self.dialog = Some(Dialog::MathOcrSetup(crate::math_ocr::Setup::from_session(&self.session)));
+            }
+            ribbon::Act::LibraryView(view) => {
+                let _ = self.run("ui.library_view", &params(&[("view", view.id())]));
+            }
+            ribbon::Act::DockMathOcr => {
+                if !self.session.ocr_config().enabled {
+                    self.tool_settings_open = true;
+                } else if self.held_ink_count() > 0 {
+                    self.pending_math_ocr_start = true;
+                } else {
+                    self.ribbon_act(ribbon::Act::InkPointer(ribbon::Pointer::Lasso));
+                }
+            }
+            ribbon::Act::ToggleHoldToStraighten => {
+                let on = self.session.ink_options().hold_to_straighten;
+                self.session.set_hold_to_straighten(!on);
+            }
+            ribbon::Act::EraserPixel(pixel) => {
+                self.session.set_eraser_kind(if pixel { nocturne_engine::EraserKind::Pixel } else { nocturne_engine::EraserKind::Object });
+            }
+            ribbon::Act::EraserWidthTenths(tenths) => {
+                self.session.set_eraser_width(f32::from(tenths) / 10.0);
             }
             ribbon::Act::ToggleEraserAutoReturn => {
                 self.eraser_auto_return = !self.eraser_auto_return;
@@ -5844,6 +6047,9 @@ impl NocturneApp {
             width: nib.width() * Self::sensitivity_width(self.sensitivity),
             gain: self.gain(),
             curve: self.pressure_curve,
+            pixel_eraser: self.session.ink_options().eraser_kind == nocturne_engine::EraserKind::Pixel,
+            eraser_width: self.session.ink_options().eraser_width,
+            hold_to_straighten: self.session.ink_options().hold_to_straighten,
         }
     }
 
@@ -6182,10 +6388,27 @@ impl NocturneApp {
     }
 
     fn remember(ed: &mut Editor, edit: bool) {
+        Self::remember_saved(ed, edit, None);
+    }
+
+    /// A letter typed or deleted by the platform keyboard, with the caret staying in its block:
+    /// the page's text is written once here, and the page as it would be saved is worked out
+    /// once and used both to say whether there is something to save and by what undo remembers.
+    /// Each of those used to work it out again, on every letter.
+    fn note_typing(ed: &mut Editor) {
+        ed.rebuild_body();
+        let saved = ed.body_to_save();
+        let file_will_hold = ed.saving.as_ref().unwrap_or(&ed.saved_body);
+        ed.dirty_since = (saved != *file_will_hold).then(Instant::now);
+        Self::remember_saved(ed, false, Some(saved));
+    }
+
+    /// [`Self::remember`], given the page as it would be saved when the caller already has it.
+    fn remember_saved(ed: &mut Editor, edit: bool, saved: Option<String>) {
         let same = ed.history.here().is_some_and(|s| s.body == ed.body && s.blocks == ed.blocks && s.boxes == ed.boxes);
         if same || {
             // Only the cursor's place on open paper came or went: the page is the one remembered.
-            let saved = ed.body_to_save();
+            let saved = saved.unwrap_or_else(|| ed.body_to_save());
             saved != ed.body && ed.history.here().is_some_and(|s| s.body == saved)
         } {
             // Nothing really changed, or the page was just put back by undo itself. A column
@@ -6476,12 +6699,157 @@ impl NocturneApp {
         self.editor.as_ref().map(|e| e.blocks.clone()).unwrap_or_default()
     }
 
+    /// The open page's layout containers, as the editor holds them.
+    pub fn editor_boxes(&self) -> Vec<nocturne_model::Container> {
+        self.editor.as_ref().map(|e| e.boxes.clone()).unwrap_or_default()
+    }
+
     pub fn editor_origin(&self) -> Option<egui::Pos2> {
         self.editor.as_ref().map(|e| e.origin)
     }
 
     pub fn ink_stroke_count(&self) -> usize {
         self.pad.as_ref().map_or(0, crate::inkpad::Pad::strokes)
+    }
+
+    /// How many strokes on the open page are currently held by the lasso or selector.
+    pub fn held_ink_count(&self) -> usize {
+        self.pad.as_ref().map_or(0, |p| p.holding())
+    }
+
+    /// Saves both the open page and its editable ink drawing immediately.
+    pub fn save_open_page(&mut self) {
+        self.save_now();
+        if let Some(p) = self.pad.as_mut() {
+            let _ = p.save();
+        }
+    }
+
+    /// True when Tablet Studio is active and using the two-pane Library Grid view.
+    pub fn is_studio_grid(&self, ctx: &Context) -> bool {
+        self.is_tablet_studio(ctx) && self.session.library_view() == nocturne_engine::LibraryView::StudioGrid
+    }
+
+    /// Closes the open page and returns to the Tablet Studio Library Grid.
+    pub fn close_to_library(&mut self) {
+        self.save_now();
+        if let Some(pad) = self.pad.as_mut()
+            && pad.dirty
+        {
+            let _ = pad.save();
+        }
+        if let Some(dir) = self.editor.as_ref().map(|e| e.dir.clone()) {
+            self.library_grid.invalidate_page(&dir);
+            self.library_grid.select_for_page(&dir);
+            if let Some(parent) = dir.parent() {
+                self.selected = Some(parent.to_path_buf());
+            }
+        }
+        let _ = self.session.settings.set("last_page", "");
+        self.editor = None;
+        self.pad = None;
+        self.math_ocr = None;
+        self.pending_math_ocr_start = false;
+        self.page_rect = None;
+        self.page_view_rect = None;
+        self.header_pill_rect = None;
+        self.pencil_pill_rect = None;
+        self.tool_settings_open = false;
+    }
+
+    /// Cached `(text_line_count, ink_stroke_count)` for a Library Grid page thumbnail, if built.
+    pub fn cached_library_thumb_counts(&self, page_dir: &Path) -> Option<(usize, usize)> {
+        self.library_grid.cached_counts(page_dir)
+    }
+
+    /// The box around all the page's ink, `[x0, y0, x1, y1]` in page points, when there is any.
+    pub fn ink_bounds(&self) -> Option<[f32; 4]> {
+        self.pad.as_ref().and_then(crate::inkpad::Pad::bounds)
+    }
+
+    /// The pens on the rack, in order: each a kind of pen, a colour and a thickness.
+    pub fn pen_rack(&self) -> &[nocturne_ink::rack::Nib] {
+        &self.rack
+    }
+
+    /// How many pen readings each stroke on the page holds, in the order they were drawn.
+    pub fn ink_dab_counts(&self) -> Vec<usize> {
+        self.pad.as_ref().map(crate::inkpad::Pad::dab_counts).unwrap_or_default()
+    }
+
+    /// The pressure each stroke on the page begins with, in the order they were drawn.
+    pub fn ink_pressures(&self) -> Vec<f32> {
+        self.pad.as_ref().map(crate::inkpad::Pad::first_pressures).unwrap_or_default()
+    }
+
+    /// True while the page's title has the keyboard.
+    pub fn title_is_focused(&self) -> bool {
+        self.editor.as_ref().is_some_and(|ed| ed.title_focused)
+    }
+
+    /// The page's title as it is being typed, before it is saved.
+    pub fn title_draft(&self) -> Option<&str> {
+        self.editor.as_ref().map(|ed| ed.title_buf.as_str())
+    }
+
+    /// True while Tablet Studio is showing a failure in its banner.
+    pub fn status_banner_showing(&self) -> bool {
+        self.status_banner_drawn
+    }
+
+    /// The one-line field that has the keyboard, with all of its text and its selection: the
+    /// name box of Rename, Add or New notebook, the page title, or search. `None` when the
+    /// keyboard is in the page's words or nowhere.
+    ///
+    /// A platform keyboard needs the whole field. Given an empty one it believes there is
+    /// nothing to delete, and it has no words to find boundaries in for its suggestions.
+    pub fn focused_text_field(&self, ctx: &Context) -> Option<PlatformTextField> {
+        let focused = ctx.memory(|m| m.focused())?;
+        let is = |id: &str| focused == egui::Id::unique(id);
+        let (text, selection) = match &self.dialog {
+            Some(Dialog::Rename { title, .. }) if is(RENAME_FIELD) => (title.as_str(), None),
+            Some(Dialog::Add { title, .. }) if is(ADD_FIELD) => (title.as_str(), None),
+            Some(Dialog::NewNotebook { name, .. }) if is(NEW_NOTEBOOK_FIELD) => (name.as_str(), None),
+            Some(_) => return None,
+            None => {
+                if let Some(crate::math_ocr::Conversion { stage: crate::math_ocr::Stage::Preview { tex, .. }, .. }) = &self.math_ocr
+                    && is(crate::math_ocr::TEX_FIELD)
+                {
+                    (tex.as_str(), None)
+                } else if is(SEARCH_FIELD) {
+                    (self.search.as_str(), None)
+                } else if is(crate::library_grid::LIBRARY_SEARCH_FIELD) {
+                    (self.library_grid.search_query(), None)
+                } else {
+                    let ed = self.editor.as_ref().filter(|ed| ed.title_focused)?;
+                    (ed.title_buf.as_str(), ed.title_selection)
+                }
+            }
+        };
+        let len = text.chars().count();
+        let (a, b) = selection
+            .or_else(|| {
+                let range = egui::TextEdit::load_state(ctx, focused)?.cursor.char_range()?;
+                Some((range.primary.index.0, range.secondary.index.0))
+            })
+            .unwrap_or((len, len));
+        let (a, b) = (a.min(len), b.min(len));
+        Some(PlatformTextField { text: text.to_string(), selection: (a.min(b), a.max(b)) })
+    }
+
+    /// Asks for a new title for the notebook, section or page at `path`.
+    pub fn open_rename_dialog(&mut self, path: PathBuf, title: String) {
+        self.dialog = Some(Dialog::Rename { path, title });
+    }
+
+    /// Asks for the name of a new notebook.
+    pub fn open_new_notebook_dialog(&mut self) {
+        self.dialog = Some(Dialog::NewNotebook { name: String::new(), format: None });
+    }
+
+    /// Asks what to add inside `parent`, offering `kind` first.
+    pub fn open_add_dialog(&mut self, parent: PathBuf, parent_kind: NodeKind, kind: NodeKind) {
+        self.dialog = Some(Dialog::Add { parent, parent_kind, title: String::new(), kind, format: None });
     }
 
     pub fn ribbon_act_for_test(&mut self, act: ribbon::Act) {
@@ -8249,8 +8617,8 @@ impl NocturneApp {
     }
 
     fn side_panel(&mut self, ui: &mut Ui) {
-        // Full page view: the notebooks step aside until the user asks for them again.
-        if self.full_page && self.editor.is_some() {
+        // Full page view or Tablet Studio library grid: the classic notebook tree steps aside.
+        if self.is_studio_grid(ui.ctx()) || (self.full_page && self.editor.is_some()) {
             return;
         }
         let mut acts = Vec::new();
@@ -8540,6 +8908,68 @@ impl NocturneApp {
         }
     }
 
+    fn studio_library_ui(&mut self, ui: &mut Ui) {
+        let tokens = self.tokens;
+        let sync_busy = self.sync_job.is_some();
+        let sync_configured = *self
+            .sync_has_token
+            .get_or_insert_with(|| self.session.sync_secrets().get_secret(nocturne_engine::KDRIVE_TOKEN_KEY).ok().flatten().is_some());
+        let out = self.library_grid.show(ui, &mut self.session, &tokens, sync_busy, sync_configured);
+        if let Some(page_dir) = out.open_page {
+            self.expand_to(&page_dir);
+            self.open_page(&page_dir);
+        }
+        if let Some((target_section, mode)) = out.new_page {
+            if let Some(section) = target_section {
+                self.create_page_in(&section);
+                match mode {
+                    crate::library_grid::NewPageMode::Handwrite => {
+                        self.ribbon_act(ribbon::Act::InkPen(self.nib));
+                    }
+                    crate::library_grid::NewPageMode::Type => {
+                        self.ribbon_act(ribbon::Act::InkPointer(ribbon::Pointer::Write));
+                        if let Some(ed) = self.editor.as_mut() {
+                            ed.title_focused = true;
+                            ed.caret = None;
+                            ed.across = None;
+                        }
+                        ui.ctx().memory_mut(|m| m.request_focus(egui::Id::unique("page-title-box")));
+                    }
+                }
+            } else {
+                self.open_new_notebook_dialog();
+            }
+        }
+        if let Some((target_section, kind)) = out.import {
+            if self.editor.is_none()
+                && let Some(section) = target_section
+            {
+                self.create_page_in(&section);
+            }
+            if self.editor.is_some() {
+                match kind {
+                    crate::library_grid::ImportKind::Document => self.ribbon_act(ribbon::Act::AddPrintout),
+                    crate::library_grid::ImportKind::Picture => self.ribbon_act(ribbon::Act::AddPicture),
+                }
+            } else {
+                self.open_new_notebook_dialog();
+            }
+        }
+        if out.new_notebook {
+            self.open_new_notebook_dialog();
+        }
+        if let Some((parent, parent_kind)) = out.new_section_in {
+            self.open_add_dialog(parent, parent_kind, NodeKind::Section);
+        }
+        if out.sync_now {
+            let ctx = ui.ctx().clone();
+            self.sync_now(&ctx);
+        }
+        for act in out.ribbon_acts {
+            self.ribbon_act(act);
+        }
+    }
+
     fn central(&mut self, ui: &mut Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
             if self.editor.is_none() {
@@ -8547,8 +8977,13 @@ impl NocturneApp {
                 // page's rect must not linger for the platform's gestures to aim at.
                 self.page_rect = None;
                 self.page_view_rect = None;
+                self.pencil_pill_rect = None;
                 crate::containers::clear_touch_handles(ui.ctx());
                 crate::inkpad::clear_held_hit_cache(ui.ctx());
+                if self.is_studio_grid(ui.ctx()) {
+                    self.studio_library_ui(ui);
+                    return;
+                }
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() * 0.22);
                     ui.add(egui::Image::from_bytes("bytes://nocturne-logo", crate::LOGO_PNG).fit_to_exact_size(vec2(128.0, 128.0)));
@@ -8596,6 +9031,19 @@ impl NocturneApp {
         let stylus_active = self.stylus.has_active_stylus();
         let finger_count = self.stylus.active_finger_count();
         let pointer_origin = self.stylus.pointer_origin();
+        // The window's pointer follows only the first contact on the glass. With a palm resting
+        // there it is the palm's, and ink read from the pointer was drawn at the palm. So once a
+        // pen is down beside a finger or palm, and until that pen lifts, the ink reads the pen's
+        // own touch. A pen alone keeps the ordinary pointer path.
+        let pen_frame = self.stylus.stylus_frame();
+        self.pen_reads_own_touch = pen_frame.is_some() && (self.pen_reads_own_touch || finger_count > 0);
+        let pen_frame = pen_frame.filter(|_| self.pen_reads_own_touch);
+        ui.ctx().data_mut(|d| match pen_frame {
+            Some(frame) => {
+                d.insert_temp(crate::stylus::StylusFrame::id(), frame);
+            }
+            None => d.remove::<crate::stylus::StylusFrame>(crate::stylus::StylusFrame::id()),
+        });
         let multi_touch_active = !stylus_active && (finger_count >= 2 || ui.input(|i| i.multi_touch().is_some()));
         let finger_drawing = self.is_finger_drawing();
         let touch_sized = self.stylus.touch_affordance_active() || ui.ctx().os() == egui::os::OperatingSystem::IOS;
@@ -8608,12 +9056,14 @@ impl NocturneApp {
             crate::inkpad::clear_held_hit_cache(ui.ctx());
         }
 
+        let math_preview_open = matches!(self.math_ocr.as_ref().map(|c| &c.stage), Some(crate::math_ocr::Stage::Preview { .. }));
         if stylus_active
             || multi_touch_active
             || pointer_origin == crate::stylus::PointerOrigin::Mouse
             || finger_drawing
             || self.show_source
             || self.dialog.is_some()
+            || math_preview_open
             || self.backstage.is_some()
             || self.compact_list_fills()
         {
@@ -8836,13 +9286,18 @@ impl NocturneApp {
         let mut space_over = false;
         let current_zoom_pct = self.zoom_percent;
         let tablet_studio = self.is_tablet_studio(ui.ctx());
+        if !tablet_studio {
+            self.pencil_pill_rect = None;
+        }
         let canvas_overlay_open = self.dialog.is_some()
+            || math_preview_open
             || self.ribbon_peek
             || self.backstage.is_some()
             || !self.search.trim().is_empty()
             || crate::ribbon::any_popup_open(ui.ctx());
         let mut multitouch_step: Option<crate::touch_ux::MultiTouchStep> = None;
         let mut pill_acts: Vec<ribbon::Act> = Vec::new();
+        let mut start_ocr = false;
         let mut minimap_out = crate::minimap::MinimapOut::default();
         {
             let Some(ed) = self.editor.as_mut() else { return };
@@ -8893,6 +9348,7 @@ impl NocturneApp {
                 ui.separator();
             }
             let height = ui.available_height();
+            let studio_view_rect = self.page_view_rect.unwrap_or_else(|| ui.available_rect_before_wrap());
             // How far the page's content reaches sideways on screen this frame (issue #188).
             let mut page_span: Option<(f32, f32)> = None;
             // The page itself. Without the source beside it the page is a readable column,
@@ -8940,6 +9396,18 @@ impl NocturneApp {
                         let column = if available_width >= page_column { page_column } else { (available_width - 16.0).max(1.0) };
                         ui.set_min_width(column);
                         ui.set_width(column);
+                        if tablet_studio {
+                            let top_pad = crate::tablet_chrome::canvas_top_clearance(
+                                studio_view_rect,
+                                self.header_pill_rect,
+                                self.pencil_pill_rect,
+                                self.session.studio_options().toolbar_dock,
+                            );
+                            let extra = (top_pad - 4.0).max(0.0);
+                            if extra > 0.0 {
+                                ui.add_space(extra);
+                            }
+                        }
                         // The page's own name, at the top of the sheet. Before the sheet's
                         // origin is taken below, so the ink layer keeps its own coordinates
                         // and a drawing stays beside the words it was made next to.
@@ -8976,7 +9444,7 @@ impl NocturneApp {
                                     pressure,
                                     &tokens,
                                     zoom_scale,
-                                    allow_stroke,
+                                    allow_stroke && !math_preview_open,
                                     cancel_uncommitted,
                                     touch_sized,
                                 );
@@ -9017,6 +9485,7 @@ impl NocturneApp {
                                 )
                             } else {
                                 let overlay_open = self.dialog.is_some()
+                                    || math_preview_open
                                     || self.ribbon_peek
                                     || self.backstage.is_some()
                                     || !self.search.trim().is_empty()
@@ -9246,6 +9715,7 @@ impl NocturneApp {
                 });
             };
             if show_source {
+                self.pencil_pill_rect = None;
                 // The code view: the page's files on the left, the one picked on the
                 // right. The page itself is not drawn while it is open, so there is only
                 // ever one editable copy of the page on screen.
@@ -9325,7 +9795,9 @@ impl NocturneApp {
                 }
                 if !canvas_overlay_open {
                     let hbar_clearance = if hbar.track.is_some() { 18.0 } else { 0.0 };
-                    let mut pill_clearance = hbar_clearance;
+                    // The minimap sits top right, clear of a tool bar docked along the top or the right.
+                    let studio = self.session.studio_options();
+                    let (mut map_top_clearance, mut map_right_clearance) = (0.0_f32, reserve);
                     if tablet_studio {
                         let pill_view = ribbon::View {
                             rules,
@@ -9335,17 +9807,65 @@ impl NocturneApp {
                             nib: self.nib,
                             finger_drawing: self.session.finger_drawing(),
                             eraser_auto_return: self.eraser_auto_return,
+                            eraser_pixel: self.session.ink_options().eraser_kind == nocturne_engine::EraserKind::Pixel,
+                            eraser_width: self.session.ink_options().eraser_width,
                             show_minimap: self.show_minimap,
                             can_undo: ed.history.can_undo() || pad.as_ref().is_some_and(crate::inkpad::Pad::can_undo),
                             can_redo: !self.undone.is_empty(),
                             can_ink_redo: pad.as_ref().is_some_and(crate::inkpad::Pad::can_redo),
+                            math_ocr_enabled: self.session.ocr_config().enabled,
+                            holding_ink: pad.as_ref().is_some_and(|p| p.holding() > 0),
                             ..ribbon::View::default()
                         };
-                        let (acts, pill_rect) = crate::tablet_chrome::show_pencil_pill(ui.ctx(), view, hbar_clearance, &pill_view, &tokens);
+                        let edge_clearance = match studio.toolbar_dock {
+                            nocturne_engine::ToolbarDock::Bottom => hbar_clearance,
+                            nocturne_engine::ToolbarDock::Right => reserve,
+                            // Under the floating header, which is at the top left.
+                            nocturne_engine::ToolbarDock::Top | nocturne_engine::ToolbarDock::Left => {
+                                self.header_pill_rect.map_or(0.0, |r| r.height() + 6.0)
+                            }
+                        };
+                        let (acts, pill_rect) = crate::tablet_chrome::show_pencil_pill(
+                            ui.ctx(),
+                            view,
+                            edge_clearance,
+                            studio,
+                            self.tool_settings_open,
+                            &pill_view,
+                            &tokens,
+                        );
+                        self.pencil_pill_rect = pill_rect;
                         pill_acts = acts;
-                        if let Some(pr) = pill_rect {
-                            pill_clearance = pill_clearance.max((view.max.y - pr.min.y + 8.0).max(0.0));
+                        if self.tool_settings_open && self.dialog.is_none() {
+                            let options = self.session.ink_options();
+                            let input = crate::tool_settings::ToolSettingsIn {
+                                finger_drawing: self.session.finger_drawing(),
+                                hold_to_straighten: options.hold_to_straighten,
+                                eraser_pixel: options.eraser_kind == nocturne_engine::EraserKind::Pixel,
+                                math_ocr_enabled: self.session.ocr_config().enabled,
+                                library_view: studio.library_view,
+                                studio,
+                                rack: &self.rack,
+                                nib: self.nib,
+                            };
+                            pill_acts.extend(crate::tool_settings::show(ui.ctx(), view, &input, &tokens));
                         }
+                        if let Some(pr) = pill_rect {
+                            match studio.toolbar_dock {
+                                nocturne_engine::ToolbarDock::Top => map_top_clearance = (pr.max.y - view.min.y + 8.0).max(0.0),
+                                nocturne_engine::ToolbarDock::Right => map_right_clearance = (view.max.x - pr.min.x + 8.0).max(reserve),
+                                _ => {}
+                            }
+                        }
+                    }
+                    if self.session.ocr_config().enabled
+                        && self.math_ocr.is_none()
+                        && self.dialog.is_none()
+                        && !self.tool_settings_open
+                        && pad.as_ref().is_some_and(|p| p.holding() > 0)
+                        && let Some(held_rect) = crate::inkpad::held_area(ui.ctx()).filter(|r| r.width() > 0.0 && r.height() > 0.0)
+                    {
+                        start_ocr = crate::math_ocr::convert_button(ui.ctx(), held_rect, view, &tokens);
                     }
                     if self.show_minimap {
                         let stroke_bounds = pad.as_ref().map(crate::inkpad::Pad::stroke_bounds).unwrap_or_default();
@@ -9355,8 +9875,8 @@ impl NocturneApp {
                             ed.origin,
                             current_zoom_pct,
                             self.minimap_collapsed,
-                            pill_clearance,
-                            reserve,
+                            map_top_clearance,
+                            map_right_clearance,
                             &ed.last_frames,
                             &stroke_bounds,
                             &tokens,
@@ -9376,13 +9896,6 @@ impl NocturneApp {
                             ui.ctx().request_repaint();
                         }
                     }
-                }
-                if tablet_studio
-                    && let Some(shown_at) = self.status_shown_at
-                    && shown_at.elapsed() < std::time::Duration::from_secs(4)
-                {
-                    crate::tablet_chrome::show_transient_notice(ui.ctx(), view, &self.status, self.status_is_error, &tokens);
-                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
                 }
             }
             if changed {
@@ -9506,6 +10019,9 @@ impl NocturneApp {
         for act in pill_acts {
             self.ribbon_act(act);
         }
+        if start_ocr || std::mem::take(&mut self.pending_math_ocr_start) {
+            self.start_math_ocr(ui.ctx());
+        }
         if minimap_out.toggle_collapsed {
             self.minimap_collapsed = !self.minimap_collapsed;
             let _ = self.session.settings.set("minimap_collapsed", if self.minimap_collapsed { "true" } else { "false" });
@@ -9539,6 +10055,9 @@ impl NocturneApp {
             }
             self.tell_kept_ink();
             self.sync_ink_reference();
+            if let Some(dir) = self.editor.as_ref().map(|e| e.dir.clone()) {
+                self.library_grid.invalidate_page(&dir);
+            }
         }
         if let Some(href) = follow {
             self.follow_link(ui.ctx(), &href);
@@ -9551,6 +10070,7 @@ impl NocturneApp {
                 ed.titled = !t.is_empty();
                 ed.title = if t.is_empty() { nocturne_store::tree::UNTITLED_PAGE.to_string() } else { t };
             }
+            self.library_grid.invalidate_page(&dir);
             self.say(crate::tl_id!("ui.title_saved"));
         }
     }
@@ -9649,7 +10169,16 @@ impl NocturneApp {
                 self.dialog = Some(next);
             }
         }
-        let Some(dialog) = self.dialog.take() else { return };
+        let Some(dialog) = self.dialog.take() else {
+            self.dialog_shown = None;
+            return;
+        };
+        // The first frame a dialog is drawn in is when its text box asks for the keyboard. Asking
+        // on every frame took the keyboard away and gave it back each frame, which on an iPad is
+        // the keyboard dropping and rising, and its suggestions starting over.
+        let kind = std::mem::discriminant(&dialog);
+        let opened_now = self.dialog_shown != Some(kind);
+        self.dialog_shown = Some(kind);
         // Page loading and native Shell icon generation can finish between the
         // recovery scan and the frame that presents this modal. Re-check the
         // filesystem so a healthy sidecar never produces a stale warning.
@@ -10141,10 +10670,8 @@ impl NocturneApp {
                         modal_title(ui, &self.tokens, crate::tl_id!("ui.new_notebook"));
                         ui.set_min_width(420.0);
                         ui.label(crate::tl_id!("ui.name_2"));
-                        let r = ui.text_edit_singleline(name);
-                        // Read Enter before asking for focus again: a new focus request hides the lost focus.
+                        let r = name_field(ui, name, NEW_NOTEBOOK_FIELD, opened_now);
                         let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                        r.request_focus();
                         format_picker(ui, format);
                         ui.add_space(12.0);
                         ui.horizontal(|ui| {
@@ -10179,6 +10706,7 @@ impl NocturneApp {
                     let kind = crate::tl!(parent_kind.label());
                     crate::i18n::format_message_id("ui.add_inside_this_kind", &[("kind", &kind.to_lowercase())])
                 };
+                let backdrop = modal_backdrop(ctx, "add-modal-backdrop");
                 egui::Window::new(heading.clone())
                     .title_bar(false)
                     .collapsible(false)
@@ -10187,6 +10715,7 @@ impl NocturneApp {
                     .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
                     .frame(modal_frame(&self.tokens))
                     .show(ctx, |ui| {
+                        stay_above(ui, backdrop);
                         modal_title(ui, &self.tokens, &heading);
                         ui.set_min_width(420.0);
                         let kinds = parent_kind.may_contain();
@@ -10199,10 +10728,8 @@ impl NocturneApp {
                             });
                         }
                         ui.label(crate::tl_id!("ui.title_2"));
-                        let r = ui.text_edit_singleline(title);
-                        // Read Enter before asking for focus again: a new focus request hides the lost focus.
+                        let r = name_field(ui, title, ADD_FIELD, opened_now);
                         let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                        r.request_focus();
                         ui.label(if *kind == NodeKind::Page {
                             crate::tl_id!("ui.format_for_this_page")
                         } else {
@@ -10359,26 +10886,35 @@ impl NocturneApp {
             }
             Dialog::Rename { path, title } => {
                 let mut go = false;
-                egui::Window::new(crate::tl_id!("ui.rename")).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(
-                    ctx,
-                    |ui| {
+                let backdrop = modal_backdrop(ctx, "rename-modal-backdrop");
+                egui::Window::new(crate::tl_id!("ui.rename"))
+                    .title_bar(false)
+                    .collapsible(false)
+                    .resizable(false)
+                    .order(egui::Order::Foreground)
+                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+                    .frame(modal_frame(&self.tokens))
+                    .show(ctx, |ui| {
+                        stay_above(ui, backdrop);
+                        modal_title(ui, &self.tokens, crate::tl_id!("ui.rename"));
+                        ui.set_min_width(420.0);
                         ui.label(crate::tl_id!("ui.title_the_folder_name_does_not_change"));
-                        let r = ui.text_edit_singleline(title);
-                        // Read Enter before asking for focus again: a new focus request hides the lost focus.
+                        let r = name_field(ui, title, RENAME_FIELD, opened_now);
                         let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                        r.request_focus();
+                        ui.add_space(12.0);
                         ui.horizontal(|ui| {
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.cancel"), false).clicked() {
+                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.cancel"), false).clicked() || ui.input(|i| i.key_pressed(Key::Escape))
+                            {
                                 keep = false;
                             }
                             if (modal_button(ui, &self.tokens, crate::tl_id!("ui.rename"), true).clicked() || enter) && !title.trim().is_empty() {
                                 go = true;
                             }
                         });
-                    },
-                );
+                    });
                 if go {
                     if self.run("node.title", &params(&[("path", &path_str(path)), ("title", title.trim())])).is_some() {
+                        self.library_grid.invalidate_page(path);
                         if self.editor.as_ref().map(|e| e.dir == *path).unwrap_or(false) {
                             self.open_page(path);
                         }
@@ -10530,6 +11066,7 @@ impl NocturneApp {
                                 self.backstage = Some("Open");
                             }
                             let _ = self.run("tree.refresh", &Params::new());
+                            self.library_grid.invalidate_all();
                             self.say(crate::i18n::format_message_id("ui.deleted_notebook_path", &[("path", &self.shown(&path))]));
                         }
                         Err(error) => {
@@ -10594,6 +11131,7 @@ impl NocturneApp {
                                 self.selected = None;
                                 self.open.remove(&path);
                                 let _ = self.run("tree.refresh", &Params::new());
+                                self.library_grid.invalidate_all();
                                 self.say(crate::tl_id!("ui.deleted_notebook"));
                             }
                             Err(error) => {
@@ -10613,6 +11151,7 @@ impl NocturneApp {
                                     self.editor = None;
                                 }
                                 self.selected = None;
+                                self.library_grid.invalidate_all();
                                 self.say(crate::tl_id!("ui.moved_to_the_notebook_recycle_bin"));
                             }
                             None => {
@@ -10829,6 +11368,7 @@ impl NocturneApp {
                             self.sync_has_token = None;
                         }
                         if out.save_and_sync_now {
+                            self.sync_by_hand = true; // by hand: Save and sync now
                             self.start_background_sync(ctx);
                         } else {
                             form.last_message = Some((crate::tl_id!("ui.kdrive_settings_saved").to_string(), false));
@@ -10841,10 +11381,149 @@ impl NocturneApp {
                     keep = false;
                 }
             }
+            Dialog::MathOcrSetup(form) => match crate::math_ocr::show_setup(ctx, form, &self.tokens) {
+                crate::math_ocr::SetupOutcome::Keep => {}
+                crate::math_ocr::SetupOutcome::Close => {
+                    keep = false;
+                }
+                crate::math_ocr::SetupOutcome::ForgetKey => {
+                    if self.run("ink.math_ocr_configure", &params(&[("provider", form.provider.id()), ("clear_key", "true")])).is_some() {
+                        *form = crate::math_ocr::Setup::from_session(&self.session);
+                    }
+                }
+                crate::math_ocr::SetupOutcome::Save => {
+                    let mut p = params(&[("provider", form.provider.id()), ("endpoint", form.endpoint.trim()), ("model", form.model.trim())]);
+                    if !form.key.trim().is_empty() {
+                        p.insert("key".into(), form.key.trim().into());
+                    }
+                    if !form.app_id.trim().is_empty() {
+                        p.insert("app_id".into(), form.app_id.trim().into());
+                    }
+                    match self.session.run("ink.math_ocr_configure", &p) {
+                        Ok(_) => {
+                            form.key.clear();
+                            form.app_id.clear();
+                            self.say(crate::tl_id!("ui.recognition_service_saved"));
+                            keep = false;
+                        }
+                        Err(e) => self.fail(&e),
+                    }
+                }
+            },
         }
         if keep {
             self.dialog = Some(next);
+        } else {
+            // Closed: a dialog of the same kind opened next is a new one.
+            self.dialog_shown = None;
         }
+    }
+
+    fn start_math_ocr(&mut self, ctx: &Context) {
+        let (Some(ed), Some(pad)) = (self.editor.as_ref(), self.pad.as_ref()) else { return };
+        let strokes = pad.held_strokes();
+        let Some(bounds) = pad.held_bounds() else { return };
+        match self.session.math_ocr_job(&strokes) {
+            Ok(job) => match crate::math_ocr::OcrRun::start(ctx.clone(), self.session.sync_http(), job) {
+                Ok(run) => {
+                    self.math_ocr =
+                        Some(crate::math_ocr::Conversion { page: ed.dir.clone(), strokes, bounds, stage: crate::math_ocr::Stage::Waiting(run) });
+                }
+                Err(err) => self.complain(&err),
+            },
+            Err(err) => self.complain(&crate::math_ocr::error_text(&err)),
+        }
+    }
+
+    fn poll_math_ocr(&mut self) {
+        if self.math_ocr.as_ref().is_some_and(|conv| self.editor.as_ref().map(|e| &e.dir) != Some(&conv.page)) {
+            self.math_ocr = None;
+            return;
+        }
+        let outcome = self.math_ocr.as_ref().and_then(|conv| match &conv.stage {
+            crate::math_ocr::Stage::Waiting(run) => run.try_recv(),
+            crate::math_ocr::Stage::Preview { .. } => None,
+        });
+        match outcome {
+            Some(Ok(tex)) => {
+                if let Some(conv) = self.math_ocr.as_mut() {
+                    conv.stage = crate::math_ocr::Stage::Preview { tex, opened: false };
+                }
+            }
+            Some(Err(err)) => {
+                self.math_ocr = None;
+                self.complain(&crate::math_ocr::error_text(&err));
+            }
+            None => {}
+        }
+    }
+
+    fn math_ocr_ui(&mut self, ctx: &Context) {
+        if self.dialog.is_some() {
+            return;
+        }
+        let Some(mut conv) = self.math_ocr.take() else { return };
+        match crate::math_ocr::show(ctx, &mut conv, &self.tokens) {
+            crate::math_ocr::Outcome::Keep => {
+                self.math_ocr = Some(conv);
+            }
+            crate::math_ocr::Outcome::Cancel => {}
+            crate::math_ocr::Outcome::Insert => {
+                self.confirm_math_ocr(conv);
+            }
+        }
+    }
+
+    fn confirm_math_ocr(&mut self, conv: crate::math_ocr::Conversion) {
+        let crate::math_ocr::Stage::Preview { tex, .. } = conv.stage else { return };
+        let clean_tex = tex.split_whitespace().collect::<Vec<_>>().join(" ");
+        if clean_tex.is_empty() {
+            return;
+        }
+        if !self.editor.as_ref().is_some_and(|ed| ed.writable && ed.dir == conv.page) {
+            return;
+        }
+        let Some(pad) = self.pad.as_mut() else { return };
+        if !pad.remove_exact_strokes(&conv.strokes) {
+            self.save_now();
+            self.complain(crate::tl_id!("ui.ink_changed_not_converted"));
+            return;
+        }
+        if let Err(e) = pad.save() {
+            self.complain(&crate::i18n::format_message_id("ui.cannot_write_the_drawing_error", &[("error", &e.to_string())]));
+            return;
+        }
+        if let Some(ed) = self.editor.as_mut() {
+            Self::remember_step(ed);
+        }
+        let now = Instant::now();
+        self.last_ink_change = Some(now);
+        self.last_local_edit_at = Some(now);
+        self.sync_dirty_since_last = true;
+        if let Some(pad) = self.pad.as_mut() {
+            pad.settle();
+        }
+        self.tell_kept_ink();
+        self.sync_ink_reference();
+        if let Some(ed) = self.editor.as_mut() {
+            ed.boxes.retain(|c| c.blocks > 0);
+            let default_width = ed.boxes.first().map_or(360.0, |c| c.width);
+            let before = ed.blocks.len();
+            ed.boxes = nocturne_model::container::fit(&ed.boxes, before, default_width);
+            let [x0, y0, x1, _y1] = conv.bounds;
+            let x = (x0 - 6.0).max(0.0).round();
+            let y = (y0 - 14.0).max(0.0).round();
+            let box_width = ((x1 - x0) + 24.0).clamp(nocturne_model::container::MIN_WIDTH, 360.0).round();
+            ed.blocks.push(nocturne_formats::markdown::Block::MathBlock(clean_tex));
+            ed.boxes.push(nocturne_model::container::Container::new(x, y, box_width, 1));
+            ed.arranged = true;
+            ed.rebuild_body();
+            Self::mark_dirty_from_blocks(ed);
+            Self::remember_edit(ed);
+        }
+        self.undone.clear();
+        self.library_grid.invalidate_page(&conv.page);
+        self.say(crate::tl_id!("ui.equation_inserted"));
     }
 
     // ---------- control channel ----------
@@ -11362,6 +12041,9 @@ impl NocturneApp {
         // A button whose file dialog Android or iOS cannot show says so (`filepicker.*.rs`).
         #[cfg(any(target_os = "android", target_os = "ios"))]
         if let Some(notice) = crate::filepicker::take_notice() {
+            if self.is_tablet_studio(ctx) {
+                self.studio_notice = Some((notice.clone(), Instant::now()));
+            }
             self.say(notice);
         }
         self.last_ctx_is_ios = ctx.os() == egui::os::OperatingSystem::IOS;
@@ -11369,6 +12051,10 @@ impl NocturneApp {
         self.poll_control(ctx);
         self.poll_import(ctx);
         self.poll_sync(ctx);
+        if std::mem::take(&mut self.pending_math_ocr_start) {
+            self.start_math_ocr(ctx);
+        }
+        self.poll_math_ocr();
         if !self.event_frames.is_empty() {
             ctx.request_repaint();
         }
@@ -11385,7 +12071,8 @@ impl NocturneApp {
         // Not while a dialog is open: it owns the keyboard, and the page behind it must not
         // change unseen (issue #262: Ctrl+Z undid and saved an edit behind Insert symbol). A
         // text box in the dialog keeps its own undo.
-        let page_keys = self.dialog.is_none();
+        let math_preview_open = matches!(self.math_ocr.as_ref().map(|c| &c.stage), Some(crate::math_ocr::Stage::Preview { .. }));
+        let page_keys = self.dialog.is_none() && !math_preview_open;
         if page_keys && ctx.input_mut(|i| i.consume_key(ctrl_shift, Key::Z) || i.consume_key(Modifiers::COMMAND, Key::Y)) {
             // The ink's as well as the page's, whichever Undo took back.
             self.redo();
@@ -11399,14 +12086,19 @@ impl NocturneApp {
         // something were written into the note (issue #134). The code view has a Find of its
         // own for the file it shows, so it keeps Ctrl+F while it is open.
         // OneNote's Ctrl+K: the Link dialog for the words picked or the link the caret is in.
-        if !self.show_source && self.dialog.is_none() && self.editor.is_some() && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::K)) {
+        if !self.show_source && page_keys && self.editor.is_some() && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::K)) {
             self.open_link_dialog();
         }
-        if !self.show_source && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F) || i.consume_key(Modifiers::COMMAND, Key::E)) {
-            if let Some(caret) = self.editor.as_mut().and_then(|ed| ed.caret.as_mut()) {
-                caret.focus = false;
+        if !self.show_source && page_keys && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F) || i.consume_key(Modifiers::COMMAND, Key::E))
+        {
+            if self.is_studio_grid(ctx) && self.editor.is_none() && self.backstage.is_none() {
+                ctx.memory_mut(|m| m.request_focus(egui::Id::unique(crate::library_grid::LIBRARY_SEARCH_FIELD)));
+            } else {
+                if let Some(caret) = self.editor.as_mut().and_then(|ed| ed.caret.as_mut()) {
+                    caret.focus = false;
+                }
+                self.focus_search = true;
             }
-            self.focus_search = true;
         }
         self.nav_keys(ctx);
         self.replay_typing(ctx);
@@ -11446,17 +12138,40 @@ impl NocturneApp {
             self.page_rect = None;
             self.page_view_rect = None;
         }
-        if self.editor.is_none()
-            && self.is_tablet_studio(ctx)
-            && let Some(shown_at) = self.status_shown_at
-            && shown_at.elapsed() < std::time::Duration::from_secs(4)
-        {
-            crate::tablet_chrome::show_transient_notice(ctx, ctx.content_rect(), &self.status, self.status_is_error, &self.tokens);
-            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        // Tablet Studio has no status bar. Routine messages are not shown there; a failure is,
+        // on one line, until it is tapped. A dialog that is open says the failure itself.
+        // What was tapped away is remembered by its words, and forgotten when the next message
+        // that is not a failure arrives.
+        if !self.status_is_error {
+            self.status_banner_dismissed = None;
+        }
+        self.status_banner_drawn = self.is_tablet_studio(ctx)
+            && self.status_is_error
+            && self.dialog.is_none()
+            && !self.status.trim().is_empty()
+            && self.status_banner_dismissed.as_deref() != Some(self.status.as_str());
+        if self.status_banner_drawn && crate::tablet_chrome::show_error_banner(ctx, ctx.content_rect(), &self.status, true, &self.tokens) {
+            self.status_banner_dismissed = Some(self.status.clone());
+            self.status_banner_drawn = false;
+        }
+        // A result the user asked for (a sync started by hand) is shown the same way, in the
+        // ordinary colours, for a few seconds or until it is tapped. A failure takes its place.
+        const NOTICE_SECS: u64 = 6;
+        if let Some((message, since)) = self.studio_notice.clone() {
+            let left = std::time::Duration::from_secs(NOTICE_SECS).saturating_sub(since.elapsed());
+            if left.is_zero() || self.status_banner_drawn || !self.is_tablet_studio(ctx) {
+                self.studio_notice = None;
+            } else if self.dialog.is_none() {
+                if crate::tablet_chrome::show_error_banner(ctx, ctx.content_rect(), &message, false, &self.tokens) {
+                    self.studio_notice = None;
+                }
+                ctx.request_repaint_after(left);
+            }
         }
         self.paint_formatting(ctx);
         self.laser_keys(ctx);
         self.search_popup(ctx);
+        self.math_ocr_ui(ctx);
         self.dialogs(ctx);
         self.import_progress(ctx);
         self.frame_edges(ctx);

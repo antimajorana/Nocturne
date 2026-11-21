@@ -1,16 +1,25 @@
-//! Dedicated iPadOS / Tablet Studio chrome: single ~44pt top bar, floating Apple Pencil tool
-//! pill (`Order::Foreground`), and transient non-blocking status toast banners.
+//! Dedicated iPadOS / Tablet Studio chrome: floating top-left header pill, classic-tree top
+//! bar, title-clearance calculation, and one-line failure banner.
 
 use crate::icons::{self, Icon};
-use crate::ribbon::{Act, Pointer, RackEdit, RuleLines, View};
+use crate::ribbon::{Act, RuleLines, View};
 use crate::theme::Tokens;
 use egui::os::OperatingSystem;
 use egui::{Align2, Color32, Context, Id, Order, Rect, RichText, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
-use nocturne_ink::{Rgb, Tool, rack, shapes::Shape};
+use nocturne_engine::{LibraryView, ToolbarDock};
+use nocturne_ink::Rgb;
+
+pub use crate::tablet_dock::{nearest_dock, show_pencil_pill};
+pub use crate::tablet_nibs::{
+    ACTIVE_NIB_RAISE, DOCK_NIB_ALONG, DOCK_NIB_CROSS, NibColors, nib_colors_for_theme, nib_slot_size, nib_visual_rect, paint_upright_nib,
+};
 
 pub const UI_LAYOUT_KEY: &str = "ui_layout_mode";
 
-const NIB_COLOURS: [Rgb; 8] = [
+/// How far floating Tablet Studio chrome keeps from the edge of the page view.
+pub(crate) const DOCK_MARGIN: f32 = 12.0;
+
+pub const NIB_COLOURS: [Rgb; 8] = [
     Rgb(0x20, 0x20, 0x20),
     Rgb(0x18, 0x55, 0xc4),
     Rgb(0xd0, 0x21, 0x21),
@@ -26,9 +35,27 @@ fn panel_is_dark(panel: Color32) -> bool {
     luma < 128.0
 }
 
-fn shown_nib_color(colour: Rgb, panel: Color32) -> Color32 {
+#[must_use]
+pub fn shown_nib_color(colour: Rgb, panel: Color32) -> Color32 {
     let adj = crate::inkpad::shown_colour(colour, panel_is_dark(panel));
     Color32::from_rgb(adj.0, adj.1, adj.2)
+}
+
+/// Vertical room reserved at the top of the scrollable page sheet in Tablet Studio so the
+/// floating top-left header pill (and a top-docked tool bar, if chosen) never covers the page
+/// title at rest, while keeping `page_view_rect` borderless to the top of the window.
+#[must_use]
+pub fn canvas_top_clearance(view_rect: Rect, header_pill: Option<Rect>, pencil_pill: Option<Rect>, dock: ToolbarDock) -> f32 {
+    let mut clear_to = view_rect.min.y;
+    if let Some(h) = header_pill {
+        clear_to = clear_to.max(h.max.y + 8.0);
+    }
+    if dock == ToolbarDock::Top {
+        let fallback = header_pill.map_or(view_rect.min.y + 126.0, |h| h.max.y + 70.0);
+        let bar_bottom = pencil_pill.filter(|p| p.center().y < view_rect.center().y).map_or(fallback, |p| p.max.y + 8.0);
+        clear_to = clear_to.max(bar_bottom);
+    }
+    (clear_to - view_rect.min.y).max(0.0)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -73,6 +100,7 @@ impl UiLayoutMode {
 
 pub struct StudioTopBarIn<'a> {
     pub drawer_open: bool,
+    pub library_view: LibraryView,
     pub can_back: bool,
     pub can_forward: bool,
     pub breadcrumb: &'a str,
@@ -85,6 +113,7 @@ pub struct StudioTopBarIn<'a> {
 #[derive(Default)]
 pub struct StudioTopBarOut {
     pub toggle_drawer: bool,
+    pub back_to_library: bool,
     pub nav_back: bool,
     pub nav_forward: bool,
     pub add_page: bool,
@@ -93,7 +122,7 @@ pub struct StudioTopBarOut {
 }
 
 // i18n-ui-text: tip
-fn studio_icon_btn(ui: &mut Ui, icon: Icon, active: bool, enabled: bool, tip: &str, t: &Tokens) -> egui::Response {
+pub(crate) fn studio_icon_btn(ui: &mut Ui, icon: Icon, active: bool, enabled: bool, tip: &str, t: &Tokens) -> egui::Response {
     let size = vec2(36.0, 34.0);
     let (rect, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
     let tip_owned = tip.to_string();
@@ -115,10 +144,25 @@ fn studio_icon_btn(ui: &mut Ui, icon: Icon, active: bool, enabled: bool, tip: &s
     resp.on_hover_text(tip)
 }
 
-/// Renders the single ~44pt Tablet Studio top bar.
+// i18n-ui-text: tip
+fn studio_back_btn(ui: &mut Ui, tip: &str, t: &Tokens) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(36.0, 34.0), Sense::click());
+    let tip_owned = tip.to_string();
+    resp.widget_info(move || egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &tip_owned));
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 7.0, t.row_hover);
+    }
+    let c = rect.center();
+    let stroke = Stroke::new(1.8, t.text);
+    ui.painter().line_segment([pos2(c.x + 3.0, c.y - 6.0), pos2(c.x - 3.0, c.y)], stroke);
+    ui.painter().line_segment([pos2(c.x - 3.0, c.y), pos2(c.x + 3.0, c.y + 6.0)], stroke);
+    resp.on_hover_text(tip)
+}
+
+/// Renders the single ~44pt Tablet Studio top bar (used in ClassicTree mode when no page is open).
 pub fn show_top_bar(ui: &mut Ui, input: &StudioTopBarIn<'_>, search: &mut String, focus_search: &mut bool, t: &Tokens) -> StudioTopBarOut {
     let mut out = StudioTopBarOut::default();
-    let search_open_id = Id::new("studio-search-open");
+    let search_open_id = Id::unique("studio-search-open");
     let mut search_open = ui.ctx().data(|d| d.get_temp::<bool>(search_open_id)).unwrap_or(false) || *focus_search || !search.trim().is_empty();
     let frame = egui::Frame::NONE.fill(t.panel).inner_margin(egui::Margin { left: 10, right: 10, top: 5, bottom: 5 });
     frame.show(ui, |ui| {
@@ -151,58 +195,7 @@ pub fn show_top_bar(ui: &mut Ui, input: &StudioTopBarIn<'_>, search: &mut String
                 }
 
                 ui.menu_button(RichText::new(format!("{}%", input.view.zoom_percent)).color(t.text), |ui| {
-                    crate::ribbon::mark_popup_open(ui.ctx());
-                    ui.set_min_width(210.0);
-                    ui.horizontal(|ui| {
-                        if ui.button(crate::tl_id!("ui.zoom_out")).clicked() {
-                            out.acts.push(Act::Zoom(-1));
-                        }
-                        // i18n-exempt: 100% is a numeric zoom reset value.
-                        if ui.button("100%").clicked() {
-                            out.acts.push(Act::Zoom(0));
-                            ui.close();
-                        }
-                        if ui.button(crate::tl_id!("ui.zoom_in")).clicked() {
-                            out.acts.push(Act::Zoom(1));
-                        }
-                    });
-                    if ui.button(crate::tl_id!("ui.fit_all_content")).clicked() {
-                        out.acts.push(Act::FitAllContent);
-                        ui.close();
-                    }
-                    if ui.button(crate::tl_id!("ui.page_width")).clicked() {
-                        out.acts.push(Act::PageWidth);
-                        ui.close();
-                    }
-                    let mut minimap_on = input.view.show_minimap;
-                    if ui.checkbox(&mut minimap_on, crate::tl_id!("ui.show_minimap")).changed() {
-                        out.acts.push(Act::ToggleMinimap);
-                    }
-                    ui.separator();
-                    let next_rules = match input.view.rules {
-                        RuleLines::None => RuleLines::College,
-                        RuleLines::College => RuleLines::GridMedium,
-                        _ => RuleLines::None,
-                    };
-                    if ui.button(crate::tl_id!("ui.studio_cycle_paper_lines")).clicked() {
-                        out.acts.push(Act::RuleLines(next_rules));
-                    }
-                    if ui.button(crate::tl_id!("ui.theme")).clicked() {
-                        out.acts.push(Act::OpenThemes);
-                        ui.close();
-                    }
-                    if ui
-                        .button(if input.show_source { crate::tl_id!("ui.hide_the_page_source") } else { crate::tl_id!("ui.show_the_page_source") })
-                        .clicked()
-                    {
-                        out.acts.push(Act::ToggleSource);
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button(crate::tl_id!("ui.switch_to_classic_ribbon")).clicked() {
-                        out.acts.push(Act::ToggleStudioLayout);
-                        ui.close();
-                    }
+                    view_menu(ui, input, &mut out);
                 });
 
                 let sync_label = if input.sync_busy {
@@ -233,7 +226,12 @@ pub fn show_top_bar(ui: &mut Ui, input: &StudioTopBarIn<'_>, search: &mut String
                     }
                 }
                 if search_open {
-                    let edit = ui.add(egui::TextEdit::singleline(search).hint_text(crate::tl_id!("ui.search_all_pages")).desired_width(155.0));
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(search)
+                            .id(Id::unique(crate::app::SEARCH_FIELD))
+                            .hint_text(crate::tl_id!("ui.search_all_pages"))
+                            .desired_width(155.0),
+                    );
                     if std::mem::take(focus_search) {
                         edit.request_focus();
                         out.clear_page_caret = true;
@@ -248,304 +246,196 @@ pub fn show_top_bar(ui: &mut Ui, input: &StudioTopBarIn<'_>, search: &mut String
     out
 }
 
-/// Renders the floating Apple Pencil tool pill at `Order::Foreground` bottom-center of `view_rect`.
-/// Returns `(acts, occupied_rect)`.
-pub fn show_pencil_pill(ctx: &Context, view_rect: Rect, bottom_clearance: f32, view: &View<'_>, t: &Tokens) -> (Vec<Act>, Option<Rect>) {
-    let mut acts = Vec::new();
-    if view_rect.width() < 320.0 || view_rect.height() < 160.0 {
-        return (acts, None);
-    }
-    let palette_id = Id::new("studio-nib-palette-open");
-    let shapes_open_id = Id::new("studio-shapes-palette-open");
-    let mut palette_for = ctx.data(|d| d.get_temp::<Option<usize>>(palette_id)).flatten();
-    let mut shapes_open = ctx.data(|d| d.get_temp::<bool>(shapes_open_id)).unwrap_or(false);
-    if !matches!(view.pointer, Pointer::Shape(_)) {
-        shapes_open = false;
-    }
+/// The narrowest the failure banner is drawn.
+pub const ERROR_BANNER_MIN_WIDTH: f32 = 240.0;
 
-    let anchor_y = (view_rect.max.y - 12.0 - bottom_clearance.max(0.0)).max(view_rect.min.y + 52.0);
-    let center_x = view_rect.center().x;
+/// Shows a failure on one line at the top of the view until tapped away or superseded.
+pub fn show_error_banner(ctx: &Context, view_rect: Rect, message: &str, is_error: bool, tokens: &Tokens) -> bool {
+    let message = message.trim();
+    if message.is_empty() {
+        return false;
+    }
+    let margin = egui::Margin { left: 12, right: 12, top: 7, bottom: 7 };
+    let widest = (view_rect.width() - 32.0).max(ERROR_BANNER_MIN_WIDTH);
+    let pos = pos2(view_rect.center().x, (view_rect.min.y + 12.0).max(52.0));
+    let mut dismissed = false;
+    egui::Area::new(Id::unique("studio-error-banner")).order(Order::Foreground).pivot(Align2::CENTER_TOP).fixed_pos(pos).constrain(true).show(
+        ctx,
+        |ui| {
+            let frame = egui::Frame::NONE
+                .fill(tokens.panel.gamma_multiply(0.97))
+                .stroke(Stroke::new(1.0, if is_error { tokens.warn } else { tokens.container_border }))
+                .corner_radius(8.0)
+                .inner_margin(margin)
+                .show(ui, |ui| {
+                    ui.set_min_width(ERROR_BANNER_MIN_WIDTH - f32::from(margin.left + margin.right));
+                    ui.set_max_width(widest - f32::from(margin.left + margin.right));
+                    ui.add(
+                        egui::Label::new(RichText::new(message).color(if is_error { tokens.warn } else { tokens.text })).truncate().selectable(false),
+                    );
+                });
+            let tap = ui.interact(frame.response.rect, Id::unique("studio-error-banner-tap"), Sense::click());
+            tap.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, message));
+            dismissed = tap.clicked();
+        },
+    );
+    dismissed
+}
 
-    let area_resp = egui::Area::new(Id::new("studio-apple-pencil-pill"))
+/// Shared view menu for the top bar and floating header pill.
+fn view_menu(ui: &mut Ui, input: &StudioTopBarIn<'_>, out: &mut StudioTopBarOut) {
+    crate::ribbon::mark_popup_open(ui.ctx());
+    ui.set_min_width(210.0);
+    ui.horizontal(|ui| {
+        if ui.button(crate::tl_id!("ui.zoom_out")).clicked() {
+            out.acts.push(Act::Zoom(-1));
+        }
+        // i18n-exempt: 100% is a numeric zoom reset value.
+        if ui.button("100%").clicked() {
+            out.acts.push(Act::Zoom(0));
+            ui.close();
+        }
+        if ui.button(crate::tl_id!("ui.zoom_in")).clicked() {
+            out.acts.push(Act::Zoom(1));
+        }
+    });
+    if ui.button(crate::tl_id!("ui.fit_all_content")).clicked() {
+        out.acts.push(Act::FitAllContent);
+        ui.close();
+    }
+    if ui.button(crate::tl_id!("ui.page_width")).clicked() {
+        out.acts.push(Act::PageWidth);
+        ui.close();
+    }
+    let mut minimap_on = input.view.show_minimap;
+    if ui.checkbox(&mut minimap_on, crate::tl_id!("ui.show_minimap")).changed() {
+        out.acts.push(Act::ToggleMinimap);
+    }
+    ui.separator();
+    let next_rules = match input.view.rules {
+        RuleLines::None => RuleLines::College,
+        RuleLines::College => RuleLines::GridMedium,
+        _ => RuleLines::None,
+    };
+    if ui.button(crate::tl_id!("ui.studio_cycle_paper_lines")).clicked() {
+        out.acts.push(Act::RuleLines(next_rules));
+    }
+    if ui.button(crate::tl_id!("ui.theme")).clicked() {
+        out.acts.push(Act::OpenThemes);
+        ui.close();
+    }
+    if ui.button(if input.show_source { crate::tl_id!("ui.hide_the_page_source") } else { crate::tl_id!("ui.show_the_page_source") }).clicked() {
+        out.acts.push(Act::ToggleSource);
+        ui.close();
+    }
+    ui.separator();
+    let (next_library_view, view_label) = match input.library_view {
+        LibraryView::StudioGrid => (LibraryView::ClassicTree, crate::tl_id!("ui.use_classic_tree")),
+        LibraryView::ClassicTree => (LibraryView::StudioGrid, crate::tl_id!("ui.use_library_grid")),
+    };
+    if ui.button(view_label).clicked() {
+        out.acts.push(Act::LibraryView(next_library_view));
+        ui.close();
+    }
+    if ui.button(crate::tl_id!("ui.switch_to_classic_ribbon")).clicked() {
+        out.acts.push(Act::ToggleStudioLayout);
+        ui.close();
+    }
+}
+
+/// The floating header of an open page in Tablet Studio at the top left of `view_rect`.
+pub fn show_header_pill(
+    ctx: &Context,
+    view_rect: Rect,
+    input: &StudioTopBarIn<'_>,
+    search: &mut String,
+    focus_search: &mut bool,
+    t: &Tokens,
+) -> (StudioTopBarOut, Rect) {
+    let mut out = StudioTopBarOut::default();
+    let search_open_id = Id::unique("studio-search-open");
+    let mut search_open = ctx.data(|d| d.get_temp::<bool>(search_open_id)).unwrap_or(false) || *focus_search || !search.trim().is_empty();
+    let area = egui::Area::new(Id::unique("studio-header-pill"))
         .order(Order::Foreground)
-        .pivot(Align2::CENTER_BOTTOM)
-        .fixed_pos(pos2(center_x, anchor_y))
+        .fixed_pos(pos2(view_rect.min.x + DOCK_MARGIN, view_rect.min.y + DOCK_MARGIN))
         .constrain(true)
-        .movable(false)
         .show(ctx, |ui| {
             let frame = egui::Frame::NONE
                 .fill(t.panel.gamma_multiply(0.97))
                 .stroke(Stroke::new(1.0, t.container_border))
                 .corner_radius(14.0)
-                .inner_margin(egui::Margin { left: 10, right: 10, top: 6, bottom: 6 });
+                .inner_margin(egui::Margin { left: 8, right: 8, top: 5, bottom: 5 });
             frame.show(ui, |ui| {
-                if let Some(nib_idx) = palette_for
-                    && let Some(&nib) = view.rack.get(nib_idx)
-                    && view.pointer == Pointer::Draw
-                    && view.nib == nib_idx
-                {
-                    crate::ribbon::mark_popup_open(ui.ctx());
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        for tool in Tool::ALL {
-                            let chosen_tool = nib.tool == tool;
-                            let tool_label = crate::tl!(tool.label());
-                            let btn = ui.add(
-                                egui::Button::new(RichText::new(tool_label).small().color(if chosen_tool { t.accent } else { t.text }))
-                                    .selected(chosen_tool)
-                                    .min_size(vec2(48.0, 26.0)),
-                            );
-                            if btn.clicked() && !chosen_tool {
-                                let mut updated = nib;
-                                updated.tool = tool;
-                                if tool == Tool::Highlighter && updated.tenths < 80 {
-                                    updated.tenths = 140;
-                                } else if tool != Tool::Highlighter && updated.tenths > 100 {
-                                    updated.tenths = 30;
-                                }
-                                acts.push(Act::InkRack(RackEdit::Set(nib_idx, updated)));
-                            }
-                        }
-                    });
-                    ui.add_space(3.0);
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 5.0;
-                        let ring_edge = crate::theme::mix(t.panel, t.text, 0.28);
-                        for rgb in NIB_COLOURS {
-                            let c = shown_nib_color(rgb, t.panel);
-                            let (sw, sr) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
-                            sr.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, crate::tl_id!("ui.pen_colour")));
-                            ui.painter().circle_filled(sw.center(), 9.5, c);
-                            ui.painter().circle_stroke(sw.center(), 9.5, Stroke::new(0.8, ring_edge));
-                            if nib.colour == rgb {
-                                ui.painter().circle_stroke(sw.center(), 11.5, Stroke::new(2.0, t.accent));
-                            }
-                            if sr.clicked() {
-                                let mut updated = nib;
-                                updated.colour = rgb;
-                                acts.push(Act::InkRack(RackEdit::Set(nib_idx, updated)));
-                            }
-                        }
-                        ui.separator();
-                        for tenths in rack::THICKNESSES {
-                            let w = f32::from(tenths) / 10.0;
-                            let chosen = nib.tenths.abs_diff(tenths) <= 3;
-                            let (wr, ws) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
-                            ws.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, crate::tl_id!("ui.pen_thickness")));
-                            if chosen {
-                                ui.painter().rect_filled(wr, 5.0, t.accent.gamma_multiply(0.18));
-                            }
-                            ui.painter().circle_filled(wr.center(), (w * 0.5).clamp(1.2, 7.5), t.text);
-                            if ws.clicked() {
-                                let mut updated = nib;
-                                updated.tenths = tenths;
-                                acts.push(Act::InkRack(RackEdit::Set(nib_idx, updated)));
-                            }
-                        }
-                    });
-                    ui.separator();
-                } else if palette_for.is_some() {
-                    palette_for = None;
-                }
-
-                if shapes_open && let Pointer::Shape(current_shape) = view.pointer {
-                    crate::ribbon::mark_popup_open(ui.ctx());
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        for shape in Shape::ALL {
-                            let here = current_shape == shape;
-                            let label = crate::tl!(shape.label());
-                            let (sr, resp) = ui.allocate_exact_size(vec2(30.0, 28.0), Sense::click());
-                            resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, here, label));
-                            if here {
-                                ui.painter().rect_filled(sr, 6.0, t.accent.gamma_multiply(0.18));
-                                ui.painter().rect_stroke(sr, 6.0, Stroke::new(1.2, t.accent), StrokeKind::Inside);
-                            } else if resp.hovered() {
-                                ui.painter().rect_filled(sr, 6.0, t.row_hover);
-                            }
-                            let box_ = Rect::from_center_size(sr.center(), vec2(15.0, 15.0));
-                            let dabs = nocturne_ink::shapes::trace(shape, (box_.min.x, box_.min.y), (box_.max.x, box_.max.y), 1.0);
-                            let pts: Vec<egui::Pos2> = dabs.iter().map(|d| pos2(d.x, d.y)).collect();
-                            if pts.len() >= 2 {
-                                ui.painter().add(egui::Shape::line(pts, Stroke::new(1.4, if here { t.accent } else { t.text })));
-                            }
-                            if resp.on_hover_text(label).clicked() {
-                                acts.push(Act::InkPointer(Pointer::Shape(shape)));
-                            }
-                        }
-                    });
-                    ui.separator();
-                }
-
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
-                    if studio_icon_btn(
-                        ui,
-                        Icon::DirLtr,
-                        view.pointer == Pointer::Write,
-                        true,
-                        crate::tl_id!("ui.put_the_pointer_back_to_the_words_and_the_caret"),
-                        t,
-                    )
-                    .clicked()
-                    {
-                        palette_for = None;
-                        shapes_open = false;
-                        acts.push(Act::InkPointer(Pointer::Write));
+                    if input.library_view == LibraryView::StudioGrid {
+                        if studio_back_btn(ui, crate::tl_id!("ui.back_to_library"), t).clicked() {
+                            out.back_to_library = true;
+                        }
+                    } else if studio_icon_btn(ui, Icon::Bars, input.drawer_open, true, crate::tl_id!("ui.studio_toggle_drawer"), t).clicked() {
+                        out.toggle_drawer = true;
                     }
-
-                    // Scale displayed rack slots to the available canvas width so portrait / Split View
-                    // never overflows, while showing up to 8 slots (all 7 default tools + 1) on full iPad width.
-                    let slot_cap = if view_rect.width() < 560.0 {
-                        3
-                    } else if view_rect.width() < 740.0 {
-                        5
+                    if studio_icon_btn(ui, Icon::Plus, false, true, crate::tl_id!("ui.add_page"), t).clicked() {
+                        out.add_page = true;
+                    }
+                    let sync_label = if input.sync_busy {
+                        crate::tl_id!("ui.syncing_short")
+                    } else if input.sync_configured {
+                        crate::tl_id!("ui.sync_short")
                     } else {
-                        8
+                        crate::tl_id!("ui.sync_setup_short")
                     };
-                    let max_nibs = view.rack.len().min(slot_cap);
-                    let border_mix = crate::theme::mix(t.panel, t.text, 0.30);
-                    for i in 0..max_nibs {
-                        let nib = view.rack[i];
-                        let active = view.pointer == Pointer::Draw && view.nib == i;
-                        let tool_label = crate::tl!(nib.tool.label());
-                        let (nr, ns) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
-                        ns.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, active, tool_label));
-                        if active {
-                            ui.painter().rect_filled(nr, 7.0, t.accent.gamma_multiply(0.18));
-                            ui.painter().rect_stroke(nr, 7.0, Stroke::new(1.5, t.accent), StrokeKind::Inside);
-                        } else if ns.hovered() {
-                            ui.painter().rect_filled(nr, 7.0, t.row_hover);
+                    let sync = egui::Button::new(RichText::new(sync_label).color(if input.sync_busy { t.accent } else { t.text }))
+                        .min_size(vec2(54.0, 34.0));
+                    if ui.add(sync).clicked() {
+                        out.acts.push(Act::OpenCloudSync);
+                    }
+                    if search_open {
+                        let edit = ui.add(
+                            egui::TextEdit::singleline(search)
+                                .id(Id::unique(crate::app::SEARCH_FIELD))
+                                .hint_text(crate::tl_id!("ui.search_all_pages"))
+                                .desired_width(170.0),
+                        );
+                        if std::mem::take(focus_search) {
+                            edit.request_focus();
+                            out.clear_page_caret = true;
                         }
-                        let nib_col = shown_nib_color(nib.colour, t.panel);
-                        match nib.tool {
-                            Tool::Highlighter => {
-                                let band = Rect::from_center_size(pos2(nr.center().x, nr.center().y - 2.0), vec2(18.0, 12.0));
-                                ui.painter().rect_filled(band, 3.0, nib_col.gamma_multiply(0.65));
-                                ui.painter().rect_stroke(band, 3.0, Stroke::new(0.9, border_mix), StrokeKind::Inside);
-                                let tip = Rect::from_min_max(pos2(nr.min.x + 6.0, nr.max.y - 7.0), pos2(nr.max.x - 6.0, nr.max.y - 3.0));
-                                ui.painter().rect_filled(tip, 1.5, nib_col);
-                            }
-                            Tool::Pencil => {
-                                icons::paint(
-                                    ui.painter(),
-                                    Rect::from_center_size(pos2(nr.center().x, nr.center().y - 3.0), vec2(15.0, 15.0)),
-                                    Icon::Pen,
-                                    nib_col,
-                                );
-                                for dx in [-7.0_f32, -2.0, 3.0] {
-                                    ui.painter().line_segment(
-                                        [pos2(nr.center().x + dx, nr.max.y - 5.0), pos2(nr.center().x + dx + 3.0, nr.max.y - 5.0)],
-                                        Stroke::new(1.8, nib_col),
-                                    );
-                                }
-                            }
-                            _ => {
-                                icons::paint(
-                                    ui.painter(),
-                                    Rect::from_center_size(pos2(nr.center().x, nr.center().y - 3.0), vec2(16.0, 16.0)),
-                                    Icon::Pen,
-                                    nib_col,
-                                );
-                                ui.painter().line_segment(
-                                    [pos2(nr.min.x + 7.0, nr.max.y - 5.0), pos2(nr.max.x - 7.0, nr.max.y - 5.0)],
-                                    Stroke::new((nib.width() * 0.45).clamp(1.5, 4.0), nib_col),
-                                );
-                            }
+                    }
+                    ui.menu_button(RichText::new(crate::tl_id!("ui.more")).color(t.text), |ui| {
+                        crate::ribbon::mark_popup_open(ui.ctx());
+                        ui.set_min_width(210.0);
+                        if ui.add_enabled(input.can_back, egui::Button::new(crate::tl_id!("ui.back"))).clicked() {
+                            out.nav_back = true;
+                            ui.close();
                         }
-                        if ns.on_hover_text(tool_label).clicked() {
-                            shapes_open = false;
-                            if active {
-                                palette_for = if palette_for == Some(i) { None } else { Some(i) };
+                        if ui.add_enabled(input.can_forward, egui::Button::new(crate::tl_id!("ui.forward"))).clicked() {
+                            out.nav_forward = true;
+                            ui.close();
+                        }
+                        if ui.button(crate::tl_id!("ui.search_all_pages")).clicked() {
+                            if search_open {
+                                search.clear();
+                                search_open = false;
                             } else {
-                                palette_for = None;
-                                acts.push(Act::InkPen(i));
+                                search_open = true;
+                                *focus_search = true;
+                                out.clear_page_caret = true;
                             }
+                            ui.close();
                         }
-                    }
-
-                    if studio_icon_btn(ui, Icon::Eraser, view.pointer == Pointer::Erase, true, crate::tl_id!("ui.toggle_eraser_tip"), t).clicked() {
-                        palette_for = None;
-                        shapes_open = false;
-                        acts.push(Act::InkPointer(Pointer::Erase));
-                    }
-                    let auto_btn = ui
-                        .add(
-                            egui::Button::new(RichText::new(crate::tl_id!("ui.eraser_auto_short")).small().color(if view.eraser_auto_return {
-                                t.accent
-                            } else {
-                                t.muted
-                            }))
-                            .selected(view.eraser_auto_return)
-                            .min_size(vec2(38.0, 34.0)),
-                        )
-                        .on_hover_text(crate::tl_id!("ui.eraser_auto_return_tip"));
-                    if auto_btn.clicked() {
-                        acts.push(Act::ToggleEraserAutoReturn);
-                    }
-
-                    if studio_icon_btn(ui, Icon::Lasso, view.pointer == Pointer::Lasso, true, crate::tl_id!("ui.lasso_select"), t).clicked() {
-                        palette_for = None;
-                        shapes_open = false;
-                        acts.push(Act::InkPointer(Pointer::Lasso));
-                    }
-                    if studio_icon_btn(ui, Icon::Pointer, view.pointer == Pointer::Pick, true, crate::tl_id!("ui.select"), t).clicked() {
-                        palette_for = None;
-                        shapes_open = false;
-                        acts.push(Act::InkPointer(Pointer::Pick));
-                    }
-                    let shape_active = matches!(view.pointer, Pointer::Shape(_));
-                    if studio_icon_btn(ui, Icon::Shapes, shape_active, true, crate::tl_id!("ui.shapes"), t).clicked() {
-                        palette_for = None;
-                        if shape_active {
-                            shapes_open = !shapes_open;
-                        } else {
-                            shapes_open = true;
-                            acts.push(Act::InkPointer(Pointer::Shape(Shape::Rectangle)));
+                        if ui.button(crate::tl_id!("ui.file")).clicked() {
+                            out.acts.push(Act::File);
+                            ui.close();
                         }
-                    }
-                    if studio_icon_btn(ui, Icon::Hand, view.finger_drawing, true, crate::tl_id!("ui.finger_drawing_tip"), t).clicked() {
-                        acts.push(Act::ToggleFingerDrawing);
-                    }
-                    ui.separator();
-                    if studio_icon_btn(ui, Icon::Undo, false, view.can_undo, crate::tl_id!("ui.undo"), t).clicked() {
-                        acts.push(Act::Undo);
-                    }
-                    if studio_icon_btn(ui, Icon::Redo, false, view.can_redo || view.can_ink_redo, crate::tl_id!("ui.redo"), t).clicked() {
-                        acts.push(Act::Redo);
-                    }
+                        ui.separator();
+                        view_menu(ui, input, &mut out);
+                    });
                 });
             });
         });
-
-    ctx.data_mut(|d| {
-        d.insert_temp(palette_id, palette_for);
-        d.insert_temp(shapes_open_id, shapes_open);
-    });
-    (acts, Some(area_resp.response.rect))
-}
-
-/// Shows a non-blocking transient toast banner when Tablet Studio hides the permanent status bar.
-pub fn show_transient_notice(ctx: &Context, view_rect: Rect, message: &str, is_error: bool, tokens: &Tokens) {
-    if message.trim().is_empty() {
-        return;
-    }
-    let pos = pos2(view_rect.center().x, (view_rect.min.y + 12.0).max(52.0));
-    egui::Area::new(Id::new("studio-transient-notice")).order(Order::Tooltip).pivot(Align2::CENTER_TOP).fixed_pos(pos).interactable(false).show(
-        ctx,
-        |ui| {
-            let stroke_col = if is_error { tokens.warn } else { tokens.container_border };
-            let text_col = if is_error { tokens.warn } else { tokens.text };
-            egui::Frame::NONE
-                .fill(tokens.panel.gamma_multiply(0.96))
-                .stroke(Stroke::new(1.0, stroke_col))
-                .corner_radius(8.0)
-                .inner_margin(egui::Margin { left: 12, right: 12, top: 6, bottom: 6 })
-                .show(ui, |ui| {
-                    ui.label(RichText::new(message).small().color(text_col));
-                });
-        },
-    );
+    ctx.data_mut(|d| d.insert_temp(search_open_id, search_open));
+    (out, area.response.rect)
 }
 
 #[cfg(test)]
@@ -560,5 +450,17 @@ mod tests {
         assert!(!UiLayoutMode::Auto.is_tablet_studio(OperatingSystem::Mac, false));
         assert!(UiLayoutMode::TabletStudio.is_tablet_studio(OperatingSystem::Windows, false));
         assert!(!UiLayoutMode::ClassicRibbon.is_tablet_studio(OperatingSystem::IOS, false));
+    }
+
+    #[test]
+    fn canvas_top_clearance_reserves_room_below_header_and_top_docked_bar() {
+        let view = Rect::from_min_max(pos2(0.0, 0.0), pos2(1180.0, 820.0));
+        let header = Rect::from_min_max(pos2(12.0, 12.0), pos2(228.0, 56.0));
+        let bottom_bar = Rect::from_min_max(pos2(300.0, 754.0), pos2(880.0, 808.0));
+        let top_bar = Rect::from_min_max(pos2(300.0, 62.0), pos2(880.0, 116.0));
+
+        assert!((canvas_top_clearance(view, Some(header), Some(bottom_bar), ToolbarDock::Bottom) - 64.0).abs() < 0.01);
+        assert!((canvas_top_clearance(view, Some(header), Some(top_bar), ToolbarDock::Top) - 124.0).abs() < 0.01);
+        assert!(canvas_top_clearance(view, Some(header), Some(bottom_bar), ToolbarDock::Top) >= top_bar.max.y + 8.0);
     }
 }

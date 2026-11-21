@@ -78,8 +78,8 @@ explain its unavailable state, or be removed until the underlying command exists
 The supplied OneNote screenshot is the visual reference for this work. Do not commit copied
 Microsoft artwork, proprietary icons, or screenshots unless their provenance and redistribution
 rights are recorded. Prefer Nocturne's code-drawn icons and theme tokens, plus links to public
-Microsoft documentation. If a local comparison image is added later, record its source in
-`ATTRIBUTION.md` and keep it in this skill's `references/` folder.
+Microsoft documentation. If a local comparison image is added later, keep it in this skill's
+`references/` folder (`ATTRIBUTION.md` rows are optional; do not commit proprietary Microsoft code or artwork without permission).
 
 ## Verification checklist
 

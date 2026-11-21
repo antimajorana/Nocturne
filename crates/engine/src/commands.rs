@@ -41,7 +41,7 @@ pub struct CommandSpec {
     pub run: fn(&mut Session, &Params) -> Result<Output, EngineError>,
 }
 
-fn req<'a>(p: &'a Params, key: &'static str) -> Result<&'a str, EngineError> {
+pub(crate) fn req<'a>(p: &'a Params, key: &'static str) -> Result<&'a str, EngineError> {
     p.get(key).map(String::as_str).ok_or(EngineError::MissingParam(key))
 }
 
@@ -454,6 +454,77 @@ fn ink_finger_drawing(s: &mut Session, p: &Params) -> Result<Output, EngineError
     Ok(Output::Json(serde_json::json!({ "finger_drawing": enabled })))
 }
 
+/// `true`, `false`, or (when missing, empty or `toggle`) the opposite of `now`.
+pub(crate) fn switch_param(p: &Params, key: &str, now: bool) -> Result<bool, EngineError> {
+    match p.get(key).map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("" | "toggle") => Ok(!now),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(_) => Err(EngineError::BadParam(format!("{key} must be true, false, or toggle"))),
+    }
+}
+
+fn ink_eraser_mode(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
+    let now = s.ink_options().eraser_kind;
+    let kind = match p.get("mode").map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("" | "toggle") => match now {
+            crate::EraserKind::Object => crate::EraserKind::Pixel,
+            crate::EraserKind::Pixel => crate::EraserKind::Object,
+        },
+        Some(raw) => crate::EraserKind::parse(raw).ok_or_else(|| EngineError::BadParam("mode must be object, pixel, or toggle".into()))?,
+    };
+    s.set_eraser_kind(kind);
+    Ok(Output::Json(serde_json::json!({ "eraser_mode": kind.id() })))
+}
+
+fn ink_eraser_width(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
+    let bad = || EngineError::BadParam("width must be s, m, l, xl, or points from 2 to 80".into());
+    let width = p.get("width").and_then(|raw| crate::InkOptions::parse_width(raw)).ok_or_else(bad)?;
+    if !s.set_eraser_width(width) {
+        return Err(bad());
+    }
+    Ok(Output::Json(serde_json::json!({ "eraser_width": width })))
+}
+
+fn ui_toolbar_dock(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
+    let bad = || EngineError::BadParam("edge must be bottom, top, left, or right".into());
+    let dock = p.get("edge").and_then(|raw| crate::ToolbarDock::parse(raw)).ok_or_else(bad)?;
+    s.set_toolbar_dock(dock);
+    Ok(Output::Json(serde_json::json!({ "toolbar_dock": dock.id() })))
+}
+
+fn ink_configure_tools(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
+    if let Some(raw) = p.get("tools") {
+        let roster = crate::DockRoster::parse(raw).map_err(|why| {
+            EngineError::BadParam(format!("tools: {why}; the tools are write, pens, eraser, lasso, select, shapes, picture, math_ocr, and history"))
+        })?;
+        s.set_dock_roster(roster);
+    }
+    Ok(Output::Json(serde_json::json!({ "tools": s.studio_options().roster.write() })))
+}
+
+fn ui_library_view(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
+    if let Some(raw) = p.get("view") {
+        let trimmed = raw.trim();
+        let next = if trimmed.eq_ignore_ascii_case("toggle") {
+            match s.library_view() {
+                crate::LibraryView::StudioGrid => crate::LibraryView::ClassicTree,
+                crate::LibraryView::ClassicTree => crate::LibraryView::StudioGrid,
+            }
+        } else {
+            crate::LibraryView::parse(trimmed).ok_or_else(|| EngineError::BadParam("view must be studio_grid, classic_tree, or toggle".into()))?
+        };
+        s.set_library_view(next);
+    }
+    Ok(Output::Json(serde_json::json!({ "library_view": s.library_view().id() })))
+}
+
+fn ink_hold_to_straighten(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
+    let enabled = switch_param(p, "enabled", s.ink_options().hold_to_straighten)?;
+    s.set_hold_to_straighten(enabled);
+    Ok(Output::Json(serde_json::json!({ "hold_to_straighten": enabled })))
+}
+
 fn node_format(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
     let dir = s.resolve(req(p, "path")?)?;
     let raw = req(p, "format")?.trim().to_ascii_lowercase();
@@ -465,7 +536,7 @@ fn node_format(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
     Ok(Output::None)
 }
 
-fn parse_opt_bool(p: &Params, key: &'static str) -> Result<Option<bool>, EngineError> {
+pub(crate) fn parse_opt_bool(p: &Params, key: &'static str) -> Result<Option<bool>, EngineError> {
     match p.get(key).map(|v| v.trim().to_ascii_lowercase()) {
         None => Ok(None),
         Some(v) if v.is_empty() => Ok(None),
@@ -867,6 +938,69 @@ blocks (optional): the justified paragraphs' positions among the page's blocks, 
         params: "enabled (optional): true, false, or toggle; default: toggle",
         changes_tree: false,
         run: ink_finger_drawing,
+    },
+    CommandSpec {
+        id: "ink.eraser_mode",
+        label: "Choose what the eraser takes",
+        params: "mode (optional): object (the whole stroke), pixel (only what is under the eraser), or toggle; default: toggle",
+        changes_tree: false,
+        run: ink_eraser_mode,
+    },
+    CommandSpec {
+        id: "ink.eraser_width",
+        label: "Set the eraser's size",
+        params: "width: s, m, l, xl, or points across from 2 to 80",
+        changes_tree: false,
+        run: ink_eraser_width,
+    },
+    CommandSpec {
+        id: "ink.hold_to_straighten",
+        label: "Straighten a stroke when the pen is held still",
+        params: "enabled (optional): true, false, or toggle; default: toggle",
+        changes_tree: false,
+        run: ink_hold_to_straighten,
+    },
+    CommandSpec {
+        id: "ink.math_ocr_toggle",
+        label: "Turn handwritten equation recognition on or off",
+        params: "enabled (optional): true, false, or toggle; default: toggle",
+        changes_tree: false,
+        run: crate::ocr::commands::toggle,
+    },
+    CommandSpec {
+        id: "ink.math_ocr_configure",
+        label: "Choose the service that reads handwritten equations, and give it its key",
+        params: "provider (optional): anthropic, gemini, openai, mathpix, or custom\nendpoint (optional): the service's address, https only unless it is on this machine; default for the service's own\nmodel (optional): the model to ask; default for the service's own\nkey (optional): the service's key, kept outside the settings file and never shown\napp_id (optional): the app id Mathpix needs beside its key\nclear_key (optional): true forgets the key\nwithout parameters, reports the settings",
+        changes_tree: false,
+        run: crate::ocr::commands::configure,
+    },
+    CommandSpec {
+        id: "ink.math_ocr_convert",
+        label: "Read a page's handwritten equation as LaTeX (sends a picture of the ink to the chosen service)",
+        params: "path (required): the page\nstrokes (optional): which strokes, by position, comma separated; default: all of them",
+        changes_tree: false,
+        run: crate::ocr::commands::convert,
+    },
+    CommandSpec {
+        id: "ink.configure_tools",
+        label: "Choose the tools on the Tablet Studio tool bar",
+        params: "tools (optional): the tools in order, comma separated, a minus before one to hide it (write, pens, eraser, lasso, select, shapes, picture, math_ocr, history); without it, reports the list",
+        changes_tree: false,
+        run: ink_configure_tools,
+    },
+    CommandSpec {
+        id: "ui.toolbar_dock",
+        label: "Move the Tablet Studio tool bar to an edge",
+        params: "edge: bottom, top, left, or right",
+        changes_tree: false,
+        run: ui_toolbar_dock,
+    },
+    CommandSpec {
+        id: "ui.library_view",
+        label: "Choose how Tablet Studio shows the notebooks and pages",
+        params: "view (optional): studio_grid, classic_tree, or toggle; without it, reports the current view",
+        changes_tree: false,
+        run: ui_library_view,
     },
     CommandSpec {
         id: "sync.status",

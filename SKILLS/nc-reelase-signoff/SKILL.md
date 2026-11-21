@@ -32,7 +32,7 @@ requested `reelase` spelling for discoverability.
 6. Run layers, assets, docs, text, and relevant UI/integration tests.
 7. Build the debug, release, and production/install artifacts appropriate to the release.
 8. Verify installer contents, bundled bridge/discovery behavior, version/About text, icons,
-   screenshots, licenses, and attribution. Test installation in a clean VM, device, or browser when
+   screenshots, and non-empty packaged `NOTICE`/`ATTRIBUTION.md`/`LICENSE-*` files (per-file `assets/` rows in `ATTRIBUTION.md` are optional). Test installation in a clean VM, device, or browser when
    the release changes packaging or external bridges. Apply `packaging/installation artifacts.md`
    and the platform matrix below. Verify each artifact carries both generated formats and all 13
    demo locales. The first-use wizard offers the managed Welcome notebook once, after installation or a

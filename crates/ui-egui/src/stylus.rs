@@ -90,6 +90,10 @@ pub struct Stylus {
     finger_ended_frame: bool,
     stylus_ended_frame: bool,
     last_origin: PointerOrigin,
+    /// Where the pen last reported being, and every place it reported this frame with its
+    /// pressure: see [`StylusFrame`].
+    stylus_pos: Option<egui::Pos2>,
+    stylus_moves: Vec<(egui::Pos2, f32)>,
 }
 
 impl Stylus {
@@ -101,6 +105,7 @@ impl Stylus {
         self.any_touch_this_frame = false;
         self.finger_ended_frame = false;
         self.stylus_ended_frame = false;
+        self.stylus_moves.clear();
         let mut finite_touch_this_frame = false;
         let mut mouse_moved = false;
         let mut pointer_pressed = false;
@@ -153,6 +158,10 @@ impl Stylus {
                         let p = reported.unwrap_or(0.0);
                         self.highest = self.highest.max(p);
                         self.samples += 1;
+                        if pos.is_finite() {
+                            self.stylus_pos = Some(*pos);
+                            self.stylus_moves.push((*pos, p));
+                        }
                         p
                     } else {
                         1.0
@@ -174,6 +183,10 @@ impl Stylus {
                         entry.pressure = p;
                         self.highest = self.highest.max(p);
                         self.samples += 1;
+                        if pos.is_finite() {
+                            self.stylus_pos = Some(*pos);
+                            self.stylus_moves.push((*pos, p));
+                        }
                     } else {
                         entry.pressure = 1.0;
                     }
@@ -183,6 +196,9 @@ impl Stylus {
                     let was_stylus = removed.is_some_and(|c| c.is_stylus) || reported.is_some();
                     if was_stylus {
                         self.stylus_ended_frame = true;
+                        if pos.is_finite() {
+                            self.stylus_pos = Some(*pos);
+                        }
                     } else {
                         self.finger_ended_frame = true;
                     }
@@ -309,6 +325,40 @@ impl Stylus {
     pub fn diagnostics(&self) -> Diagnostics {
         self.diagnostics
     }
+
+    /// What the pen itself did this frame, read from its own touch events: `None` unless a pen
+    /// is on the glass or lifted this frame.
+    pub fn stylus_frame(&self) -> Option<StylusFrame> {
+        let down = self.has_active_stylus();
+        if !down && !self.stylus_ended_frame {
+            return None;
+        }
+        Some(StylusFrame { down, landed: self.landed.is_some(), pos: self.stylus_pos?, moves: self.stylus_moves.clone() })
+    }
+}
+
+/// One frame of a pen, taken from the pen's own contact and not from the window's pointer.
+///
+/// The window layer turns only the first contact on the glass into a pointer. With a palm
+/// resting on the screen that contact is the palm, and the pointer then follows the palm while
+/// the pen draws. So the ink reads the pen here.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StylusFrame {
+    /// The pen is on the glass at the end of this frame.
+    pub down: bool,
+    /// The pen came down this frame.
+    pub landed: bool,
+    /// Where the pen is, or where it was when it lifted.
+    pub pos: egui::Pos2,
+    /// Every place the pen reported this frame, in order, each with its pressure.
+    pub moves: Vec<(egui::Pos2, f32)>,
+}
+
+impl StylusFrame {
+    /// Where the ink keeps this frame's pen reading for the page.
+    pub fn id() -> egui::Id {
+        egui::Id::new("nocturne-stylus-frame")
+    }
 }
 
 #[cfg(test)]
@@ -317,6 +367,36 @@ mod tests {
 
     fn touch(phase: egui::TouchPhase, force: Option<f32>) -> egui::Event {
         egui::Event::Touch { device_id: egui::TouchDeviceId(0), id: egui::TouchId(0), phase, pos: egui::Pos2::ZERO, force }
+    }
+
+    fn contact(id: u64, phase: egui::TouchPhase, pos: egui::Pos2, force: Option<f32>) -> egui::Event {
+        egui::Event::Touch { device_id: egui::TouchDeviceId(0), id: egui::TouchId(id), phase, pos, force }
+    }
+
+    /// A palm lands first and owns the window's pointer; the pen's own frame still follows the pen.
+    #[test]
+    fn the_pen_frame_follows_the_pen_and_not_a_resting_palm() {
+        use egui::TouchPhase::{End, Move, Start};
+        use egui::pos2;
+        let (palm, a, b, c) = (pos2(600.0, 500.0), pos2(100.0, 100.0), pos2(120.0, 104.0), pos2(140.0, 108.0));
+        let mut s = Stylus::default();
+        s.update(&[contact(1, Start, palm, None), egui::Event::PointerMoved(palm)]);
+        assert_eq!(s.stylus_frame(), None, "a palm alone is not a pen");
+
+        s.update(&[contact(2, Start, a, Some(0.4))]);
+        assert_eq!(s.stylus_frame(), Some(StylusFrame { down: true, landed: true, pos: a, moves: vec![(a, 0.4)] }));
+
+        s.update(&[contact(1, Move, palm + egui::vec2(1.0, 1.0), None), contact(2, Move, b, Some(0.5)), contact(2, Move, c, Some(0.6))]);
+        assert_eq!(s.stylus_frame(), Some(StylusFrame { down: true, landed: false, pos: c, moves: vec![(b, 0.5), (c, 0.6)] }));
+
+        s.update(&[]);
+        assert_eq!(s.stylus_frame(), Some(StylusFrame { down: true, landed: false, pos: c, moves: Vec::new() }), "a pen held still");
+
+        s.update(&[contact(2, End, c, Some(0.0))]);
+        assert_eq!(s.stylus_frame(), Some(StylusFrame { down: false, landed: false, pos: c, moves: Vec::new() }), "the frame the pen lifts in");
+
+        s.update(&[]);
+        assert_eq!(s.stylus_frame(), None, "the palm is still down, the pen is gone");
     }
 
     #[test]
