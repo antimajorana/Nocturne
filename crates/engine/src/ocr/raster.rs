@@ -20,15 +20,89 @@ const MAX_SCALE: f32 = 4.0;
 const SUB: usize = 4;
 /// Coordinates beyond this are a damaged file, not handwriting.
 const SANE: f32 = 1.0e6;
+/// Minimum rendered stroke width in pixels so thin or light-pressure pencil and brush strokes
+/// stay crisp black ink when downscaled for OCR encoders.
+const MIN_STROKE_PX: f32 = 2.6;
+
+/// Rasterized monochrome PNG image together with its pixel dimensions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RasterImage {
+    pub png: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
 
 type Polygon = Vec<(f32, f32)>;
 
-fn polygons(strokes: &[Stroke]) -> Vec<Polygon> {
+fn valid_strokes(strokes: &[Stroke]) -> Vec<&Stroke> {
     strokes
         .iter()
         .filter(|s| s.tool != Tool::Highlighter)
+        .filter(|s| !s.dabs.is_empty())
         .filter(|s| s.dabs.iter().all(|d| d.x.is_finite() && d.y.is_finite() && d.x.abs() < SANE && d.y.abs() < SANE))
-        .map(shape::outline)
+        .collect()
+}
+
+fn estimate_scale(valid: &[&Stroke]) -> Option<f32> {
+    let mut x0 = f32::MAX;
+    let mut y0 = f32::MAX;
+    let mut x1 = f32::MIN;
+    let mut y1 = f32::MIN;
+    let mut any = false;
+    for stroke in valid {
+        let half = if stroke.width.is_finite() && stroke.width > 0.0 { stroke.width * 0.5 } else { 0.5 };
+        for d in &stroke.dabs {
+            x0 = x0.min(d.x - half);
+            y0 = y0.min(d.y - half);
+            x1 = x1.max(d.x + half);
+            y1 = y1.max(d.y + half);
+            any = true;
+        }
+    }
+    if !any {
+        return None;
+    }
+    let longest = (x1 - x0).max(y1 - y0).max(1.0);
+    Some(MAX_SCALE.min((MAX_SIDE as f32 - 2.0 * MARGIN) / longest))
+}
+
+/// Ensures every point along `stroke` renders at least `min_width_pt` wide before outlining,
+/// lifting very thin or low-pressure pencil/brush strokes without bloating already-bold strokes.
+fn lift_stroke_for_ocr(stroke: &Stroke, min_width_pt: f32) -> Stroke {
+    let mut lifted = stroke.clone();
+    if !lifted.width.is_finite() || lifted.width < min_width_pt {
+        lifted.width = min_width_pt;
+    }
+    if shape::width_at(&lifted, 1.0) < min_width_pt {
+        lifted.curve = Default::default();
+        lifted.gain = 1.0;
+    }
+    for i in 0..lifted.dabs.len() {
+        let p = lifted.dabs[i].pressure;
+        if shape::width_at(&lifted, p) < min_width_pt {
+            let mut lo = if p.is_finite() { p.clamp(0.0, 1.0) } else { 0.0 };
+            let mut hi = 1.0f32;
+            for _ in 0..12 {
+                let mid = (lo + hi) * 0.5;
+                if shape::width_at(&lifted, mid) >= min_width_pt {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            lifted.dabs[i].pressure = hi;
+        }
+    }
+    lifted
+}
+
+fn polygons(valid: &[&Stroke], min_width_pt: f32) -> Vec<Polygon> {
+    valid
+        .iter()
+        .map(|s| {
+            let lifted = lift_stroke_for_ocr(s, min_width_pt);
+            shape::outline(&lifted)
+        })
         .filter(|poly| poly.len() >= 3 && poly.iter().all(|(x, y)| x.is_finite() && y.is_finite()))
         .collect()
 }
@@ -80,9 +154,13 @@ fn fill_span(row: &mut [f32], from: f32, to: f32, weight: f32) {
     }
 }
 
-/// The picture of these strokes. `NoInk` if there is nothing in them to draw.
-pub fn png(strokes: &[Stroke]) -> Result<Vec<u8>, OcrError> {
-    let mut polys = polygons(strokes);
+/// The picture of these strokes together with its pixel dimensions.
+/// Returns [`OcrError::NoInk`] if there is nothing in `strokes` to draw.
+pub fn render_png(strokes: &[Stroke]) -> Result<RasterImage, OcrError> {
+    let valid = valid_strokes(strokes);
+    let Some(est_scale) = estimate_scale(&valid) else { return Err(OcrError::NoInk) };
+    let min_width_pt = MIN_STROKE_PX / est_scale.max(1e-4);
+    let mut polys = polygons(&valid, min_width_pt);
     let Some(&(x, y)) = polys.first().and_then(|p| p.first()) else { return Err(OcrError::NoInk) };
     let (mut x0, mut y0, mut x1, mut y1) = (x, y, x, y);
     for (px, py) in polys.iter().flatten() {
@@ -100,12 +178,18 @@ pub fn png(strokes: &[Stroke]) -> Result<Vec<u8>, OcrError> {
         coverage(&polys, width as usize, height as usize).into_iter().map(|c| (255.0 * (1.0 - c.clamp(0.0, 1.0))).round() as u8).collect();
     let mut out = Vec::new();
     PngEncoder::new(&mut out).write_image(&pixels, width, height, ExtendedColorType::L8).map_err(|_| OcrError::Picture)?;
-    Ok(out)
+    Ok(RasterImage { png: out, width, height })
+}
+
+/// The picture of these strokes. `NoInk` if there is nothing in them to draw.
+pub fn png(strokes: &[Stroke]) -> Result<Vec<u8>, OcrError> {
+    Ok(render_png(strokes)?.png)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nocturne_ink::{Dab, Rgb};
 
     #[test]
     fn a_square_drawn_twice_or_backwards_is_filled_once() {
@@ -120,5 +204,23 @@ mod tests {
         // Half a pixel in from the left edge covers half of that pixel.
         let cover = coverage(&[vec![(2.5, 2.0), (6.0, 2.0), (6.0, 6.0), (2.5, 6.0)]], 8, 8);
         assert!((cover[3 * 8 + 2] - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn render_png_reports_dimensions_and_lifts_thin_low_pressure_strokes() {
+        // Wide equation-scale horizontal stroke with whisper-thin brush width and tiny pressure.
+        let mut thin_brush = Stroke::new(Tool::BrushPen, Rgb::BLACK, 0.6);
+        thin_brush.dabs = (0..=20).map(|i| Dab::new(i as f32 * 40.0, 50.0, 0.05)).collect();
+
+        let rendered = render_png(&[thin_brush]).expect("render thin stroke");
+        let img = image::load_from_memory(&rendered.png).expect("decode png").to_luma8();
+        assert_eq!(rendered.width, img.width());
+        assert_eq!(rendered.height, img.height());
+        assert!(rendered.width > rendered.height * 4, "wide stroke preserves wide aspect ratio");
+
+        // At the horizontal center column, the stroke must span at least 2 fully dark pixels vertically.
+        let mid_x = img.width() / 2;
+        let dark_rows = (0..img.height()).filter(|&y| img.get_pixel(mid_x, y).0[0] < 64).count();
+        assert!(dark_rows >= 2, "expected lifted stroke to render at least 2 solid dark pixel rows, got {dark_rows}");
     }
 }

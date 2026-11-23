@@ -5,7 +5,7 @@ use crate::theme::{self, RADIUS_CONTROL, RADIUS_PILL, Tokens};
 use egui::{Align2, Context, CornerRadius, Id, Key, Modifiers, Order, Rect, RichText, Sense, Stroke, StrokeKind, Ui, Vec2, vec2};
 use nocturne_engine::ocr::local_model::{self, DownloadProgress};
 use nocturne_engine::ocr::{self, OcrError, OcrJob, OcrProvider};
-use nocturne_engine::{SyncError, SyncHttpClient};
+use nocturne_engine::{OcrMode, SyncError, SyncHttpClient};
 use nocturne_ink::Stroke as InkStroke;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -121,6 +121,7 @@ pub struct Conversion {
     pub page: PathBuf,
     pub strokes: Vec<InkStroke>,
     pub bounds: [f32; 4],
+    pub mode: OcrMode,
     pub stage: Stage,
 }
 
@@ -150,17 +151,27 @@ pub fn error_text(err: &OcrError) -> String {
     }
 }
 
-/// The pill over held ink. `held` is where the held ink is on screen. True when pressed.
-pub fn convert_button(ctx: &Context, held: Rect, view: Rect, t: &Tokens) -> bool {
+/// The floating pill over held ink, offering whichever recognition modes are enabled.
+pub fn convert_buttons(
+    ctx: &Context,
+    held_rect: Rect,
+    view_rect: Rect,
+    math_enabled: bool,
+    handwriting_enabled: bool,
+    t: &Tokens,
+) -> Option<OcrMode> {
+    if !math_enabled && !handwriting_enabled {
+        return None;
+    }
     let h = crate::touch_ux::TOUCH_PILL_HEIGHT;
-    let above = held.top() - h - 8.0 >= view.top();
-    let at = egui::pos2(held.center().x, if above { held.top() - 8.0 } else { held.bottom() + 8.0 });
-    let mut pressed = false;
+    let above = held_rect.top() - h - 8.0 >= view_rect.top();
+    let at = egui::pos2(held_rect.center().x, if above { held_rect.top() - 8.0 } else { held_rect.bottom() + 8.0 });
+    let mut chosen = None;
     egui::Area::new(Id::unique("math-ocr-convert"))
         .order(Order::Foreground)
         .pivot(if above { Align2::CENTER_BOTTOM } else { Align2::CENTER_TOP })
         .fixed_pos(at)
-        .constrain_to(view)
+        .constrain_to(view_rect)
         .show(ctx, |ui| {
             let frame = egui::Frame::NONE
                 .fill(t.surface_elevated)
@@ -169,11 +180,34 @@ pub fn convert_button(ctx: &Context, held: Rect, view: Rect, t: &Tokens) -> bool
                 .inner_margin(egui::Margin::symmetric(10, 4))
                 .corner_radius(CornerRadius::same(RADIUS_PILL));
             frame.show(ui, |ui| {
-                let label = RichText::new(crate::tl_id!("ui.convert_to_latex")).color(t.text);
-                pressed = ui.add(egui::Button::new(label).frame(false).min_size(vec2(120.0, h - 8.0))).clicked();
+                ui.horizontal(|ui| {
+                    if math_enabled {
+                        let label = RichText::new(crate::tl_id!("ui.convert_to_latex")).color(t.text);
+                        if ui.add(egui::Button::new(label).frame(false).min_size(vec2(120.0, h - 8.0))).clicked() {
+                            chosen = Some(OcrMode::MathLatex);
+                        }
+                    }
+                    if math_enabled && handwriting_enabled {
+                        ui.separator();
+                    }
+                    if handwriting_enabled {
+                        let label = RichText::new(crate::tl_id!("ui.ocr_convert_to_text")).color(t.text);
+                        let resp = ui
+                            .add(egui::Button::new(label).frame(false).min_size(vec2(110.0, h - 8.0)))
+                            .on_hover_text(crate::tl_id!("ui.ocr_convert_to_text_tip"));
+                        if resp.clicked() {
+                            chosen = Some(OcrMode::HandwritingText);
+                        }
+                    }
+                });
             });
         });
-    pressed
+    chosen
+}
+
+/// The pill over held ink. `held` is where the held ink is on screen. True when pressed.
+pub fn convert_button(ctx: &Context, held: Rect, view: Rect, t: &Tokens) -> bool {
+    convert_buttons(ctx, held, view, true, false, t).is_some()
 }
 
 /// True when the TeX is something the typesetter reads in full, not its plain-text fallback.
@@ -182,15 +216,23 @@ pub fn typesets(ui: &Ui, tex: &str) -> bool {
     !tex.trim().is_empty() && crate::mathview::measure(ui, tex, 18.0, true).engine == nocturne_math::Engine::Ratex
 }
 
-/// Draws the conversion: the waiting card or the preview modal. Says what the writer chose.
-pub fn show(ctx: &Context, conv: &mut Conversion, t: &Tokens) -> Outcome {
-    match &mut conv.stage {
-        Stage::Waiting(_) => show_waiting(ctx, t),
-        Stage::Preview { tex, opened } => show_preview(ctx, tex, opened, t),
+fn modal_title(mode: OcrMode) -> &'static str {
+    match mode {
+        OcrMode::MathLatex => crate::tl_id!("ui.convert_to_latex"),
+        OcrMode::HandwritingText => crate::tl_id!("ui.ocr_text_window_title"),
     }
 }
 
-fn show_waiting(ctx: &Context, t: &Tokens) -> Outcome {
+/// Draws the conversion: the waiting card or the preview modal. Says what the writer chose.
+pub fn show(ctx: &Context, conv: &mut Conversion, t: &Tokens) -> Outcome {
+    let mode = conv.mode;
+    match &mut conv.stage {
+        Stage::Waiting(_) => show_waiting(ctx, mode, t),
+        Stage::Preview { tex, opened } => show_preview(ctx, mode, tex, opened, t),
+    }
+}
+
+fn show_waiting(ctx: &Context, mode: OcrMode, t: &Tokens) -> Outcome {
     let mut outcome = Outcome::Keep;
     let inner_w = (modal::responsive_width(ctx.viewport_rect().width(), 360.0) - 32.0).max(160.0);
     // Uses the shared modal frame without a blocking full-screen scrim so the writer can still
@@ -202,7 +244,7 @@ fn show_waiting(ctx: &Context, t: &Tokens) -> Outcome {
                 ui.set_width(inner_w);
                 ui.set_max_width(inner_w);
                 ui.visuals_mut().override_text_color = Some(t.text);
-                if modal::header(ui, crate::tl_id!("ui.convert_to_latex"), true, t) {
+                if modal::header(ui, modal_title(mode), true, t) {
                     outcome = Outcome::Cancel;
                 }
                 ui.horizontal(|ui| {
@@ -224,55 +266,71 @@ fn show_waiting(ctx: &Context, t: &Tokens) -> Outcome {
     outcome
 }
 
-fn show_preview(ctx: &Context, tex: &mut String, opened: &mut bool, t: &Tokens) -> Outcome {
+fn show_preview(ctx: &Context, mode: OcrMode, text: &mut String, opened: &mut bool, t: &Tokens) -> Outcome {
     crate::ribbon::mark_popup_open(ctx);
-    let usable = !tex.trim().is_empty();
-    let res =
-        Modal::new("math-ocr-window", crate::tl_id!("ui.convert_to_latex")).backdrop_id("math-ocr-window-backdrop").width(400.0).show_with_footer(
-            ctx,
-            t,
-            |ui| {
-                if tex.contains(['\r', '\n']) {
-                    *tex = tex.replace("\r\n", " ").replace(['\r', '\n'], " ");
+    let usable = !text.trim().is_empty();
+    let res = Modal::new("math-ocr-window", modal_title(mode)).backdrop_id("math-ocr-window-backdrop").width(400.0).show_with_footer(
+        ctx,
+        t,
+        |ui| {
+            let tex_id = Id::unique(TEX_FIELD);
+            match mode {
+                OcrMode::MathLatex => {
+                    if text.contains(['\r', '\n']) {
+                        *text = text.replace("\r\n", " ").replace(['\r', '\n'], " ");
+                    }
+                    let preview = egui::Frame::NONE
+                        .fill(t.code_bg)
+                        .stroke(Stroke::new(1.0, t.border_subtle))
+                        .inner_margin(egui::Margin::same(10))
+                        .corner_radius(CornerRadius::same(RADIUS_CONTROL));
+                    preview.show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        crate::mathview::display(ui, text, 20.0, t.strong);
+                    });
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(crate::tl_id!("ui.latex_source")).color(t.text));
+                    if !*opened && ui.is_enabled() && !ui.is_sizing_pass() {
+                        ui.memory_mut(|m| m.request_focus(tex_id));
+                        *opened = true;
+                    }
+                    ui.add(egui::TextEdit::singleline(text).id(tex_id).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace));
+                    if text.contains(['\r', '\n']) {
+                        *text = text.replace("\r\n", " ").replace(['\r', '\n'], " ");
+                    }
+                    if !text.trim().is_empty() && !typesets(ui, text) {
+                        ui.add_space(4.0);
+                        ui.colored_label(t.warn, crate::tl_id!("ui.latex_not_typeset"));
+                    }
                 }
-                let preview = egui::Frame::NONE
-                    .fill(t.code_bg)
-                    .stroke(Stroke::new(1.0, t.border_subtle))
-                    .inner_margin(egui::Margin::same(10))
-                    .corner_radius(CornerRadius::same(RADIUS_CONTROL));
-                preview.show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    crate::mathview::display(ui, tex, 20.0, t.strong);
-                });
-                ui.add_space(8.0);
-                ui.label(RichText::new(crate::tl_id!("ui.latex_source")).color(t.text));
-                let tex_id = Id::unique(TEX_FIELD);
-                if !*opened && ui.is_enabled() && !ui.is_sizing_pass() {
-                    ui.memory_mut(|m| m.request_focus(tex_id));
-                    *opened = true;
-                }
-                ui.add(egui::TextEdit::singleline(tex).id(tex_id).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace));
-                if tex.contains(['\r', '\n']) {
-                    *tex = tex.replace("\r\n", " ").replace(['\r', '\n'], " ");
-                }
-                if !tex.trim().is_empty() && !typesets(ui, tex) {
+                OcrMode::HandwritingText => {
+                    ui.label(RichText::new(crate::tl_id!("ui.ocr_text_edit_label")).color(t.text));
                     ui.add_space(4.0);
-                    ui.colored_label(t.warn, crate::tl_id!("ui.latex_not_typeset"));
+                    if !*opened && ui.is_enabled() && !ui.is_sizing_pass() {
+                        ui.memory_mut(|m| m.request_focus(tex_id));
+                        *opened = true;
+                    }
+                    ui.add(egui::TextEdit::multiline(text).id(tex_id).desired_rows(4).desired_width(f32::INFINITY));
                 }
-            },
-            |ui| {
-                let mut out = Outcome::Keep;
-                ui.horizontal_wrapped(|ui| {
-                    if modal::secondary_button(ui, crate::tl_id!("ui.cancel"), t).clicked() {
-                        out = Outcome::Cancel;
-                    }
-                    if modal::primary_button_enabled(ui, crate::tl_id!("ui.insert_equation"), usable, t).clicked() {
-                        out = Outcome::Insert;
-                    }
-                });
-                out
-            },
-        );
+            }
+        },
+        |ui| {
+            let mut out = Outcome::Keep;
+            let insert_label = match mode {
+                OcrMode::MathLatex => crate::tl_id!("ui.insert_equation"),
+                OcrMode::HandwritingText => crate::tl_id!("ui.ocr_insert_text"),
+            };
+            ui.horizontal_wrapped(|ui| {
+                if modal::secondary_button(ui, crate::tl_id!("ui.cancel"), t).clicked() {
+                    out = Outcome::Cancel;
+                }
+                if modal::primary_button_enabled(ui, insert_label, usable, t).clicked() {
+                    out = Outcome::Insert;
+                }
+            });
+            out
+        },
+    );
     let mut outcome = res.inner.1;
     if outcome == Outcome::Keep && res.closed {
         outcome = Outcome::Cancel;
@@ -479,119 +537,7 @@ pub fn show_setup(ctx: &Context, form: &mut Setup, download: Option<DownloadProg
     outcome
 }
 
-fn show_local_model_body(ui: &mut Ui, form: &Setup, download: Option<DownloadProgress>, t: &Tokens, outcome: &mut SetupOutcome) {
-    ui.label(RichText::new(crate::tl_id!("ui.ocr_local_model_desc")).color(t.muted));
-    ui.add_space(8.0);
-    if !local_model::is_supported_on_platform() {
-        ui.label(RichText::new(crate::tl_id!("ui.ocr_local_model_unsupported")).color(t.warn));
-        return;
-    }
-    if let Some(prog) = download {
-        let frac = if prog.total_bytes > 0 { (prog.bytes_downloaded as f32 / prog.total_bytes as f32).clamp(0.0, 1.0) } else { 0.0 };
-        let pct = (frac * 100.0).round().clamp(0.0, 100.0) as u32;
-        let done = format!("{:.1}", prog.bytes_downloaded as f64 / (1024.0 * 1024.0));
-        let total = format!("{:.1}", prog.total_bytes as f64 / (1024.0 * 1024.0));
-        let text = crate::i18n::format_message_id("ui.ocr_model_downloading", &[("done", &done), ("total", &total), ("percent", &pct.to_string())]);
-        ui.label(RichText::new(text).color(t.text));
-        ui.add_space(4.0);
-        progress_bar(ui, frac, t);
-        ui.add_space(8.0);
-        if modal::danger_button(ui, crate::tl_id!("ui.cancel"), t).clicked() {
-            *outcome = SetupOutcome::CancelDownload;
-        }
-    } else if form.model_installed {
-        ui.label(RichText::new(crate::tl_id!("ui.ocr_model_installed")).color(t.ok));
-        ui.add_space(8.0);
-        if modal::danger_button(ui, crate::tl_id!("ui.ocr_model_remove"), t).clicked() {
-            *outcome = SetupOutcome::RemoveModel;
-        }
-    } else {
-        ui.label(RichText::new(crate::tl_id!("ui.ocr_model_not_installed")).color(t.muted));
-        ui.add_space(8.0);
-        if modal::primary_button(ui, crate::tl_id!("ui.ocr_model_download"), t).clicked() {
-            *outcome = SetupOutcome::DownloadModel;
-        }
-    }
-}
+#[path = "math_ocr_setup.rs"]
+mod setup_body;
 
-fn show_cloud_body(ui: &mut Ui, form: &mut Setup, t: &Tokens) {
-    ui.label(RichText::new(crate::tl_id!("ui.recognition_sends_picture")).color(t.muted));
-    ui.add_space(8.0);
-    let w = (ui.available_width() - 108.0).max(120.0);
-    let row = |ui: &mut Ui, lbl: &str, val: &mut String, id: &str, hint: &str, pw: bool| {
-        ui.label(RichText::new(lbl).color(t.text));
-        let mut edit = egui::TextEdit::singleline(val).id(Id::unique(id)).password(pw).desired_width(w);
-        if !hint.is_empty() {
-            edit = edit.hint_text(hint);
-        }
-        ui.add(edit);
-        ui.end_row();
-    };
-    egui::Grid::new(Id::unique("math-ocr-setup-grid")).num_columns(2).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
-        row(ui, crate::tl_id!("ui.service_address"), &mut form.endpoint, "math-ocr-endpoint", form.provider.default_endpoint(), false);
-        if form.provider != OcrProvider::Mathpix {
-            row(ui, crate::tl_id!("ui.model_name"), &mut form.model, "math-ocr-model", form.provider.default_model(), false);
-        } else {
-            row(ui, crate::tl_id!("ui.app_id"), &mut form.app_id, "math-ocr-app-id", "", false);
-        }
-        row(ui, crate::tl_id!("ui.service_key"), &mut form.key, "math-ocr-key", "", true);
-    });
-    ui.add_space(6.0);
-    let kept = form.kept();
-    let (msg, col) = if form.provider == OcrProvider::Mathpix && !kept && form.has_stored_secret() {
-        (crate::tl_id!("ui.ocr_mathpix_incomplete"), t.warn)
-    } else {
-        (if kept { crate::tl_id!("ui.key_is_kept") } else { crate::tl_id!("ui.no_key_kept") }, t.muted)
-    };
-    ui.label(RichText::new(msg).color(col));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mathpix_and_on_device_credentials_and_setup_render() {
-        let mp = OcrProvider::ALL.iter().position(|p| *p == OcrProvider::Mathpix).expect("mathpix");
-        let mut s = Setup { provider: OcrProvider::Mathpix, ..Setup::default() };
-        assert!(!s.kept() && !s.has_stored_secret());
-        s.has_key[mp] = true;
-        assert!(!s.kept() && s.has_stored_secret());
-        (s.has_key[mp], s.has_app_id) = (false, true);
-        assert!(!s.kept() && s.has_stored_secret());
-        s.has_key[mp] = true;
-        assert!(s.kept() && s.has_stored_secret());
-        s.provider = OcrProvider::AppleVision;
-        assert!(s.kept() && !s.has_stored_secret() && !s.can_save(false));
-        s.native_ocr_available = true;
-        assert!(s.can_save(false));
-        s.provider = OcrProvider::LocalModel;
-        assert!(s.kept() && !s.has_stored_secret() && !s.can_save(false));
-        s.model_installed = true;
-        assert!(s.can_save(false) && !s.can_save(true));
-
-        let t = crate::theme::Theme::DEFAULT.tokens();
-        let prog = DownloadProgress {
-            file_index: 0,
-            file_count: 3,
-            file_name: local_model::ENCODER_FILE,
-            bytes_downloaded: 50_000_000,
-            total_bytes: local_model::TOTAL_MODEL_BYTES,
-        };
-        let cases = [
-            (OcrProvider::AppleVision, false, false, None),
-            (OcrProvider::AppleVision, false, true, None),
-            (OcrProvider::LocalModel, false, false, None),
-            (OcrProvider::LocalModel, false, false, Some(prog)),
-            (OcrProvider::LocalModel, true, false, None),
-            (OcrProvider::Mathpix, false, false, None),
-        ];
-        for (provider, model_installed, native_ocr_available, dl) in cases {
-            let mut form = Setup { provider, model_installed, native_ocr_available, error: Some("err".into()), ..Setup::default() };
-            let ctx = Context::default();
-            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(360.0, 560.0))), ..Default::default() };
-            let mut out = ctx.run_ui(input, |ui| assert_eq!(show_setup(ui.ctx(), &mut form, dl, &t), SetupOutcome::Keep));
-            out.textures_delta.clear();
-        }
-    }
-}
+use setup_body::{show_cloud_body, show_local_model_body};

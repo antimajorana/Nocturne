@@ -18,7 +18,7 @@ mod provider;
 pub mod raster;
 pub mod vision_post;
 
-pub use vision_post::{VisionObservation, observations_to_latex};
+pub use vision_post::{VisionObservation, observations_to_latex, observations_to_latex_with_aspect, observations_to_text};
 
 use crate::Session;
 use crate::sync::{SyncHttpClient, is_loopback_http};
@@ -29,10 +29,40 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub const MATH_OCR_ENABLED_KEY: &str = "math_ocr_enabled";
+pub const HANDWRITING_OCR_ENABLED_KEY: &str = "handwriting_ocr_enabled";
 const PROVIDER_KEY: &str = "ocr_provider";
 const ENDPOINT_KEY: &str = "ocr_endpoint";
 const MODEL_KEY: &str = "ocr_model";
 const MATHPIX_APP_ID_SECRET: &str = "ocr_app_id_mathpix";
+
+/// What kind of handwritten content OCR should recognize.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OcrMode {
+    #[default]
+    MathLatex,
+    HandwritingText,
+}
+
+impl OcrMode {
+    /// Stable identifier used in commands and settings (`"math"` or `"handwriting"`).
+    #[must_use]
+    pub fn id(self) -> &'static str {
+        match self {
+            OcrMode::MathLatex => "math",
+            OcrMode::HandwritingText => "handwriting",
+        }
+    }
+
+    /// Parses `"math"` / `"latex"` or `"handwriting"` / `"text"` (case-insensitive).
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "math" | "latex" => Some(OcrMode::MathLatex),
+            "handwriting" | "text" => Some(OcrMode::HandwritingText),
+            _ => None,
+        }
+    }
+}
 
 /// Platform-native on-device OCR backend (for example Apple Vision `VNRecognizeTextRequest` on
 /// iOS/iPadOS/macOS).
@@ -45,6 +75,14 @@ pub trait NativeOcrBackend: Send + Sync {
     /// Runs on-device recognition on PNG image bytes and returns bounding-box observations in
     /// top-left normalized `[0.0, 1.0]` coordinates.
     fn recognize_png(&self, png_bytes: &[u8]) -> Result<Vec<VisionObservation>, OcrError>;
+
+    /// Runs on-device recognition tuned for `mode` (for example disabling language correction for
+    /// `OcrMode::MathLatex` and enabling it for `OcrMode::HandwritingText`).
+    ///
+    /// Defaults to [`Self::recognize_png`] so existing implementations keep compiling.
+    fn recognize_png_with_mode(&self, png_bytes: &[u8], _mode: OcrMode) -> Result<Vec<VisionObservation>, OcrError> {
+        self.recognize_png(png_bytes)
+    }
 }
 
 /// Fallback native OCR backend used when no platform implementation is installed.
@@ -179,6 +217,7 @@ pub(crate) fn key_matches_endpoint(settings: &Settings, provider: OcrProvider, e
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OcrConfig {
     pub enabled: bool,
+    pub handwriting_enabled: bool,
     pub provider: OcrProvider,
     pub endpoint: String,
     pub model: String,
@@ -190,6 +229,7 @@ impl OcrConfig {
         let endpoint = text(ENDPOINT_KEY);
         OcrConfig {
             enabled: text(MATH_OCR_ENABLED_KEY) == "true",
+            handwriting_enabled: text(HANDWRITING_OCR_ENABLED_KEY) == "true",
             provider: OcrProvider::parse(&text(PROVIDER_KEY)).unwrap_or_default(),
             // A settings file that was meddled with cannot point a key at an unsafe address.
             endpoint: if endpoint_is_safe(&endpoint) { endpoint } else { String::new() },
@@ -199,6 +239,7 @@ impl OcrConfig {
 
     pub(crate) fn save(&self, settings: &Settings) -> Result<(), nocturne_store::StoreError> {
         settings.set(MATH_OCR_ENABLED_KEY, if self.enabled { "true" } else { "false" })?;
+        settings.set(HANDWRITING_OCR_ENABLED_KEY, if self.handwriting_enabled { "true" } else { "false" })?;
         settings.set(PROVIDER_KEY, self.provider.id())?;
         settings.set(ENDPOINT_KEY, &self.endpoint)?;
         settings.set(MODEL_KEY, &self.model)
@@ -233,7 +274,7 @@ pub fn endpoint_is_safe(url: &str) -> bool {
     }
 }
 
-/// Why there is no LaTeX. None of these carries a key or the text of a reply.
+/// Why there is no recognition result. None of these carries a key or the text of a reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OcrError {
     /// Recognition is switched off.
@@ -251,13 +292,13 @@ pub enum OcrError {
     RateLimited,
     /// The service declined to answer.
     Refused,
-    /// The answer was cut off before any LaTeX.
+    /// The answer was cut off before any output.
     Truncated,
     /// Another HTTP status.
     Status(u16),
     /// The request did not get there or back.
     Transport(String),
-    /// The reply had no LaTeX in it.
+    /// The reply had no usable text or LaTeX in it.
     BadReply,
 }
 
@@ -286,25 +327,38 @@ impl std::error::Error for OcrError {}
 #[derive(Clone)]
 pub struct OcrJob {
     pub enabled: bool,
+    pub mode: OcrMode,
     pub provider: OcrProvider,
     pub endpoint: String,
     pub model: String,
     pub key: String,
     pub app_id: String,
     pub png: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
     pub native_ocr: Option<Arc<dyn NativeOcrBackend>>,
     pub model_dir: Option<PathBuf>,
+}
+
+impl OcrJob {
+    /// Executes this OCR job on the current thread (typically a worker thread).
+    pub fn execute(&self, http: &dyn SyncHttpClient) -> Result<String, OcrError> {
+        recognize(http, self)
+    }
 }
 
 impl fmt::Debug for OcrJob {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OcrJob")
             .field("enabled", &self.enabled)
+            .field("mode", &self.mode)
             .field("provider", &self.provider)
             .field("endpoint", &self.endpoint)
             .field("model", &self.model)
             .field("has_key", &!self.key.is_empty())
             .field("png_bytes", &self.png.len())
+            .field("width", &self.width)
+            .field("height", &self.height)
             .field("has_native_ocr", &self.native_ocr.is_some())
             .field("has_model_dir", &self.model_dir.is_some())
             .finish()
@@ -325,6 +379,11 @@ impl Session {
     /// Turns equation recognition on or off. False if the settings file could not be written.
     pub fn set_math_ocr_enabled(&mut self, enabled: bool) -> bool {
         self.settings.set(MATH_OCR_ENABLED_KEY, if enabled { "true" } else { "false" }).is_ok()
+    }
+
+    /// Turns general handwriting-to-text recognition on or off. False if the settings file could not be written.
+    pub fn set_handwriting_ocr_enabled(&mut self, enabled: bool) -> bool {
+        self.settings.set(HANDWRITING_OCR_ENABLED_KEY, if enabled { "true" } else { "false" }).is_ok()
     }
 
     /// True if `provider` has a saved API key valid for its effective endpoint.
@@ -361,14 +420,24 @@ impl Session {
         }
     }
 
-    /// True if the chosen service has all it needs: an address, a model, and its key (or on-device readiness).
+    /// True if the chosen service has all it needs for math OCR: an address, a model, and its key (or on-device readiness).
     pub fn math_ocr_ready(&self) -> bool {
-        self.ocr_parts().is_ok()
+        self.ocr_parts_for_mode(OcrMode::MathLatex).is_ok()
     }
 
-    fn ocr_parts(&self) -> Result<(OcrConfig, String, String), OcrError> {
+    /// True if handwriting-to-text recognition is enabled and the chosen service (or native fallback
+    /// when the math-only local model is selected) can handle general handwriting.
+    pub fn handwriting_ocr_ready(&self) -> bool {
+        self.ocr_parts_for_mode(OcrMode::HandwritingText).is_ok()
+    }
+
+    fn ocr_parts_for_mode(&self, mode: OcrMode) -> Result<(OcrConfig, String, String), OcrError> {
         let cfg = self.ocr_config();
-        if !cfg.enabled {
+        let enabled = match mode {
+            OcrMode::MathLatex => cfg.enabled,
+            OcrMode::HandwritingText => cfg.handwriting_enabled,
+        };
+        if !enabled {
             return Err(OcrError::Disabled);
         }
         match cfg.provider {
@@ -379,6 +448,14 @@ impl Session {
                 return Err(OcrError::Unsupported);
             }
             OcrProvider::LocalModel => {
+                if mode == OcrMode::HandwritingText {
+                    // The downloaded local Pix2Text MFR model is math-only; delegate to the
+                    // platform-native recognizer (Apple Vision on iPadOS) when available.
+                    if self.native_ocr_backend().is_some_and(|b| b.is_supported()) {
+                        return Ok((cfg, String::new(), String::new()));
+                    }
+                    return Err(OcrError::Unsupported);
+                }
                 if !local_model::is_supported_on_platform() {
                     return Err(OcrError::Unsupported);
                 }
@@ -413,37 +490,61 @@ impl Session {
         Ok((cfg, key, app_id))
     }
 
-    /// The main-thread half: checks the switch and the settings, and draws the picture.
-    pub fn math_ocr_job(&self, strokes: &[Stroke]) -> Result<OcrJob, OcrError> {
-        let (cfg, key, app_id) = self.ocr_parts()?;
-        let png = raster::png(strokes)?;
+    /// The main-thread half: checks the switch and the settings for `mode`, and draws the picture.
+    pub fn start_ocr_job(&self, strokes: &[Stroke], mode: OcrMode) -> Result<OcrJob, OcrError> {
+        let (cfg, key, app_id) = self.ocr_parts_for_mode(mode)?;
+        let rendered = raster::render_png(strokes)?;
         Ok(OcrJob {
             enabled: true,
+            mode,
             provider: cfg.provider,
             endpoint: cfg.effective_endpoint().to_string(),
             model: cfg.effective_model().to_string(),
             key,
             app_id,
-            png,
+            png: rendered.png,
+            width: rendered.width,
+            height: rendered.height,
             native_ocr: self.native_ocr_backend(),
             model_dir: Some(self.ocr_model_dir()),
         })
     }
+
+    /// Starts an OCR job in [`OcrMode::MathLatex`] mode.
+    pub fn start_math_ocr_job(&self, strokes: &[Stroke]) -> Result<OcrJob, OcrError> {
+        self.start_ocr_job(strokes, OcrMode::MathLatex)
+    }
+
+    /// The main-thread half for equation recognition (delegates to [`Self::start_ocr_job`]).
+    pub fn math_ocr_job(&self, strokes: &[Stroke]) -> Result<OcrJob, OcrError> {
+        self.start_ocr_job(strokes, OcrMode::MathLatex)
+    }
 }
 
-/// The worker half: runs on-device recognition or sends the picture and reads the LaTeX out of the reply.
+fn recognize_native(job: &OcrJob) -> Result<String, OcrError> {
+    let backend = job.native_ocr.as_deref().filter(|b| b.is_supported()).ok_or(OcrError::Unsupported)?;
+    let observations = backend.recognize_png_with_mode(&job.png, job.mode)?;
+    let output = match job.mode {
+        OcrMode::MathLatex => {
+            let aspect = if job.height > 0 { job.width as f32 / job.height as f32 } else { 1.0 };
+            clean_latex(&vision_post::observations_to_latex_with_aspect(&observations, aspect))
+        }
+        OcrMode::HandwritingText => vision_post::observations_to_text(&observations),
+    };
+    if output.is_empty() { Err(OcrError::BadReply) } else { Ok(output) }
+}
+
+/// The worker half: runs on-device recognition or sends the picture and reads the output out of the reply.
 pub fn recognize(http: &dyn SyncHttpClient, job: &OcrJob) -> Result<String, OcrError> {
     if !job.enabled {
         return Err(OcrError::Disabled);
     }
     match job.provider {
-        OcrProvider::AppleVision => {
-            let backend = job.native_ocr.as_deref().filter(|b| b.is_supported()).ok_or(OcrError::Unsupported)?;
-            let observations = backend.recognize_png(&job.png)?;
-            let latex = clean_latex(&vision_post::observations_to_latex(&observations));
-            if latex.is_empty() { Err(OcrError::BadReply) } else { Ok(latex) }
-        }
+        OcrProvider::AppleVision => recognize_native(job),
         OcrProvider::LocalModel => {
+            if job.mode == OcrMode::HandwritingText {
+                return recognize_native(job);
+            }
             if !local_model::is_supported_on_platform() {
                 return Err(OcrError::Unsupported);
             }
@@ -465,7 +566,7 @@ pub fn recognize(http: &dyn SyncHttpClient, job: &OcrJob) -> Result<String, OcrE
             let req = provider::request(job)?;
             let reply = http.request(req).map_err(|e| OcrError::Transport(without_secrets(&e.to_string(), job)))?;
             match reply.status {
-                200..=299 => provider::answer(job.provider, &reply.body),
+                200..=299 => provider::answer(job.provider, job.mode, &reply.body),
                 401 | 403 => Err(OcrError::Auth),
                 429 => Err(OcrError::RateLimited),
                 other => Err(OcrError::Status(other)),
@@ -543,6 +644,10 @@ pub fn base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{EngineError, Output, Params};
+    use nocturne_ink::{Dab, Rgb, Tool};
+    use nocturne_store::testing::TempDir;
+    use serde_json::json;
 
     #[test]
     fn base64_matches_the_rfc_vectors() {
@@ -561,5 +666,91 @@ mod tests {
         for bad in ["", "https://", "https://user@h", "http://example.test", "https://h/ v1", "http://127.0.0.1.evil.test", "file:///etc"] {
             assert!(!endpoint_is_safe(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn ocr_mode_id_and_parse_round_trip() {
+        assert_eq!(OcrMode::default(), OcrMode::MathLatex);
+        assert_eq!(OcrMode::MathLatex.id(), "math");
+        assert_eq!(OcrMode::HandwritingText.id(), "handwriting");
+        assert_eq!(OcrMode::parse("math"), Some(OcrMode::MathLatex));
+        assert_eq!(OcrMode::parse(" LaTeX "), Some(OcrMode::MathLatex));
+        assert_eq!(OcrMode::parse("handwriting"), Some(OcrMode::HandwritingText));
+        assert_eq!(OcrMode::parse("TEXT"), Some(OcrMode::HandwritingText));
+        assert_eq!(OcrMode::parse("diagram"), None);
+    }
+
+    #[test]
+    fn handwriting_ocr_toggle_command_and_config_persistence() {
+        let t = TempDir::new("ocr-handwriting-toggle");
+        let settings_path = t.path().join("settings").join("s.toml");
+        let mut s = Session::new(&t.path().join("notebooks"), Settings::at(settings_path.clone())).expect("session");
+
+        // Starts disabled by default.
+        assert!(!s.ocr_config().handwriting_enabled);
+
+        // Toggle with no params flips to true and persists.
+        let out = s.run("ink.handwriting_ocr_toggle", &Params::new()).expect("toggle on");
+        let Output::Json(val) = out else { panic!("expected json") };
+        assert_eq!(val, json!({ "handwriting_ocr_enabled": true }));
+        assert!(OcrConfig::load(&Settings::at(settings_path.clone())).handwriting_enabled);
+
+        // Explicit false persists.
+        let mut p = Params::new();
+        p.insert("enabled".to_string(), "false".to_string());
+        let out = s.run("ink.handwriting_ocr_toggle", &p).expect("toggle off");
+        let Output::Json(val) = out else { panic!("expected json") };
+        assert_eq!(val, json!({ "handwriting_ocr_enabled": false }));
+        assert!(!OcrConfig::load(&Settings::at(settings_path.clone())).handwriting_enabled);
+
+        // Invalid value is rejected.
+        let mut bad = Params::new();
+        bad.insert("enabled".to_string(), "maybe".to_string());
+        assert!(matches!(s.run("ink.handwriting_ocr_toggle", &bad), Err(EngineError::BadParam(_))));
+
+        // Direct Session setter also persists.
+        assert!(s.set_handwriting_ocr_enabled(true));
+        assert!(OcrConfig::load(&Settings::at(settings_path)).handwriting_enabled);
+    }
+
+    #[test]
+    fn local_model_handwriting_delegates_to_native_backend_or_returns_unsupported() {
+        struct ModeAwareNativeBackend;
+        impl NativeOcrBackend for ModeAwareNativeBackend {
+            fn recognize_png(&self, _png_bytes: &[u8]) -> Result<Vec<VisionObservation>, OcrError> {
+                Ok(vec![VisionObservation::new("fallback", 0.1, 0.1, 0.2, 0.1, 0.99)])
+            }
+
+            fn recognize_png_with_mode(&self, _png_bytes: &[u8], mode: OcrMode) -> Result<Vec<VisionObservation>, OcrError> {
+                match mode {
+                    OcrMode::MathLatex => Ok(vec![VisionObservation::new("x", 0.1, 0.4, 0.1, 0.2, 0.99)]),
+                    OcrMode::HandwritingText => Ok(vec![
+                        VisionObservation::new("Hello", 0.05, 0.10, 0.20, 0.08, 0.99),
+                        VisionObservation::new("notes", 0.30, 0.10, 0.20, 0.08, 0.99),
+                    ]),
+                }
+            }
+        }
+
+        let t = TempDir::new("ocr-local-handwriting-fallback");
+        let mut s = Session::new(&t.path().join("notebooks"), Settings::at(t.path().join("settings").join("s.toml"))).expect("session");
+        let mut stroke = Stroke::new(Tool::Pen, Rgb::BLACK, 2.0);
+        stroke.dabs = vec![Dab::new(10.0, 10.0, 1.0), Dab::new(80.0, 10.0, 1.0)];
+
+        assert!(s.set_handwriting_ocr_enabled(true));
+        let mut cfg_p = Params::new();
+        cfg_p.insert("provider".to_string(), "local_model".to_string());
+        s.run("ink.math_ocr_configure", &cfg_p).expect("configure local_model");
+
+        // Without native backend: LocalModel cannot handle HandwritingText.
+        assert!(matches!(s.start_ocr_job(&[stroke.clone()], OcrMode::HandwritingText), Err(OcrError::Unsupported)));
+
+        // With native backend (e.g. Apple Vision on iPadOS): LocalModel delegates HandwritingText cleanly!
+        s.set_native_ocr_backend(Arc::new(ModeAwareNativeBackend));
+        let job = s.start_ocr_job(&[stroke], OcrMode::HandwritingText).expect("handwriting job via native fallback");
+        assert_eq!(job.mode, OcrMode::HandwritingText);
+        assert!(job.width > 0 && job.height > 0);
+        let text = job.execute(&*s.sync_http()).expect("recognized text");
+        assert_eq!(text, "Hello notes");
     }
 }

@@ -1,6 +1,6 @@
 //! The commands for equation recognition: the switch, the settings, and one conversion.
 
-use super::{MATHPIX_APP_ID_SECRET, OcrConfig, OcrProvider, endpoint_is_safe, key_matches_endpoint, local_model, recognize};
+use super::{MATHPIX_APP_ID_SECRET, OcrConfig, OcrMode, OcrProvider, endpoint_is_safe, key_matches_endpoint, local_model, recognize};
 use crate::commands::{parse_opt_bool, req, switch_param};
 use crate::{EngineError, Output, Params, Session};
 use serde_json::json;
@@ -11,6 +11,14 @@ pub(crate) fn toggle(s: &mut Session, p: &Params) -> Result<Output, EngineError>
         return Err(EngineError::BadParam("the settings file could not be written".into()));
     }
     Ok(Output::Json(json!({ "math_ocr_enabled": enabled })))
+}
+
+pub(crate) fn toggle_handwriting(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
+    let enabled = switch_param(p, "enabled", s.ocr_config().handwriting_enabled)?;
+    if !s.set_handwriting_ocr_enabled(enabled) {
+        return Err(EngineError::BadParam("the settings file could not be written".into()));
+    }
+    Ok(Output::Json(json!({ "handwriting_ocr_enabled": enabled })))
 }
 
 fn status(s: &Session) -> serde_json::Value {
@@ -25,6 +33,7 @@ fn status(s: &Session) -> serde_json::Value {
     };
     json!({
         "math_ocr_enabled": cfg.enabled,
+        "handwriting_ocr_enabled": cfg.handwriting_enabled,
         "supported": supported,
         "provider": cfg.provider.id(),
         "endpoint": cfg.effective_endpoint(),
@@ -32,6 +41,7 @@ fn status(s: &Session) -> serde_json::Value {
         "has_key": s.ocr_has_key(cfg.provider),
         "has_app_id": s.ocr_has_mathpix_app_id(),
         "ready": s.math_ocr_ready(),
+        "handwriting_ready": s.handwriting_ocr_ready(),
         "model_installed": model_installed,
         "native_ocr_available": native_available,
     })
@@ -123,7 +133,8 @@ pub(crate) fn configure(s: &mut Session, p: &Params) -> Result<Output, EngineErr
         }
     }
     if cfg != was {
-        OcrConfig { enabled: s.ocr_config().enabled, ..cfg }.save(&s.settings)?;
+        let current = s.ocr_config();
+        OcrConfig { enabled: current.enabled, handwriting_enabled: current.handwriting_enabled, ..cfg }.save(&s.settings)?;
     }
     Ok(Output::Json(status(s)))
 }
@@ -136,7 +147,16 @@ pub(crate) fn remove_model(s: &mut Session, _p: &Params) -> Result<Output, Engin
 
 pub(crate) fn convert(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
     let bad = |m: String| EngineError::BadParam(m);
-    if !s.ocr_config().enabled {
+    let mode = match p.get("mode").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+        None => OcrMode::MathLatex,
+        Some(raw) => OcrMode::parse(raw).ok_or_else(|| bad("mode must be math or handwriting".into()))?,
+    };
+    let cfg = s.ocr_config();
+    let enabled = match mode {
+        OcrMode::MathLatex => cfg.enabled,
+        OcrMode::HandwritingText => cfg.handwriting_enabled,
+    };
+    if !enabled {
         return Err(bad(super::OcrError::Disabled.to_string()));
     }
     let page = s.resolve(req(p, "path")?)?;
@@ -158,7 +178,10 @@ pub(crate) fn convert(s: &mut Session, p: &Params) -> Result<Output, EngineError
             chosen
         }
     };
-    let job = s.math_ocr_job(&strokes).map_err(|e| bad(e.to_string()))?;
-    let latex = recognize(&*s.sync_http(), &job).map_err(|e| bad(e.to_string()))?;
-    Ok(Output::Json(json!({ "latex": latex })))
+    let job = s.start_ocr_job(&strokes, mode).map_err(|e| bad(e.to_string()))?;
+    let result = recognize(&*s.sync_http(), &job).map_err(|e| bad(e.to_string()))?;
+    match mode {
+        OcrMode::MathLatex => Ok(Output::Json(json!({ "latex": result }))),
+        OcrMode::HandwritingText => Ok(Output::Json(json!({ "text": result }))),
+    }
 }

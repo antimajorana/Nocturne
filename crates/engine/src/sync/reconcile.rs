@@ -184,6 +184,7 @@ fn stage_sync_into_dir(
     // counterpart (up to 50 files per pass) even when `propagate_deletes == false` so deleted
     // pages/sections do not reappear on the next sync.
     let mut planned_remote_deletes: Vec<(String, u64)> = Vec::new();
+    let mut deferred_recycled: BTreeSet<String> = BTreeSet::new();
     let mut planned_local_deletes: Vec<StagedLocalTrash> = Vec::new();
     if config.propagate_deletes && !baseline.is_empty() && (local_files.is_empty() || remote_files.is_empty()) {
         return Err(SyncError::SafetyRefused("refusing to propagate deletions because one side of the sync folder is completely empty".into()));
@@ -200,8 +201,12 @@ fn stage_sync_into_dir(
             }
             (None, Some(r), Some(b)) if r.fingerprint() == b.remote_fingerprint => {
                 let explicitly_recycled = is_recycled_rel_path(rel, recycled_prefixes);
-                if explicitly_recycled && planned_remote_deletes.len() < 50 {
-                    planned_remote_deletes.push((rel.clone(), r.id));
+                if explicitly_recycled {
+                    if planned_remote_deletes.len() < 50 {
+                        planned_remote_deletes.push((rel.clone(), r.id));
+                    } else {
+                        deferred_recycled.insert(rel.clone());
+                    }
                 } else if config.propagate_deletes {
                     unrecycled_deletes += 1;
                     planned_remote_deletes.push((rel.clone(), r.id));
@@ -405,9 +410,17 @@ fn stage_sync_into_dir(
             }
             (None, Some(r), Some(b)) => {
                 // Local was deleted since baseline. Remote modify ALWAYS beats delete; otherwise
-                // honour explicit local recycle-bin deletion or `propagate_deletes`.
+                // honour explicit local recycle-bin deletion (including items deferred past the
+                // 50-item batch cap) or `propagate_deletes`.
                 let planned_trash = planned_remote_deletes.iter().any(|(p, _)| p == &rel);
-                if r.fingerprint() != b.remote_fingerprint || !planned_trash {
+                if r.fingerprint() != b.remote_fingerprint {
+                    stage_counter += 1;
+                    let staged = stage_remote_download(client, drive_id, r, stage_dir, stage_counter, &rel, None, false)?;
+                    downloads.push(staged);
+                } else if deferred_recycled.contains(&rel) {
+                    // Keep the baseline entry in `next_manifest` without downloading so the next
+                    // sync pass trashes the next batch instead of resurrecting deleted files locally.
+                } else if !planned_trash {
                     stage_counter += 1;
                     let staged = stage_remote_download(client, drive_id, r, stage_dir, stage_counter, &rel, None, false)?;
                     downloads.push(staged);
@@ -683,4 +696,208 @@ fn write_staged_to_dest(staged_file: &Path, dest: &Path) -> Result<(), SyncError
         let _ = std::fs::remove_file(&tmp);
         SyncError::Io(format!("replace {}: {e}", dest.display()))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn more_than_50_recycled_files_trash_in_batches_without_resurrection_or_safety_refusal() {
+        use crate::sync::UreqSyncClient;
+        use nocturne_store::testing::TempDir;
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        for propagate_deletes in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            let addr = listener.local_addr().expect("local addr");
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_srv = Arc::clone(&stop);
+            let trashed_ids = Arc::new(Mutex::new(Vec::<u64>::new()));
+            let trashed_srv = Arc::clone(&trashed_ids);
+            let unexpected_calls = Arc::new(Mutex::new(Vec::<String>::new()));
+            let unexpected_srv = Arc::clone(&unexpected_calls);
+
+            let server = thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if stop_srv.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let Ok(mut stream) = stream else { break };
+                    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                    let mut req_line = String::new();
+                    if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+                        continue;
+                    }
+                    loop {
+                        let mut hdr = String::new();
+                        if reader.read_line(&mut hdr).unwrap_or(0) == 0 || hdr == "\r\n" || hdr == "\n" {
+                            break;
+                        }
+                    }
+                    let mut parts = req_line.split_whitespace();
+                    let method = parts.next().unwrap_or("");
+                    let path = parts.next().unwrap_or("");
+                    if method == "DELETE"
+                        && let Some(id) = path.rsplit('/').next().and_then(|seg| seg.parse::<u64>().ok())
+                    {
+                        trashed_srv.lock().expect("lock").push(id);
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+                    } else {
+                        unexpected_srv.lock().expect("lock").push(req_line.trim().to_string());
+                        let _ = stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    }
+                    let _ = stream.flush();
+                }
+            });
+
+            let tmp = TempDir::new(&format!("reconcile-recycled-batch-{propagate_deletes}"));
+            let endpoint = format!("http://{addr}");
+            let http = UreqSyncClient::new();
+            let client = KDriveClient::new(&http, &endpoint, "test-token", None).expect("client");
+
+            let kept_rel = "nb/_node.toml".to_string();
+            let kept_sha = sha256_bytes(b"kind = \"notebook\"\n");
+            let mut local_files = BTreeMap::new();
+            local_files.insert(kept_rel.clone(), LocalEntry { sha256: kept_sha.clone(), size: 18, mtime_secs: 1_700_000_000 });
+
+            let mut remote_files = BTreeMap::new();
+            let mut baseline = BTreeMap::new();
+            let kept_remote = RemoteEntry {
+                id: 1,
+                parent_id: 10,
+                name: "_node.toml".into(),
+                is_dir: false,
+                size: 18,
+                last_modified_at: 1_700_000_000,
+                revised_at: 1_700_000_000,
+                hash: Some("h-kept".into()),
+                etag: None,
+                visibility: None,
+            };
+            baseline.insert(
+                kept_rel.clone(),
+                ManifestEntry {
+                    local_sha256: kept_sha,
+                    local_size: 18,
+                    remote_id: kept_remote.id,
+                    remote_fingerprint: kept_remote.fingerprint(),
+                    synced_unix_secs: 1_700_000_000,
+                },
+            );
+            remote_files.insert(kept_rel.clone(), kept_remote);
+
+            let total_recycled = 62usize;
+            for i in 0..total_recycled {
+                let rel = format!("nb/old-section/page-{i:02}/index.md");
+                let id = 100 + i as u64;
+                let remote = RemoteEntry {
+                    id,
+                    parent_id: 20,
+                    name: "index.md".into(),
+                    is_dir: false,
+                    size: 12,
+                    last_modified_at: 1_700_000_000,
+                    revised_at: 1_700_000_000,
+                    hash: Some(format!("h-{id}")),
+                    etag: None,
+                    visibility: None,
+                };
+                baseline.insert(
+                    rel.clone(),
+                    ManifestEntry {
+                        local_sha256: format!("sha-{id}"),
+                        local_size: 12,
+                        remote_id: id,
+                        remote_fingerprint: remote.fingerprint(),
+                        synced_unix_secs: 1_700_000_000,
+                    },
+                );
+                remote_files.insert(rel, remote);
+            }
+
+            let mut recycled_prefixes = BTreeSet::new();
+            recycled_prefixes.insert("nb/old-section".to_string());
+            let config = SyncConfig { propagate_deletes, ..SyncConfig::default() };
+
+            // Pass 1: trashes the first 50, defers the remaining 12 without downloading or SafetyRefused.
+            let stage_dir_1 = tmp.path().join("stage-1");
+            std::fs::create_dir_all(&stage_dir_1).expect("stage 1");
+            let staged_1 = stage_sync_into_dir(
+                &client,
+                7,
+                None,
+                10,
+                "Nocturne".into(),
+                tmp.path(),
+                &local_files,
+                &recycled_prefixes,
+                &remote_files,
+                BTreeMap::new(),
+                tmp.path().join("manifest.json"),
+                "key".into(),
+                baseline.clone(),
+                &stage_dir_1,
+                1_700_000_100,
+                &config,
+                None,
+            )
+            .expect("pass 1 must succeed without SafetyRefused");
+
+            assert_eq!(staged_1.report.trashed_remote.len(), 50, "propagate_deletes={propagate_deletes}");
+            assert!(staged_1.downloads.is_empty(), "deferred recycled files must not be re-downloaded");
+            assert!(staged_1.report.downloaded.is_empty());
+            assert_eq!(staged_1.manifest_entries.len(), 1 + (total_recycled - 50));
+            for rel in &staged_1.report.trashed_remote {
+                assert!(!staged_1.manifest_entries.contains_key(rel));
+                remote_files.remove(rel);
+            }
+            for (rel, entry) in &baseline {
+                if !staged_1.report.trashed_remote.contains(rel) {
+                    assert_eq!(staged_1.manifest_entries.get(rel), Some(entry), "deferred entry must keep its baseline");
+                }
+            }
+
+            // Pass 2: trashes the remaining 12 deferred files cleanly.
+            let stage_dir_2 = tmp.path().join("stage-2");
+            std::fs::create_dir_all(&stage_dir_2).expect("stage 2");
+            let staged_2 = stage_sync_into_dir(
+                &client,
+                7,
+                None,
+                10,
+                "Nocturne".into(),
+                tmp.path(),
+                &local_files,
+                &recycled_prefixes,
+                &remote_files,
+                BTreeMap::new(),
+                tmp.path().join("manifest.json"),
+                "key".into(),
+                staged_1.manifest_entries.clone(),
+                &stage_dir_2,
+                1_700_000_200,
+                &config,
+                None,
+            )
+            .expect("pass 2 must succeed");
+
+            assert_eq!(staged_2.report.trashed_remote.len(), total_recycled - 50);
+            assert!(staged_2.downloads.is_empty());
+            assert_eq!(staged_2.manifest_entries.len(), 1);
+            assert!(staged_2.manifest_entries.contains_key(&kept_rel));
+
+            stop.store(true, Ordering::Relaxed);
+            let _ = TcpStream::connect(addr);
+            let _ = server.join();
+
+            assert_eq!(trashed_ids.lock().expect("lock").len(), total_recycled);
+            assert!(unexpected_calls.lock().expect("lock").is_empty(), "no downloads should have been requested");
+        }
+    }
 }

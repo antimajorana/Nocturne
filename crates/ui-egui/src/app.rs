@@ -1211,7 +1211,7 @@ pub struct NocturneApp {
     header_pill_rect: Option<egui::Rect>,
     pencil_pill_rect: Option<egui::Rect>,
     math_ocr: Option<crate::math_ocr::Conversion>,
-    pending_math_ocr_start: bool,
+    pending_math_ocr_start: Option<nocturne_engine::OcrMode>,
     ocr_model_download: Option<crate::math_ocr::ModelDownloadWorker>,
     library_grid: crate::library_grid::LibraryGrid,
     /// The sync now running was started by hand, so its result is shown when it ends.
@@ -1419,7 +1419,7 @@ impl NocturneApp {
             header_pill_rect: None,
             pencil_pill_rect: None,
             math_ocr: None,
-            pending_math_ocr_start: false,
+            pending_math_ocr_start: None,
             ocr_model_download: None,
             library_grid,
             sync_by_hand: false,
@@ -1803,7 +1803,7 @@ impl NocturneApp {
             && !self.ribbon_peek
             && !egui::Popup::is_any_open(ctx)
             && !crate::ribbon::any_popup_open(ctx)
-            && self.page_rect.is_some_and(|r| r.contains(at))
+            && self.page_view_rect.or(self.page_rect).is_some_and(|r| r.contains(at))
             && !self.page_scroll_strip.is_some_and(|s| s.contains(at))
             && ctx.layer_id_at(at).is_none_or(|l| l.order < egui::Order::Foreground)
     }
@@ -2193,7 +2193,19 @@ impl NocturneApp {
         }
         self.canvas_pan.x = (self.canvas_pan.x + delta_points.x).clamp(-1.0e6, 1.0e6);
         if self.pointer == ribbon::Pointer::Write {
-            self.pending_external_scroll_y = (self.pending_external_scroll_y + delta_points.y).clamp(-1.0e6, 1.0e6);
+            let mut rem_y = delta_points.y;
+            if self.canvas_pan.y < 0.0 && rem_y > 0.0 {
+                let take = rem_y.min(-self.canvas_pan.y);
+                self.canvas_pan.y += take;
+                rem_y -= take;
+            } else if self.canvas_pan.y > 0.0 && rem_y < 0.0 {
+                let take = (-rem_y).min(self.canvas_pan.y);
+                self.canvas_pan.y -= take;
+                rem_y += take;
+            }
+            if rem_y != 0.0 {
+                self.pending_external_scroll_y = (self.pending_external_scroll_y + rem_y).clamp(-1.0e6, 1.0e6);
+            }
         } else {
             self.canvas_pan.y = (self.canvas_pan.y + delta_points.y).clamp(-1.0e6, 1.0e6);
         }
@@ -2227,7 +2239,7 @@ impl NocturneApp {
         self.fit_page_width = false;
         if new_zoom != old_zoom
             && let Some(pos) = focal_pos.filter(|p| p.is_finite())
-            && let Some(page_rect) = self.page_rect
+            && let Some(page_rect) = self.page_view_rect.or(self.page_rect)
             && page_rect.contains(pos)
         {
             #[allow(clippy::cast_precision_loss)]
@@ -3019,6 +3031,7 @@ impl NocturneApp {
 
     /// Opens a page without counting it as a visit: what Back and Forward do.
     fn open_page_inner(&mut self, dir: &Path) {
+        let switching_page = self.editor.as_ref().is_none_or(|e| e.dir != dir);
         self.page_opened = true;
         self.save_now();
         self.code = crate::codeview::State::default();
@@ -3130,6 +3143,17 @@ impl NocturneApp {
             }
             self.absorb_old_sheets(dir);
             self.sync_ink_reference();
+            if switching_page {
+                self.canvas_pan = egui::Vec2::ZERO;
+                self.pending_scroll_offset_y = Some(0.0);
+                self.pending_external_scroll_y = 0.0;
+                self.pending_fit_bounds = None;
+                self.finger_pan = FingerPanState::Idle;
+                self.finger_handle_drag = None;
+                self.canvas_drag = None;
+                self.typed_while_inking.clear();
+                self.typed_wait = 0;
+            }
             self.selected = Some(dir.to_path_buf());
             self.cursor = 0;
             self.remember_last_page(dir);
@@ -4536,6 +4560,7 @@ impl NocturneApp {
         let ui_language = self.ui_language.clone();
         let languages = crate::i18n::available_languages();
         let layout_mode = self.session.layout_mode();
+        let ocr_cfg = self.session.ocr_config();
         let mut acts = Vec::new();
         egui::CentralPanel::default().show(ui, |ui| {
             let telemetry_root = self.session.settings.path().parent().unwrap_or(std::path::Path::new(".")).join("telemetry");
@@ -4556,6 +4581,8 @@ impl NocturneApp {
                 &languages,
                 self.ui_scale,
                 layout_mode,
+                ocr_cfg.enabled,
+                ocr_cfg.handwriting_enabled,
                 &update,
                 &tokens,
             );
@@ -4598,6 +4625,9 @@ impl NocturneApp {
                 backstage::Act::SetLayoutMode(mode) => {
                     let _ = self.run("ui.layout_mode", &params(&[("mode", mode.id())]));
                     self.last_tablet_studio = self.is_tablet_studio(ui.ctx());
+                    if !self.last_tablet_studio {
+                        self.tool_settings_open = false;
+                    }
                 }
                 backstage::Act::OpenTelemetryFolder(path) => {
                     // The folder is made on first use: it does not exist until a session has
@@ -4626,7 +4656,16 @@ impl NocturneApp {
                     };
                     let _ = self.run("ui.layout_mode", &params(&[("mode", next.id())]));
                     self.last_tablet_studio = self.is_tablet_studio(ui.ctx());
+                    if !self.last_tablet_studio {
+                        self.tool_settings_open = false;
+                    }
                     self.backstage = None;
+                }
+                backstage::Act::ToggleMathOcr => self.ribbon_act(ribbon::Act::ToggleMathOcr),
+                backstage::Act::ToggleHandwritingOcr => self.ribbon_act(ribbon::Act::ToggleHandwritingOcr),
+                backstage::Act::OpenMathOcrSetup => {
+                    self.backstage = None;
+                    self.ribbon_act(ribbon::Act::OpenMathOcrSetup);
                 }
                 backstage::Act::ResetPreferences => self.dialog = Some(Dialog::ResetPreferences),
                 backstage::Act::ExportTelemetry(root) => {
@@ -5342,6 +5381,7 @@ impl NocturneApp {
     fn ribbon_act(&mut self, act: ribbon::Act) {
         match act {
             ribbon::Act::File => self.backstage = Some("Info"),
+            ribbon::Act::Options => self.backstage = Some("Options"),
             ribbon::Act::PageVersions => {
                 self.save_now();
                 if let Some(page) = self.editor.as_ref().map(|e| e.dir.clone()) {
@@ -5522,7 +5562,16 @@ impl NocturneApp {
             ribbon::Act::ToggleMathOcr => {
                 let next = if self.session.ocr_config().enabled { "false" } else { "true" };
                 let _ = self.run("ink.math_ocr_toggle", &params(&[("enabled", next)]));
-                if !self.session.ocr_config().enabled {
+                if !self.session.ocr_config().enabled && self.math_ocr.as_ref().is_some_and(|c| c.mode == nocturne_engine::OcrMode::MathLatex) {
+                    self.math_ocr = None;
+                }
+            }
+            ribbon::Act::ToggleHandwritingOcr => {
+                let next = if self.session.ocr_config().handwriting_enabled { "false" } else { "true" };
+                let _ = self.run("ink.handwriting_ocr_toggle", &params(&[("enabled", next)]));
+                if !self.session.ocr_config().handwriting_enabled
+                    && self.math_ocr.as_ref().is_some_and(|c| c.mode == nocturne_engine::OcrMode::HandwritingText)
+                {
                     self.math_ocr = None;
                 }
             }
@@ -5533,10 +5582,12 @@ impl NocturneApp {
                 let _ = self.run("ui.library_view", &params(&[("view", view.id())]));
             }
             ribbon::Act::DockMathOcr => {
-                if !self.session.ocr_config().enabled {
+                let cfg = self.session.ocr_config();
+                if !cfg.enabled && !cfg.handwriting_enabled {
                     self.tool_settings_open = true;
                 } else if self.held_ink_count() > 0 {
-                    self.pending_math_ocr_start = true;
+                    let mode = if cfg.enabled { nocturne_engine::OcrMode::MathLatex } else { nocturne_engine::OcrMode::HandwritingText };
+                    self.pending_math_ocr_start = Some(mode);
                 } else {
                     self.ribbon_act(ribbon::Act::InkPointer(ribbon::Pointer::Lasso));
                 }
@@ -5572,6 +5623,9 @@ impl NocturneApp {
                 };
                 self.session.set_layout_mode(next);
                 self.last_tablet_studio = matches!(next, nocturne_engine::UiLayoutMode::TabletStudio);
+                if !self.last_tablet_studio {
+                    self.tool_settings_open = false;
+                }
             }
             ribbon::Act::FormatPainter(sticky) => self.pick_up_formatting(sticky),
             ribbon::Act::PageTemplates => {
@@ -6691,7 +6745,7 @@ impl NocturneApp {
         self.editor = None;
         self.pad = None;
         self.math_ocr = None;
-        self.pending_math_ocr_start = false;
+        self.pending_math_ocr_start = None;
         self.page_rect = None;
         self.page_view_rect = None;
         self.header_pill_rect = None;
@@ -9097,7 +9151,7 @@ impl NocturneApp {
     }
 
     fn wheel_canvas_pan_delta(delta: egui::Vec2, modifiers: Modifiers, canvas_pan_enabled: bool) -> egui::Vec2 {
-        if modifiers.ctrl {
+        if modifiers.ctrl || modifiers.command {
             return egui::Vec2::ZERO;
         }
         if modifiers.shift {
@@ -9166,6 +9220,7 @@ impl NocturneApp {
             self.finger_handle_drag = None;
         } else if pointer_origin == crate::stylus::PointerOrigin::Finger {
             let write_handles_active = self.pointer == ribbon::Pointer::Write && !self.show_source && !self.space_tool;
+            let ink_grab_active = matches!(self.pointer, ribbon::Pointer::Lasso | ribbon::Pointer::Pick) && !self.show_source && !self.space_tool;
             let events = ui.input(|i| i.events.clone());
             for event in &events {
                 let egui::Event::Touch { id, phase, pos, force, .. } = event else { continue };
@@ -9175,9 +9230,12 @@ impl NocturneApp {
                 match phase {
                     egui::TouchPhase::Start => {
                         if self.canvas_pointer_unoccluded(ui.ctx(), *pos) {
-                            if write_handles_active
-                                && (crate::containers::active_touch_handle_at(ui.ctx(), *pos) || crate::inkpad::held_handle_at(ui.ctx(), *pos))
-                            {
+                            let hits_write_handle = write_handles_active
+                                && (crate::containers::active_touch_handle_at(ui.ctx(), *pos) || crate::inkpad::held_handle_at(ui.ctx(), *pos));
+                            let hits_ink_grab = ink_grab_active
+                                && (crate::inkpad::held_handle_at(ui.ctx(), *pos)
+                                    || crate::inkpad::held_area(ui.ctx()).is_some_and(|r| r.contains(*pos)));
+                            if hits_write_handle || hits_ink_grab {
                                 self.finger_handle_drag = Some(*id);
                                 self.finger_pan = FingerPanState::Idle;
                             } else if self.finger_handle_drag.is_none() {
@@ -9254,7 +9312,8 @@ impl NocturneApp {
         if finger_pan_delta.x != 0.0 && finger_pan_delta.x.is_finite() {
             self.canvas_pan.x = (self.canvas_pan.x + finger_pan_delta.x).clamp(-1.0e6, 1.0e6);
         }
-        let held_ink_touch_drag = self.pointer == ribbon::Pointer::Write && (self.finger_handle_drag.is_some() || finger_handle_ended);
+        let held_ink_touch_drag = matches!(self.pointer, ribbon::Pointer::Write | ribbon::Pointer::Lasso | ribbon::Pointer::Pick)
+            && (self.finger_handle_drag.is_some() || finger_handle_ended);
         let allow_stroke =
             !multi_touch_active && (!(pointer_origin == crate::stylus::PointerOrigin::Finger && !finger_drawing) || held_ink_touch_drag);
         let cancel_uncommitted = multi_touch_active;
@@ -9266,7 +9325,7 @@ impl NocturneApp {
                 || matches!(self.finger_pan, FingerPanState::Pending { .. } | FingerPanState::Scrolling { .. })
                 || (pointer_origin == crate::stylus::PointerOrigin::Finger && (self.stylus.finger_ended_this_frame() || was_scrolling)));
 
-        let page_input_rect = self.page_rect;
+        let page_input_rect = self.page_view_rect.or(self.page_rect);
         let wheel_canvas_pan_enabled = self.pointer != ribbon::Pointer::Write;
         if self.editor.is_some() && !self.show_source {
             // Draw > Panning Hand: the main button drags the page as the middle one always does
@@ -9279,8 +9338,13 @@ impl NocturneApp {
                 let pointer = page_input_rect.and_then(|rect| i.pointer.interact_pos().filter(|p| rect.contains(*p)));
                 let wheel = if page_input_rect.is_some_and(|rect| i.pointer.hover_pos().is_some_and(|p| rect.contains(p))) {
                     i.events.iter().fold(egui::Vec2::ZERO, |sum, event| match event {
-                        egui::Event::MouseWheel { delta, modifiers, .. } => {
-                            sum + Self::wheel_canvas_pan_delta(*delta, *modifiers, wheel_canvas_pan_enabled)
+                        egui::Event::MouseWheel { unit, delta, modifiers, .. } => {
+                            let scaled = match unit {
+                                egui::MouseWheelUnit::Point => *delta,
+                                egui::MouseWheelUnit::Line => *delta * 24.0,
+                                egui::MouseWheelUnit::Page => *delta * 240.0,
+                            };
+                            sum + Self::wheel_canvas_pan_delta(scaled, *modifiers, wheel_canvas_pan_enabled)
                         }
                         _ => sum,
                     })
@@ -9292,7 +9356,7 @@ impl NocturneApp {
                 let down = i.pointer.button_down(egui::PointerButton::Middle) || (hand && i.pointer.primary_down());
                 (pointer, pressed, down, wheel)
             });
-            if wheel_canvas_pan_enabled {
+            if wheel != egui::Vec2::ZERO {
                 self.canvas_pan += wheel;
                 self.canvas_pan.x = self.canvas_pan.x.clamp(-1.0e6, 1.0e6);
                 self.canvas_pan.y = self.canvas_pan.y.clamp(-1.0e6, 1.0e6);
@@ -9310,19 +9374,33 @@ impl NocturneApp {
         } else {
             self.canvas_drag = None;
         }
-        let wheel_zoom = ui.input(|i| {
+        let (wheel_zoom, wheel_focal) = ui.input(|i| {
             if i.multi_touch().is_some() {
-                return 1.0;
+                return (1.0, None);
             }
-            page_input_rect.and_then(|rect| i.pointer.hover_pos().filter(|p| rect.contains(*p))).map_or(1.0, |_| i.zoom_delta())
+            match page_input_rect.and_then(|rect| i.pointer.hover_pos().filter(|p| rect.contains(*p))) {
+                Some(pos) => (i.zoom_delta(), Some(pos)),
+                None => (1.0, None),
+            }
         });
-        if wheel_zoom.is_finite() && (wheel_zoom - 1.0).abs() > 0.001 {
-            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let percent = (self.zoom_percent as f32 * wheel_zoom)
-                .round()
-                .clamp(crate::touch_ux::MIN_ZOOM_PERCENT as f32, crate::touch_ux::MAX_ZOOM_PERCENT as f32) as u32;
-            self.set_zoom_percent(percent);
-            self.fit_page_width = false;
+        if wheel_zoom.is_finite() && (wheel_zoom - 1.0).abs() > 0.0005 {
+            self.apply_external_pinch_zoom(wheel_zoom, wheel_focal);
+        }
+        // On a touch screen two fingers scroll, pan sideways, and pinch-zoom the page,
+        // suppressed while a stylus contact is active for palm rejection. Applied before
+        // `ScrollArea` and `page()` render so zoom, pan, and focal-point anchoring take
+        // effect on the same frame without lag or missed repaints.
+        if !stylus_active
+            && !self.external_gesture_blocked()
+            && let Some(touch) = ui.input(|i| i.multi_touch())
+        {
+            let (pan, zoom_scale_delta) = crate::touch_ux::sanitize_multitouch_canvas_delta(touch.translation_delta, touch.zoom_delta);
+            if pan != egui::Vec2::ZERO {
+                self.apply_external_pan(pan);
+            }
+            if let Some(scale) = zoom_scale_delta {
+                self.apply_external_pinch_zoom(scale, Some(touch.center_pos));
+            }
         }
         if self.fit_page_width {
             let width = ui.available_width();
@@ -9368,7 +9446,8 @@ impl NocturneApp {
         let mut follow: Option<String> = None;
         // The drawing on this page is lent to the block that holds it, and written back
         // once the page's borrow is over.
-        let (pen, pressure) = (self.pen(), self.stylus.sample().pressure);
+        let pen = self.pen();
+        let pressure = if pointer_origin == crate::stylus::PointerOrigin::Mouse { 1.0 } else { self.stylus.sample().pressure };
         let mut pad = self.pad.take();
         let mut ink_changed = false;
         let mut page_rect = None;
@@ -9384,6 +9463,7 @@ impl NocturneApp {
         let show_minimap = self.minimap_visible(ui.ctx());
         if !tablet_studio {
             self.pencil_pill_rect = None;
+            self.tool_settings_open = false;
         }
         let hide_canvas_chrome = self.dialog.is_some()
             || math_preview_open
@@ -9394,9 +9474,8 @@ impl NocturneApp {
             || !self.search.trim().is_empty()
             || crate::ribbon::any_popup_open_this_pass(ui.ctx());
         let canvas_overlay_open = hide_canvas_chrome || self.tool_settings_open || crate::ribbon::any_popup_open(ui.ctx());
-        let mut multitouch_step: Option<crate::touch_ux::MultiTouchStep> = None;
         let mut pill_acts: Vec<ribbon::Act> = Vec::new();
-        let mut start_ocr = false;
+        let mut start_ocr: Option<nocturne_engine::OcrMode> = None;
         let mut minimap_out = crate::minimap::MinimapOut::default();
         {
             let Some(ed) = self.editor.as_mut() else { return };
@@ -9713,7 +9792,7 @@ impl NocturneApp {
                                 }
                                 // A press anywhere else on the page lets go of the ink, unless it
                                 // went on something still selected.
-                                let on_held = pressed.is_some_and(|p| crate::inkpad::held_area(ui.ctx()).is_some_and(|r| r.contains(p)));
+                                let on_held = pressed.is_some_and(|p| crate::inkpad::held_handle_at(ui.ctx(), p));
                                 let ctrl_press = ui.input(|i| {
                                     i.events.iter().any(|e| {
                                         matches!(e, egui::Event::PointerButton { pressed: true, modifiers, .. } if modifiers.command || modifiers.ctrl)
@@ -9826,6 +9905,7 @@ impl NocturneApp {
             } else {
                 let scroll = egui::containers::scroll_area::ScrollSource {
                     drag: egui::containers::scroll_area::DragScroll::Never,
+                    mouse_wheel: !wheel_canvas_pan_enabled,
                     ..egui::containers::scroll_area::ScrollSource::default()
                 };
                 let page_outer = ui.available_rect_before_wrap();
@@ -9840,13 +9920,6 @@ impl NocturneApp {
                 let shown = scroll_area.show(ui, |ui| {
                     if total_scroll_y != 0.0 && total_scroll_y.is_finite() {
                         ui.scroll_with_delta_animation(vec2(0.0, total_scroll_y), egui::style::ScrollAnimation::none());
-                    }
-                    // On a touch screen two fingers scroll, pan sideways, and pinch-zoom the page,
-                    // suppressed while a stylus contact is active for palm rejection.
-                    if !stylus_active && let Some(touch) = ui.input(|i| i.multi_touch()) {
-                        let step = crate::touch_ux::compute_multitouch_canvas_step(touch.translation_delta, touch.zoom_delta, current_zoom_pct);
-                        ui.scroll_with_delta_animation(vec2(0.0, step.scroll_y), egui::style::ScrollAnimation::none());
-                        multitouch_step = Some(step);
                     }
                     page(
                         ui,
@@ -9946,11 +10019,13 @@ impl NocturneApp {
                         };
                         if self.tool_settings_open && self.dialog.is_none() {
                             let options = self.session.ink_options();
+                            let ocr_cfg = self.session.ocr_config();
                             let input = crate::tool_settings::ToolSettingsIn {
                                 finger_drawing: self.session.finger_drawing(),
                                 hold_to_straighten: options.hold_to_straighten,
                                 eraser_pixel: options.eraser_kind == nocturne_engine::EraserKind::Pixel,
-                                math_ocr_enabled: self.session.ocr_config().enabled,
+                                math_ocr_enabled: ocr_cfg.enabled,
+                                handwriting_ocr_enabled: ocr_cfg.handwriting_enabled,
                                 library_view: studio.library_view,
                                 studio,
                                 rack: &self.rack,
@@ -9966,14 +10041,16 @@ impl NocturneApp {
                             }
                         }
                     }
-                    if self.session.ocr_config().enabled
+                    let ocr_cfg = self.session.ocr_config();
+                    if (ocr_cfg.enabled || ocr_cfg.handwriting_enabled)
                         && self.math_ocr.is_none()
                         && self.dialog.is_none()
                         && !self.tool_settings_open
                         && pad.as_ref().is_some_and(|p| p.holding() > 0)
                         && let Some(held_rect) = crate::inkpad::held_area(ui.ctx()).filter(|r| r.width() > 0.0 && r.height() > 0.0)
                     {
-                        start_ocr = crate::math_ocr::convert_button(ui.ctx(), held_rect, view, &tokens);
+                        start_ocr =
+                            crate::math_ocr::convert_buttons(ui.ctx(), held_rect, view, ocr_cfg.enabled, ocr_cfg.handwriting_enabled, &tokens);
                     }
                     if show_minimap {
                         let stroke_bounds = pad.as_ref().map(crate::inkpad::Pad::stroke_bounds).unwrap_or_default();
@@ -10038,13 +10115,6 @@ impl NocturneApp {
                 let path = path_str(&ed.dir);
                 let line = nocturne_model::justify::write(&ed.justified);
                 save_justified = Some((path, line));
-            }
-        }
-        if let Some(step) = multitouch_step {
-            self.canvas_pan.x = (self.canvas_pan.x + step.pan_x).clamp(-1.0e6, 1.0e6);
-            if let Some(zoom) = step.new_zoom {
-                self.set_zoom_percent(zoom);
-                self.fit_page_width = false;
             }
         }
         self.cursor = cursor;
@@ -10127,8 +10197,8 @@ impl NocturneApp {
         for act in pill_acts {
             self.ribbon_act(act);
         }
-        if start_ocr || std::mem::take(&mut self.pending_math_ocr_start) {
-            self.start_math_ocr(ui.ctx());
+        if let Some(mode) = start_ocr.or_else(|| self.pending_math_ocr_start.take()) {
+            self.start_math_ocr(ui.ctx(), mode);
         }
         if minimap_out.toggle_collapsed {
             self.minimap_collapsed = !self.minimap_collapsed;
@@ -11669,15 +11739,20 @@ impl NocturneApp {
         }
     }
 
-    fn start_math_ocr(&mut self, ctx: &Context) {
+    fn start_math_ocr(&mut self, ctx: &Context, mode: nocturne_engine::OcrMode) {
         let (Some(ed), Some(pad)) = (self.editor.as_ref(), self.pad.as_ref()) else { return };
         let strokes = pad.held_strokes();
         let Some(bounds) = pad.held_bounds() else { return };
-        match self.session.math_ocr_job(&strokes) {
+        match self.session.start_ocr_job(&strokes, mode) {
             Ok(job) => match crate::math_ocr::OcrRun::start(ctx.clone(), self.session.sync_http(), job) {
                 Ok(run) => {
-                    self.math_ocr =
-                        Some(crate::math_ocr::Conversion { page: ed.dir.clone(), strokes, bounds, stage: crate::math_ocr::Stage::Waiting(run) });
+                    self.math_ocr = Some(crate::math_ocr::Conversion {
+                        page: ed.dir.clone(),
+                        strokes,
+                        bounds,
+                        mode,
+                        stage: crate::math_ocr::Stage::Waiting(run),
+                    });
                 }
                 Err(err) => self.complain(&err),
             },
@@ -11726,10 +11801,32 @@ impl NocturneApp {
 
     fn confirm_math_ocr(&mut self, conv: crate::math_ocr::Conversion) {
         let crate::math_ocr::Stage::Preview { tex, .. } = conv.stage else { return };
-        let clean_tex = tex.split_whitespace().collect::<Vec<_>>().join(" ");
-        if clean_tex.is_empty() {
-            return;
-        }
+        let new_blocks: Vec<nocturne_formats::markdown::Block> = match conv.mode {
+            nocturne_engine::OcrMode::MathLatex => {
+                let clean_tex = tex.split_whitespace().collect::<Vec<_>>().join(" ");
+                if clean_tex.is_empty() {
+                    return;
+                }
+                vec![nocturne_formats::markdown::Block::MathBlock(clean_tex)]
+            }
+            nocturne_engine::OcrMode::HandwritingText => {
+                let lines: Vec<nocturne_formats::markdown::Block> = tex
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(|line| {
+                        nocturne_formats::markdown::Block::Paragraph(vec![nocturne_formats::markdown::Span {
+                            text: line.to_string(),
+                            ..nocturne_formats::markdown::Span::default()
+                        }])
+                    })
+                    .collect();
+                if lines.is_empty() {
+                    return;
+                }
+                lines
+            }
+        };
         if !self.editor.as_ref().is_some_and(|ed| ed.writable && ed.dir == conv.page) {
             return;
         }
@@ -11767,8 +11864,9 @@ impl NocturneApp {
             let x = (x0 - 6.0).max(0.0).round();
             let y = (y0 - 14.0).max(0.0).round();
             let box_width = ((x1 - x0) + 24.0).clamp(nocturne_model::container::MIN_WIDTH, 360.0).round();
-            ed.blocks.push(nocturne_formats::markdown::Block::MathBlock(clean_tex));
-            ed.boxes.push(nocturne_model::container::Container::new(x, y, box_width, 1));
+            let added = new_blocks.len();
+            ed.blocks.extend(new_blocks);
+            ed.boxes.push(nocturne_model::container::Container::new(x, y, box_width, added));
             ed.arranged = true;
             if ed.caret.as_ref().is_some_and(|c| c.block >= ed.blocks.len()) {
                 ed.caret = None;
@@ -11781,7 +11879,11 @@ impl NocturneApp {
         self.save_now();
         self.undone.clear();
         self.library_grid.invalidate_page(&conv.page);
-        self.say(crate::tl_id!("ui.equation_inserted"));
+        let msg = match conv.mode {
+            nocturne_engine::OcrMode::MathLatex => crate::tl_id!("ui.equation_inserted"),
+            nocturne_engine::OcrMode::HandwritingText => crate::tl_id!("ui.ocr_insert_text"),
+        };
+        self.say(msg);
     }
 
     // ---------- control channel ----------
@@ -12312,8 +12414,8 @@ impl NocturneApp {
         self.poll_import(ctx);
         self.poll_sync(ctx);
         self.poll_ocr_model_download();
-        if std::mem::take(&mut self.pending_math_ocr_start) {
-            self.start_math_ocr(ctx);
+        if let Some(mode) = self.pending_math_ocr_start.take() {
+            self.start_math_ocr(ctx, mode);
         }
         self.poll_math_ocr();
         if !self.event_frames.is_empty() {

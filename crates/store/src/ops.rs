@@ -233,14 +233,21 @@ pub fn move_node(path: &Path, dest: &Path) -> Result<PathBuf> {
     if fs::rename(&path, &target).is_err() {
         // Another drive, for a notebook opened from elsewhere: copied over, then the old one
         // taken away once the copy is whole.
-        copy_tree(&path, &target).map_err(|e| StoreError::io("copy", &target, e))?;
-        remove_tree(&path).map_err(|e| StoreError::io("delete", &path, e))?;
+        copy_and_remove_tree(&path, &target)?;
     }
     set_node_order(&target, order)?;
     if let Some(from) = from {
         compact_orders(&from)?;
     }
     Ok(target)
+}
+
+fn copy_and_remove_tree(from: &Path, to: &Path) -> Result<()> {
+    if let Err(err) = copy_tree(from, to) {
+        let _ = remove_tree(to);
+        return Err(StoreError::io("copy", to, err));
+    }
+    remove_tree(from).map_err(|e| StoreError::io("delete", from, e))
 }
 
 /// Copies a page (with its subpages, files and ink), a section or a section group into another
@@ -405,10 +412,7 @@ fn create_node_inner(
     if !parent_info.kind.may_contain().contains(&kind) {
         return Err(StoreError::invalid(format!("a {} cannot contain a {}", parent_info.kind.label().to_lowercase(), kind.label().to_lowercase())));
     }
-    let order = match want_order {
-        Some(o) => o,
-        None => u32::try_from(child_dirs(parent).len()).unwrap_or(0).saturating_mul(10).saturating_add(10),
-    };
+    let order = want_order.unwrap_or_else(|| next_order(parent));
     let dir = unique_child(parent, &names::slug(slug_title));
     let (now, id) = (iso_now(), new_id());
     fs::create_dir(&dir).map_err(|e| StoreError::io("create", &dir, e))?;
@@ -992,5 +996,55 @@ mod tests {
         set_node_format(&nb, None).expect("clear format");
         assert_eq!(tree::read_node(&nb).and_then(|n| n.format), None);
         assert!(set_node_format(&md_page, Some(PageFormat::Html)).is_err());
+    }
+
+    #[test]
+    fn creating_a_node_after_deleting_an_earlier_sibling_does_not_collide_orders() {
+        let t = TempDir::new("ops-order-after-delete");
+        let s = settings(&t);
+        let r = root(&t);
+        let nb = create_notebook(&r, "NB", None, &s).expect("nb");
+        let first = create_node(&nb, "First", NodeKind::Page, None, &s).expect("first");
+        let _second = create_node(&nb, "Second", NodeKind::Page, None, &s).expect("second");
+        let last = create_node(&nb, "ZZ Last", NodeKind::Page, None, &s).expect("last");
+        assert_eq!(read_node(&last).map(|n| n.order), Some(30));
+
+        delete_node(&r, &first).expect("delete first");
+        let added = create_node(&nb, "AA Added", NodeKind::Page, None, &s).expect("added");
+        assert_eq!(read_node(&added).map(|n| n.order), Some(40));
+        assert_eq!(child_dirs(&nb).last(), Some(&added), "newly added page stays last instead of colliding at order 30");
+    }
+
+    #[test]
+    fn failed_copy_during_move_cleans_up_partial_target() {
+        let t = TempDir::new("ops-move-partial-cleanup");
+        let src = t.path().join("src");
+        fs::create_dir_all(&src).expect("src");
+        fs::write(src.join("a-copied-first.txt"), b"hello").expect("file a");
+
+        // Error when destination parent does not exist leaves source intact.
+        let bad_dst = t.path().join("missing-parent").join("dst");
+        assert!(copy_and_remove_tree(&src, &bad_dst).is_err());
+        assert!(!bad_dst.exists());
+        assert!(src.join("a-copied-first.txt").is_file());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dst = t.path().join("dst");
+            let blocked = src.join("z-unreadable.txt");
+            fs::write(&blocked, b"secret").expect("file z");
+            fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+            let unreadable = fs::read(&blocked).is_err();
+            if unreadable {
+                let res = copy_and_remove_tree(&src, &dst);
+                fs::set_permissions(&blocked, fs::Permissions::from_mode(0o644)).expect("restore perms");
+                assert!(res.is_err(), "copying an unreadable file must fail");
+                assert!(!dst.exists(), "partial destination tree must be removed on copy failure");
+                assert!(src.join("a-copied-first.txt").is_file(), "source tree must remain untouched");
+            } else {
+                fs::set_permissions(&blocked, fs::Permissions::from_mode(0o644)).expect("restore perms");
+            }
+        }
     }
 }

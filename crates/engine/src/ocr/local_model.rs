@@ -219,6 +219,8 @@ pub fn download_model_from_specs(
             }
             installed.push(dst);
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        inference::invalidate_cache(dir);
         Ok(())
     })();
 
@@ -228,6 +230,8 @@ pub fn download_model_from_specs(
 
 /// Removes the downloaded model files and any `.staging/` folder from `dir`.
 pub fn remove_model(dir: &Path) -> Result<(), SyncError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    inference::invalidate_cache(dir);
     let staging = dir.join(".staging");
     if staging.exists() {
         std::fs::remove_dir_all(&staging).map_err(|e| SyncError::Io(format!("remove {}: {e}", staging.display())))?;
@@ -244,15 +248,58 @@ pub fn remove_model(dir: &Path) -> Result<(), SyncError> {
     Ok(())
 }
 
+/// Active content box inside the `384x384` ViT canvas so equations retain a clean white margin
+/// and keep their true aspect ratio via letterboxing instead of non-uniform squashing.
+const LETTERBOX_INNER: u32 = 368;
+
+/// Minimum consecutive identical n-gram occurrences that trigger the decoding repetition guard.
+const REPEAT_GUARD_RUNS: usize = 4;
+/// Maximum n-gram length checked for degenerate greedy-decoding loops (`k` in `1..=6`).
+const REPEAT_GUARD_MAX_K: usize = 6;
+
+/// Detects whether `tokens` ends with 4 consecutive identical repetitions of any pattern of
+/// length `k` in `1..=6`. If detected, trims the redundant trailing copies (leaving one copy)
+/// and returns `true`.
+pub(crate) fn trim_repetition_loop(tokens: &mut Vec<u32>) -> bool {
+    for k in 1..=REPEAT_GUARD_MAX_K {
+        let window = k * REPEAT_GUARD_RUNS;
+        if tokens.len() < window {
+            continue;
+        }
+        let base = tokens.len() - window;
+        let pattern = &tokens[base..base + k];
+        let repeated = (1..REPEAT_GUARD_RUNS).all(|r| &tokens[base + r * k..base + (r + 1) * k] == pattern);
+        if repeated {
+            tokens.truncate(base + k);
+            return true;
+        }
+    }
+    false
+}
+
 /// Preprocesses a PNG image into a normalized CHW `[1, 3, 384, 384]` `f32` buffer:
-/// decoded to RGB, resized to `384x384` (Catmull-Rom / bicubic), and normalized via `(v / 255.0 - 0.5) / 0.5`.
+/// decoded to RGB, aspect-ratio-preserved inside a centered `368x368` box on a white (`255`)
+/// `384x384` canvas (Catmull-Rom / bicubic), and normalized via `(v / 255.0 - 0.5) / 0.5`.
 pub fn preprocess_png(png_bytes: &[u8]) -> Result<Vec<f32>, OcrError> {
     let img = image::load_from_memory(png_bytes).map_err(|_| OcrError::Picture)?;
     let rgb = img.to_rgb8();
-    let resized = image::imageops::resize(&rgb, IMG_SIZE, IMG_SIZE, image::imageops::FilterType::CatmullRom);
+    let (src_w, src_h) = rgb.dimensions();
+    if src_w == 0 || src_h == 0 {
+        return Err(OcrError::Picture);
+    }
+    let scale = (f64::from(LETTERBOX_INNER) / f64::from(src_w)).min(f64::from(LETTERBOX_INNER) / f64::from(src_h));
+    let dst_w = ((f64::from(src_w) * scale).round() as u32).clamp(1, LETTERBOX_INNER);
+    let dst_h = ((f64::from(src_h) * scale).round() as u32).clamp(1, LETTERBOX_INNER);
+    let resized = image::imageops::resize(&rgb, dst_w, dst_h, image::imageops::FilterType::CatmullRom);
+
+    let mut canvas = image::RgbImage::from_pixel(IMG_SIZE, IMG_SIZE, image::Rgb([255, 255, 255]));
+    let offset_x = i64::from((IMG_SIZE - dst_w) / 2);
+    let offset_y = i64::from((IMG_SIZE - dst_h) / 2);
+    image::imageops::overlay(&mut canvas, &resized, offset_x, offset_y);
+
     let plane = (IMG_SIZE as usize) * (IMG_SIZE as usize);
     let mut out = vec![0.0f32; 3 * plane];
-    for (idx, pixel) in resized.pixels().enumerate() {
+    for (idx, pixel) in canvas.pixels().enumerate() {
         let [r, g, b] = pixel.0;
         out[idx] = (f32::from(r) / 255.0 - 0.5) / 0.5;
         out[plane + idx] = (f32::from(g) / 255.0 - 0.5) / 0.5;
@@ -372,31 +419,63 @@ pub fn recognize_png(model_dir: &Path, png_bytes: &[u8]) -> Result<String, OcrEr
 mod inference {
     use super::{
         BpeTokenizer, DECODER_FILE, ENCODER_FILE, EOS_TOKEN_ID, IMG_SIZE, MAX_DECODE_TOKENS, START_TOKEN_ID, TOKENIZER_FILE, preprocess_png,
+        trim_repetition_loop,
     };
     use crate::ocr::OcrError;
-    use std::path::Path;
-    use std::sync::Arc;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, OnceLock};
     use tract_onnx::prelude::*;
 
-    pub(super) fn run_inference(model_dir: &Path, png_bytes: &[u8]) -> Result<String, OcrError> {
+    struct CachedModel {
+        tokenizer: BpeTokenizer,
+        encoder: Arc<TypedRunnableModel>,
+        decoder: Arc<TypedRunnableModel>,
+        input_count: usize,
+        input_ids_slot: usize,
+        enc_hidden_slot: usize,
+        enc_mask_slot: Option<usize>,
+        dec_mask_slot: Option<usize>,
+        enc_seq: usize,
+    }
+
+    static MODEL_CACHE: OnceLock<Mutex<Option<(PathBuf, Arc<CachedModel>)>>> = OnceLock::new();
+
+    fn cache_lock() -> std::sync::MutexGuard<'static, Option<(PathBuf, Arc<CachedModel>)>> {
+        let mutex = MODEL_CACHE.get_or_init(|| Mutex::new(None));
+        match mutex.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    pub(super) fn invalidate_cache(dir: &Path) {
+        let mut guard = cache_lock();
+        if guard.as_ref().is_some_and(|(cached_dir, _)| cached_dir == dir) {
+            *guard = None;
+        }
+    }
+
+    fn load_model(model_dir: &Path) -> Result<CachedModel, OcrError> {
         let tokenizer_bytes = std::fs::read(model_dir.join(TOKENIZER_FILE)).map_err(|_| OcrError::NotConfigured("the local math model"))?;
         let tokenizer = BpeTokenizer::from_json_bytes(&tokenizer_bytes).map_err(|_| OcrError::BadReply)?;
-
-        let pixel_data = preprocess_png(png_bytes)?;
-        let pixel_tensor: Tensor =
-            tract_ndarray::Array4::from_shape_vec((1, 3, IMG_SIZE as usize, IMG_SIZE as usize), pixel_data).map_err(|_| OcrError::Picture)?.into();
 
         let mut encoder_proto =
             tract_onnx::onnx().model_for_path(model_dir.join(ENCODER_FILE)).map_err(|e| OcrError::Transport(format!("load encoder ONNX: {e}")))?;
         encoder_proto
             .set_input_fact(0, InferenceFact::dt_shape(f32::datum_type(), tvec![1, 3, IMG_SIZE as usize, IMG_SIZE as usize]))
             .map_err(|e| OcrError::Transport(format!("configure encoder input: {e}")))?;
-        let encoder =
-            encoder_proto.into_optimized().and_then(|m| m.into_runnable()).map_err(|e| OcrError::Transport(format!("optimize encoder ONNX: {e}")))?;
+        let encoder_typed = encoder_proto.into_optimized().map_err(|e| OcrError::Transport(format!("optimize encoder ONNX: {e}")))?;
+        let concrete_enc_shape = encoder_typed.output_fact(0).ok().and_then(|fact| fact.shape.as_concrete().map(<[usize]>::to_vec));
+        let encoder = encoder_typed.into_runnable().map_err(|e| OcrError::Transport(format!("compile encoder ONNX: {e}")))?;
 
-        let encoder_outputs = encoder.run(tvec!(pixel_tensor.into())).map_err(|e| OcrError::Transport(format!("run encoder ONNX: {e}")))?;
-        let encoder_hidden = encoder_outputs.first().ok_or(OcrError::BadReply)?.clone().into_tensor();
-        let enc_shape = encoder_hidden.shape().to_vec();
+        let enc_shape = match concrete_enc_shape {
+            Some(shape) if !shape.is_empty() => shape,
+            _ => {
+                let probe = tract_ndarray::Array4::<f32>::zeros((1, 3, IMG_SIZE as usize, IMG_SIZE as usize)).into_tensor();
+                let outputs = encoder.run(tvec!(probe.into())).map_err(|e| OcrError::Transport(format!("probe encoder ONNX: {e}")))?;
+                outputs.first().ok_or(OcrError::BadReply)?.shape().to_vec()
+            }
+        };
 
         let mut decoder_proto =
             tract_onnx::onnx().model_for_path(model_dir.join(DECODER_FILE)).map_err(|e| OcrError::Transport(format!("load decoder ONNX: {e}")))?;
@@ -410,21 +489,24 @@ mod inference {
         let mut input_ids_slot: Option<usize> = None;
         let mut enc_hidden_slot: Option<usize> = None;
         let mut enc_mask_slot: Option<usize> = None;
+        let mut dec_mask_slot: Option<usize> = None;
         for (idx, outlet) in outlets.iter().enumerate() {
             let name = decoder_proto.node(outlet.node).name.to_ascii_lowercase();
             if name.contains("input_ids") {
                 input_ids_slot = Some(idx);
             } else if name.contains("encoder_hidden") {
                 enc_hidden_slot = Some(idx);
-            } else if name.contains("attention_mask") {
+            } else if name.contains("attention_mask") && !name.contains("decoder") {
                 enc_mask_slot = Some(idx);
+            } else if name.contains("attention_mask") && name.contains("decoder") {
+                dec_mask_slot = Some(idx);
             }
         }
         let input_ids_slot = input_ids_slot.unwrap_or(0);
         let enc_hidden_slot = enc_hidden_slot.unwrap_or(if input_ids_slot == 0 { 1 } else { 0 });
 
         let seq_sym = decoder_proto.symbols.sym("sequence_length");
-        let ids_shape: TVec<TDim> = tvec![1i64.into(), seq_sym.into()];
+        let ids_shape: TVec<TDim> = tvec![1i64.into(), seq_sym.clone().into()];
         decoder_proto
             .set_input_fact(input_ids_slot, InferenceFact::dt_shape(i64::datum_type(), ids_shape))
             .map_err(|e| OcrError::Transport(format!("configure decoder input_ids: {e}")))?;
@@ -436,29 +518,67 @@ mod inference {
         if let Some(mask_slot) = enc_mask_slot {
             decoder_proto
                 .set_input_fact(mask_slot, InferenceFact::dt_shape(i64::datum_type(), tvec![1, enc_seq]))
+                .map_err(|e| OcrError::Transport(format!("configure encoder attention mask: {e}")))?;
+        }
+        if let Some(mask_slot) = dec_mask_slot {
+            let dec_mask_shape: TVec<TDim> = tvec![1i64.into(), seq_sym.into()];
+            decoder_proto
+                .set_input_fact(mask_slot, InferenceFact::dt_shape(i64::datum_type(), dec_mask_shape))
                 .map_err(|e| OcrError::Transport(format!("configure decoder attention mask: {e}")))?;
         }
 
         let decoder =
             decoder_proto.into_optimized().and_then(|m| m.into_runnable()).map_err(|e| OcrError::Transport(format!("optimize decoder ONNX: {e}")))?;
 
+        Ok(CachedModel { tokenizer, encoder, decoder, input_count, input_ids_slot, enc_hidden_slot, enc_mask_slot, dec_mask_slot, enc_seq })
+    }
+
+    fn get_or_load_model(model_dir: &Path) -> Result<Arc<CachedModel>, OcrError> {
+        {
+            let guard = cache_lock();
+            if let Some((cached_dir, model)) = guard.as_ref()
+                && cached_dir == model_dir
+            {
+                return Ok(Arc::clone(model));
+            }
+        }
+        let loaded = Arc::new(load_model(model_dir)?);
+        let mut guard = cache_lock();
+        *guard = Some((model_dir.to_path_buf(), Arc::clone(&loaded)));
+        Ok(loaded)
+    }
+
+    pub(super) fn run_inference(model_dir: &Path, png_bytes: &[u8]) -> Result<String, OcrError> {
+        let model = get_or_load_model(model_dir)?;
+
+        let pixel_data = preprocess_png(png_bytes)?;
+        let pixel_tensor: Tensor =
+            tract_ndarray::Array4::from_shape_vec((1, 3, IMG_SIZE as usize, IMG_SIZE as usize), pixel_data).map_err(|_| OcrError::Picture)?.into();
+
+        let encoder_outputs = model.encoder.run(tvec!(pixel_tensor.into())).map_err(|e| OcrError::Transport(format!("run encoder ONNX: {e}")))?;
+        let encoder_hidden = encoder_outputs.first().ok_or(OcrError::BadReply)?.clone().into_tensor();
+
         let enc_hidden_tv = TValue::from_const(Arc::new(encoder_hidden));
         let enc_mask_tv: Option<TValue> =
-            enc_mask_slot.map(|_| TValue::from_const(Arc::new(tract_ndarray::Array2::<i64>::ones((1, enc_seq)).into_tensor())));
+            model.enc_mask_slot.map(|_| TValue::from_const(Arc::new(tract_ndarray::Array2::<i64>::ones((1, model.enc_seq)).into_tensor())));
 
         let mut token_ids: Vec<u32> = vec![START_TOKEN_ID];
         for _step in 0..MAX_DECODE_TOKENS {
+            let seq_len = token_ids.len();
             let ids_i64: Vec<i64> = token_ids.iter().map(|&id| i64::from(id)).collect();
-            let ids_tensor: Tensor = tract_ndarray::Array2::from_shape_vec((1, ids_i64.len()), ids_i64).map_err(|_| OcrError::BadReply)?.into();
+            let ids_tensor: Tensor = tract_ndarray::Array2::from_shape_vec((1, seq_len), ids_i64).map_err(|_| OcrError::BadReply)?.into();
 
-            let mut inputs: TVec<TValue> = tvec![Tensor::default().into(); input_count];
-            inputs[input_ids_slot] = ids_tensor.into();
-            inputs[enc_hidden_slot] = enc_hidden_tv.clone();
-            if let (Some(mask_slot), Some(mask_tv)) = (enc_mask_slot, &enc_mask_tv) {
+            let mut inputs: TVec<TValue> = tvec![Tensor::default().into(); model.input_count];
+            inputs[model.input_ids_slot] = ids_tensor.into();
+            inputs[model.enc_hidden_slot] = enc_hidden_tv.clone();
+            if let (Some(mask_slot), Some(mask_tv)) = (model.enc_mask_slot, &enc_mask_tv) {
                 inputs[mask_slot] = mask_tv.clone();
             }
+            if let Some(mask_slot) = model.dec_mask_slot {
+                inputs[mask_slot] = tract_ndarray::Array2::<i64>::ones((1, seq_len)).into_tensor().into();
+            }
 
-            let outputs = decoder.run(inputs).map_err(|e| OcrError::Transport(format!("run decoder ONNX: {e}")))?;
+            let outputs = model.decoder.run(inputs).map_err(|e| OcrError::Transport(format!("run decoder ONNX: {e}")))?;
             let logits_tv = outputs.first().ok_or(OcrError::BadReply)?;
             let logits = logits_tv.to_plain_array_view::<f32>().map_err(|e| OcrError::Transport(format!("read decoder logits: {e}")))?;
             let vocab_size = *logits.shape().last().ok_or(OcrError::BadReply)?;
@@ -482,9 +602,12 @@ mod inference {
                 break;
             }
             token_ids.push(next_id);
+            if trim_repetition_loop(&mut token_ids) {
+                break;
+            }
         }
 
-        Ok(tokenizer.decode(&token_ids))
+        Ok(model.tokenizer.decode(&token_ids))
     }
 }
 
@@ -586,24 +709,69 @@ mod tests {
     }
 
     #[test]
-    fn preprocess_png_outputs_normalized_chw_384x384_tensor() {
-        // 2x2 black & white test PNG
+    fn preprocess_png_outputs_normalized_chw_384x384_tensor_with_white_letterbox() {
+        let size = IMG_SIZE as usize;
+        let at = |tensor: &[f32], x: usize, y: usize| tensor[y * size + x];
+
+        // 2x2 black & white test PNG stays finite and in [-1, 1].
         let mut png = Vec::new();
         let pixels: [u8; 4] = [0, 255, 255, 0];
         PngEncoder::new(&mut png).write_image(&pixels, 2, 2, ExtendedColorType::L8).expect("encode png");
         let tensor = preprocess_png(&png).expect("preprocess");
-        assert_eq!(tensor.len(), 3 * 384 * 384);
+        assert_eq!(tensor.len(), 3 * size * size);
         assert!(tensor.iter().all(|v| v.is_finite() && *v >= -1.0001 && *v <= 1.0001));
-        // Solid black image -> all -1.0; solid white image -> all +1.0
+
+        // Solid square black image -> 8px white margin (+1.0), inner 368x368 solid black (-1.0).
         let mut black_png = Vec::new();
         PngEncoder::new(&mut black_png).write_image(&[0u8; 16], 4, 4, ExtendedColorType::L8).expect("black");
         let black = preprocess_png(&black_png).expect("black tensor");
-        assert!(black.iter().all(|v| (*v + 1.0).abs() < 1e-5));
+        assert!((at(&black, 0, 0) - 1.0).abs() < 1e-5, "outer border is white letterbox");
+        assert!((at(&black, size / 2, size / 2) + 1.0).abs() < 1e-5, "center is black");
 
+        // Solid white image -> all +1.0.
         let mut white_png = Vec::new();
         PngEncoder::new(&mut white_png).write_image(&[255u8; 16], 4, 4, ExtendedColorType::L8).expect("white");
         let white = preprocess_png(&white_png).expect("white tensor");
         assert!(white.iter().all(|v| (*v - 1.0).abs() < 1e-5));
+
+        // Wide 800x100 solid black image must preserve 8:1 aspect ratio inside 368x368 (368x46),
+        // leaving tall pure-white (+1.0) letterbox bands at top and bottom instead of stretching vertically.
+        let mut wide_png = Vec::new();
+        PngEncoder::new(&mut wide_png).write_image(&vec![0u8; 800 * 100], 800, 100, ExtendedColorType::L8).expect("wide black");
+        let wide = preprocess_png(&wide_png).expect("wide tensor");
+        for y in 0..150 {
+            assert!((at(&wide, size / 2, y) - 1.0).abs() < 1e-5, "expected white top letterbox band at row {y}");
+        }
+        for y in (size - 150)..size {
+            assert!((at(&wide, size / 2, y) - 1.0).abs() < 1e-5, "expected white bottom letterbox band at row {y}");
+        }
+        assert!((at(&wide, size / 2, size / 2) + 1.0).abs() < 1e-5, "center band holds the black equation");
+    }
+
+    #[test]
+    fn repetition_loop_guard_detects_and_trims_1_to_6_token_cycles() {
+        // 3 consecutive copies do not trigger.
+        let mut three = vec![1, 10, 42, 42, 42];
+        assert!(!trim_repetition_loop(&mut three));
+        assert_eq!(three, vec![1, 10, 42, 42, 42]);
+
+        // k = 1 repeated 4 times -> trims 3 trailing copies.
+        let mut k1 = vec![1, 10, 42, 42, 42, 42];
+        assert!(trim_repetition_loop(&mut k1));
+        assert_eq!(k1, vec![1, 10, 42]);
+
+        // k = 3 repeated 4 times -> keeps prefix + one copy of the 3-token cycle.
+        let mut k3 = vec![1, 7, 8, 9, 10, 8, 9, 10, 8, 9, 10, 8, 9, 10];
+        assert!(trim_repetition_loop(&mut k3));
+        assert_eq!(k3, vec![1, 7, 8, 9, 10]);
+
+        // k = 6 repeated 4 times -> keeps prefix + one copy of the 6-token cycle.
+        let mut k6 = vec![1, 99];
+        for _ in 0..4 {
+            k6.extend_from_slice(&[11, 12, 13, 14, 15, 16]);
+        }
+        assert!(trim_repetition_loop(&mut k6));
+        assert_eq!(k6, vec![1, 99, 11, 12, 13, 14, 15, 16]);
     }
 
     #[test]

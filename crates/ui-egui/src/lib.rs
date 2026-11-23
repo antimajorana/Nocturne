@@ -44,6 +44,7 @@ pub mod turn;
 pub mod input_language {
     pub use nocturne_input_language::{Watcher, is_rtl, watch_changes};
 }
+pub mod ink_color;
 pub mod inkpad;
 pub mod math_ocr;
 pub mod mathview;

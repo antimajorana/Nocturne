@@ -617,16 +617,25 @@ fn list_marker(line: &str) -> Option<(bool, usize, usize, &str)> {
 
 fn starts_block(line: &str) -> bool {
     let t = line.trim_start();
-    t.starts_with('#') || t.starts_with("```") || t.starts_with('>') || t.starts_with("$$") || list_marker(line).is_some()
+    t.starts_with('#') || backtick_fence_open(t).is_some() || t.starts_with('>') || t.starts_with("$$") || list_marker(line).is_some()
 }
 
 fn parse_attr(tag: &str, name: &str) -> Option<String> {
-    let lower = tag.to_lowercase();
-    let marker = format!("{name}=\"");
-    let start = lower.find(&marker)? + marker.len();
-    let end = tag.get(start..)?.find('"')?;
-    // The value as it was before it was escaped for the tag: `&quot;` is a quote in the text.
-    tag.get(start..start + end).map(crate::html::unescape)
+    let lower = tag.to_ascii_lowercase();
+    let marker = format!("{}=\"", name.to_ascii_lowercase());
+    let mut offset = 0;
+    while let Some(rel) = lower.get(offset..)?.find(&marker) {
+        let pos = offset + rel;
+        let at_boundary = pos == 0 || lower.as_bytes().get(pos - 1).is_some_and(u8::is_ascii_whitespace);
+        if at_boundary {
+            let start = pos + marker.len();
+            let end = tag.get(start..)?.find('"')?;
+            // The value as it was before it was escaped for the tag: `&quot;` is a quote in the text.
+            return tag.get(start..start + end).map(crate::html::unescape);
+        }
+        offset = pos + marker.len();
+    }
+    None
 }
 
 fn try_parse_img_block(line: &str) -> Option<Block> {
@@ -644,6 +653,13 @@ fn try_parse_img_block(line: &str) -> Option<Block> {
 /// How many backticks `text` starts with.
 fn backtick_run(text: &str) -> usize {
     text.bytes().take_while(|&b| b == b'`').count()
+}
+
+/// Opening backtick fence length, if `t` starts a fenced code block (CommonMark §4.5):
+/// three or more leading backticks with no backticks in the info string that follows.
+fn backtick_fence_open(t: &str) -> Option<usize> {
+    let open = backtick_run(t);
+    (open >= 3 && t.get(open..).is_some_and(|rest| !rest.contains('`'))).then_some(open)
 }
 
 /// The fence to write round `code`: three backticks, or one more than the longest run that
@@ -664,15 +680,14 @@ pub fn parse(src: &str) -> Vec<Block> {
         let t = line.trim();
         if t.is_empty() {
             i += 1;
-        } else if t.starts_with("```") {
+        } else if let Some(open) = backtick_fence_open(t) {
             // The fence is as long as its run of backticks, and only a run at least as long,
             // with nothing after it, closes it: a shorter fence inside is part of the code.
-            let open = backtick_run(t);
-            let lang = t[open..].trim().to_string();
+            let lang = t.get(open..).unwrap_or("").trim().to_string();
             let closes = |l: &str| {
                 let l = l.trim();
                 let run = backtick_run(l);
-                run >= open && l[run..].is_empty()
+                run >= open && l.get(run..).is_some_and(str::is_empty)
             };
             let mut body = Vec::new();
             i += 1;
@@ -917,5 +932,42 @@ mod tests {
             let _ = parse(s);
             let _ = parse_inline(s);
         }
+    }
+
+    #[test]
+    fn inline_code_with_backticks_at_paragraph_start_is_not_a_fence() {
+        let blocks = parse("``` `` ``` and more\n");
+        assert_eq!(
+            blocks,
+            vec![Block::Paragraph(vec![
+                Span { text: "``".into(), code: true, ..Span::default() },
+                Span { text: " and more".into(), ..Span::default() },
+            ])]
+        );
+
+        let continued = parse("first line\n``` `` ``` second\n");
+        assert_eq!(
+            continued,
+            vec![Block::Paragraph(vec![
+                Span { text: "first line ".into(), ..Span::default() },
+                Span { text: "``".into(), code: true, ..Span::default() },
+                Span { text: " second".into(), ..Span::default() },
+            ])]
+        );
+
+        let fenced = parse("```rust\nlet x = 1;\n```\n");
+        assert_eq!(fenced, vec![Block::Code { lang: "rust".into(), text: "let x = 1;".into() }]);
+    }
+
+    #[test]
+    fn parse_attr_handles_unicode_case_expansion_and_attribute_boundaries() {
+        // Turkish dotted capital 'İ' changes byte length under Unicode `.to_lowercase()`.
+        let unicode_img = parse("<img alt=\"İ\" src=\"assets/pic.png\" width=\"120\">\n");
+        assert_eq!(unicode_img, vec![Block::Image { alt: "İ".into(), src: "assets/pic.png".into(), width: Some(120.0), height: None }]);
+
+        let boundary_img = parse("<img data-src=\"wrong.png\" src=\"right.png\" data-width=\"999\" width=\"48\">\n");
+        assert_eq!(boundary_img, vec![Block::Image { alt: String::new(), src: "right.png".into(), width: Some(48.0), height: None }]);
+
+        assert!(try_parse_img_block("<img data-src=\"only.png\">").is_none());
     }
 }

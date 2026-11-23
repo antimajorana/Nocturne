@@ -2541,8 +2541,8 @@ pub fn show_blocks_with_touch(
                 && out.task_set.is_none()
                 && let Some(p) = drag_began_in(ui, resp.rect)
             {
-                let at = char_under(ui, &block, &resp, p, t, page);
-                let to_at = ui.ctx().pointer_latest_pos().map(|cur| char_under(ui, &block, &resp, cur, t, page)).unwrap_or(at);
+                let at = char_under(ui, &block, &resp, p, t, page, zoom);
+                let to_at = ui.ctx().pointer_latest_pos().map(|cur| char_under(ui, &block, &resp, cur, t, page, zoom)).unwrap_or(at);
                 if across.is_none() {
                     *across = Some(Across { from: (i, byte_of_caret(&block, at)), to: (i, byte_of_caret(&block, at)) });
                 }
@@ -2558,7 +2558,7 @@ pub fn show_blocks_with_touch(
                 && let Some(p) = ui.ctx().pointer_latest_pos()
                 && resp.rect.contains(p)
             {
-                let at = byte_of_caret(&block, char_under(ui, &block, &resp, p, t, page));
+                let at = byte_of_caret(&block, char_under(ui, &block, &resp, p, t, page, zoom));
                 match across.as_mut() {
                     // Already open: this is where it reaches now, the block it began in
                     // included, so dragging back the way it came shortens it again.
@@ -2582,17 +2582,19 @@ pub fn show_blocks_with_touch(
             } else if (resp.clicked() || resp.double_clicked() || tapped_here.is_some()) && is_writable(&block) {
                 // A click on a link follows it; anywhere else it puts the caret there.
                 let click_pos = resp.interact_pointer_pos().or(tapped_here);
-                let link = (!contains_inline_image(&block)).then(|| click_pos.and_then(|p| link_under(ui, &block, &resp, p, t, page))).flatten();
+                let link = (!contains_inline_image(&block))
+                    .then(|| click_pos.and_then(|p| link_under_zoomed(ui, &block, &resp, p, t, page, zoom)))
+                    .flatten();
                 match link {
                     Some(href) => changed.link = Some(href),
                     None => {
-                        let at = click_pos.map(|p| char_under(ui, &block, &resp, p, t, page));
+                        let at = click_pos.map(|p| char_under(ui, &block, &resp, p, t, page, zoom));
                         action = Some(Action::MoveTo(i, at));
                     }
                 }
             }
             if resp.hovered() && is_writable(&block) {
-                let over_link = resp.hover_pos().and_then(|p| link_under(ui, &block, &resp, p, t, page)).is_some();
+                let over_link = resp.hover_pos().and_then(|p| link_under_zoomed(ui, &block, &resp, p, t, page, zoom)).is_some();
                 ui.ctx().set_cursor_icon(if over_link { egui::CursorIcon::PointingHand } else { egui::CursorIcon::Text });
             }
             frame_block(ui, top, false, t, zoom);
@@ -3234,10 +3236,21 @@ pub fn write_rtl(ui: &mut Ui, c: &mut Caret, size: f32, t: &Tokens, id: egui::Id
             anchor = at;
             changed = true;
         }
-        if delete && at < c.text.len() {
-            let next = c.text.get(at..).and_then(|s| s.chars().next()).map(char::len_utf8).unwrap_or(0);
-            c.text.replace_range(at..at + next, "");
-            changed = true;
+        if delete {
+            let (a, b) = (anchor.min(at), anchor.max(at));
+            if a < b {
+                c.text.replace_range(a..b, "");
+                at = a;
+                anchor = a;
+                changed = true;
+            } else if at < c.text.len() {
+                let next = c.text.get(at..).and_then(|s| s.chars().next()).map(char::len_utf8).unwrap_or(0);
+                if next > 0 {
+                    c.text.replace_range(at..at + next, "");
+                    anchor = at;
+                    changed = true;
+                }
+            }
         }
         if pressed(Key::Backspace).is_some() {
             let (a, b) = (anchor.min(at), anchor.max(at));
@@ -3588,13 +3601,14 @@ fn apply(action: Action, blocks: &mut Vec<Block>, caret: &mut Option<Caret>, cha
 }
 
 /// The character of a finished block under `pos`, given the area `resp` it was drawn in.
-fn char_under(ui: &Ui, block: &Block, resp: &egui::Response, pos: egui::Pos2, t: &Tokens, page: Option<nocturne_model::Dir>) -> usize {
-    if let Some(at) = char_under_drawn(ui, block, resp, pos, t, page) {
+fn char_under(ui: &Ui, block: &Block, resp: &egui::Response, pos: egui::Pos2, t: &Tokens, page: Option<nocturne_model::Dir>, zoom: f32) -> usize {
+    let zoom = zoom.max(0.01);
+    if let Some(at) = char_under_drawn(ui, block, resp, pos, t, page, zoom) {
         return at;
     }
     let (size, strong) = size_of(block);
     let text = caret_text(block);
-    char_at(ui, &text, size, strong, t, resp.rect.width(), pos - resp.rect.min - egui::vec2(lead_width(block), 0.0), page)
+    char_at(ui, &text, size * zoom, strong, t, resp.rect.width(), pos - resp.rect.min - egui::vec2(lead_width(block) * zoom, 0.0), page)
 }
 
 /// Where a click on a finished block lands in the text the caret writes in.
@@ -3605,7 +3619,16 @@ fn char_under(ui: &Ui, block: &Block, resp: &egui::Response, pos: egui::Pos2, t:
 /// the text and invisible on the page. So the pointer is measured against what was drawn and
 /// the answer is carried back over the marks. `None` when that carrying back cannot be
 /// trusted, and the caller measures the old way.
-fn char_under_drawn(ui: &Ui, block: &Block, resp: &egui::Response, pos: egui::Pos2, t: &Tokens, page: Option<nocturne_model::Dir>) -> Option<usize> {
+fn char_under_drawn(
+    ui: &Ui,
+    block: &Block,
+    resp: &egui::Response,
+    pos: egui::Pos2,
+    t: &Tokens,
+    page: Option<nocturne_model::Dir>,
+    zoom: f32,
+) -> Option<usize> {
+    let zoom = zoom.max(0.01);
     let spans = match block {
         Block::Heading { spans, .. } | Block::Paragraph(spans) | Block::Quote(spans) | Block::Item { spans, .. } => spans,
         _ => return None,
@@ -3614,7 +3637,7 @@ fn char_under_drawn(ui: &Ui, block: &Block, resp: &egui::Response, pos: egui::Po
         return None;
     }
     let (spans, mark) = match preview::tagged(spans) {
-        Some((_, stripped)) => (stripped, 21.0),
+        Some((_, stripped)) => (stripped, 21.0 * zoom),
         None => (spans.clone(), 0.0),
     };
     // The walk below counts the marks span by span. That count is only right when the marks
@@ -3623,7 +3646,7 @@ fn char_under_drawn(ui: &Ui, block: &Block, resp: &egui::Response, pos: egui::Po
         return None;
     }
     let drawn: String = spans.iter().map(|s| s.text.as_str()).collect();
-    let lead = mark + lead_width(block);
+    let lead = mark + lead_width(block) * zoom;
     // A row that reads right to left keeps its bullet and its tag mark on the right, so its
     // words start at the left edge; a row that reads the other way has them after the lead.
     let rtl = preview::dir_of(&spans, page).is_rtl();
@@ -3631,6 +3654,7 @@ fn char_under_drawn(ui: &Ui, block: &Block, resp: &egui::Response, pos: egui::Po
     let x = if rtl { rel.x } else { rel.x - lead };
     let column = (resp.rect.width() - lead).max(32.0);
     let (size, strong) = size_of(block);
+    let size = size * zoom;
     let at = if crate::bidi::paints(&drawn, page) {
         let byte = crate::bidi::hit(&drawn, vec2(x, rel.y), size, column, page);
         drawn.get(..byte).unwrap_or(drawn.as_str()).chars().count()
@@ -3691,13 +3715,26 @@ fn link_in(block: &Block, at: usize, page: Option<nocturne_model::Dir>) -> Optio
 /// right-to-left or mixed line is asked through the painter that drew it; any other line
 /// through egui's layout of its text.
 pub fn link_under(ui: &Ui, block: &Block, resp: &egui::Response, pos: egui::Pos2, t: &Tokens, page: Option<nocturne_model::Dir>) -> Option<String> {
+    link_under_zoomed(ui, block, resp, pos, t, page, 1.0)
+}
+
+/// Like [`link_under`], scaled to the page's current `zoom`.
+pub fn link_under_zoomed(
+    ui: &Ui,
+    block: &Block,
+    resp: &egui::Response,
+    pos: egui::Pos2,
+    t: &Tokens,
+    page: Option<nocturne_model::Dir>,
+    zoom: f32,
+) -> Option<String> {
     if !is_writable(block) {
         return None;
     }
-    if let Some(href) = preview::link_at_point(block, pos - resp.rect.min, resp.rect.width(), page) {
+    if let Some(href) = preview::link_at_point_zoomed(block, pos - resp.rect.min, resp.rect.width(), page, zoom) {
         return Some(href);
     }
-    link_in(block, char_under(ui, block, resp, pos, t, page), page)
+    link_in(block, char_under(ui, block, resp, pos, t, page, zoom), page)
 }
 
 /// How wide the bullet or quote bar in front of a block is, so a click lands on the right
@@ -4907,6 +4944,136 @@ code
         paste_at(&mut blocks, &mut caret, 0, new);
         assert_eq!(blocks.len(), 3, "after the line that has words");
         assert!(matches!(blocks[1], Block::Heading { .. }));
+    }
+
+    #[test]
+    fn zoomed_char_under_and_link_under_scale_with_zoom() {
+        let block = blocks("alpha beta [target](https://example.test) gamma\n").remove(0);
+        let tokens = crate::theme::Theme::DEFAULT.tokens();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1400.0, 400.0));
+
+        let measure = |zoom: f32| -> (usize, f32, f32) {
+            let ctx = egui::Context::default();
+            let mut char_at_100 = 0;
+            let mut link_xs = Vec::new();
+            let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+                crate::fonts::install_once(ui.ctx());
+                ui.set_width(600.0 * zoom);
+                let shown = preview::show_block_zoomed(
+                    ui,
+                    &block,
+                    0,
+                    std::path::Path::new("."),
+                    &tokens,
+                    false,
+                    Some(nocturne_model::Dir::Ltr),
+                    None,
+                    None,
+                    ui.id().with("zoom-hit-block"),
+                    zoom,
+                );
+                let resp = shown.response;
+                let y = resp.rect.center().y;
+                char_at_100 = char_under(ui, &block, &resp, egui::pos2(resp.rect.min.x + 100.0, y), &tokens, Some(nocturne_model::Dir::Ltr), zoom);
+                let steps = (resp.rect.width().min(600.0 * zoom) as i32).max(1);
+                for x in (0..steps).step_by(2) {
+                    let p = egui::pos2(resp.rect.min.x + x as f32, y);
+                    if link_under_zoomed(ui, &block, &resp, p, &tokens, Some(nocturne_model::Dir::Ltr), zoom).as_deref()
+                        == Some("https://example.test")
+                    {
+                        link_xs.push(x as f32);
+                    }
+                }
+            });
+            out.textures_delta.clear();
+            let first = *link_xs.first().expect("link hit start");
+            let last = *link_xs.last().expect("link hit end");
+            (char_at_100, first, last)
+        };
+
+        let (c_half, a_half, b_half) = measure(0.5);
+        let (c_one, a_one, b_one) = measure(1.0);
+        let (c_two, a_two, b_two) = measure(2.0);
+        let mid_half = (a_half + b_half) * 0.5;
+        let mid_one = (a_one + b_one) * 0.5;
+        let mid_two = (a_two + b_two) * 0.5;
+
+        assert!(c_two < c_one && c_one < c_half, "fixed x=100pt must land on fewer chars at higher zoom: 2x={c_two}, 1x={c_one}, 0.5x={c_half}");
+        assert!(mid_two > mid_one * 1.6, "2x link center must scale up: 1x={mid_one}, 2x={mid_two}");
+        assert!(mid_half < mid_one * 0.65, "0.5x link center must scale down: 1x={mid_one}, 0.5x={mid_half}");
+
+        // Clicking at mid_one * zoom hits the link at every zoom level.
+        for zoom in [0.5_f32, 1.0, 2.0] {
+            let ctx = egui::Context::default();
+            let mut hit = None;
+            let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+                crate::fonts::install_once(ui.ctx());
+                ui.set_width(600.0 * zoom);
+                let shown = preview::show_block_zoomed(
+                    ui,
+                    &block,
+                    0,
+                    std::path::Path::new("."),
+                    &tokens,
+                    false,
+                    Some(nocturne_model::Dir::Ltr),
+                    None,
+                    None,
+                    ui.id().with("zoom-link-click"),
+                    zoom,
+                );
+                let resp = shown.response;
+                let p = egui::pos2(resp.rect.min.x + mid_one * zoom, resp.rect.center().y);
+                hit = link_under_zoomed(ui, &block, &resp, p, &tokens, Some(nocturne_model::Dir::Ltr), zoom);
+            });
+            out.textures_delta.clear();
+            assert_eq!(hit.as_deref(), Some("https://example.test"), "zoom={zoom}: scaled link center must hit link");
+        }
+    }
+
+    #[test]
+    fn write_rtl_delete_removes_active_selection_and_keeps_utf8_boundaries() {
+        let tokens = crate::theme::Theme::DEFAULT.tokens();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(600.0, 200.0));
+        let del = egui::Event::Key { key: Key::Delete, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+
+        let run_delete = |text: &str, selection: (usize, usize)| -> (String, (usize, usize), bool) {
+            let ctx = egui::Context::default();
+            let id = egui::Id::new("rtl-delete-test");
+            let mut caret = Caret { block: 0, text: text.to_string(), focus: false, selection, place: None, cell: None, span: None, inline: None };
+            // Frame 1: acquire focus on the RTL editor widget.
+            let mut out1 = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+                crate::fonts::install_once(ui.ctx());
+                let _ = write_rtl(ui, &mut caret, 14.5, &tokens, id, Some(nocturne_model::Dir::Rtl));
+            });
+            out1.textures_delta.clear();
+            // Frame 2: send Delete while focused.
+            let mut changed = false;
+            let mut out2 = ctx.run_ui(egui::RawInput { events: vec![del.clone()], screen_rect: Some(screen), ..Default::default() }, |ui| {
+                let wrote = write_rtl(ui, &mut caret, 14.5, &tokens, id, Some(nocturne_model::Dir::Rtl));
+                changed = wrote.changed;
+            });
+            out2.textures_delta.clear();
+            (caret.text, caret.selection, changed)
+        };
+
+        // 1. Forward selection to end of Arabic text (at == text.len(), anchor < at).
+        let (text, sel, changed) = run_delete("مرحبا بالعالم", (13, 6));
+        assert!(changed);
+        assert_eq!(text, "مرحبا ");
+        assert_eq!(sel, (6, 6));
+
+        // 2. Backward selection across mixed 1-byte ASCII and 2-byte Arabic chars (at < anchor).
+        let (text, sel, changed) = run_delete("a مرحبا", (0, 4));
+        assert!(changed);
+        assert_eq!(text, "حبا");
+        assert_eq!(sel, (0, 0));
+
+        // 3. Collapsed caret deletes the single character after the caret.
+        let (text, sel, changed) = run_delete("مرحبا", (0, 0));
+        assert!(changed);
+        assert_eq!(text, "رحبا");
+        assert_eq!(sel, (0, 0));
     }
 }
 

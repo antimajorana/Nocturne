@@ -17,7 +17,7 @@ use crate::library_thumbs::{
 pub use crate::library_thumbs::{CachedThumb, ImportKind, LibraryAction, ThumbLine, ThumbStroke};
 use crate::ribbon::Act;
 use crate::theme::{Tokens, mix};
-use egui::{Align, Color32, CornerRadius, FontId, Id, Key, Layout, Rect, RichText, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
+use egui::{Align, CornerRadius, FontId, Id, Key, Layout, Rect, RichText, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use nocturne_engine::{LibraryView, Output, Params, Session};
 use nocturne_model::NodeKind;
 use nocturne_store::Settings;
@@ -185,14 +185,16 @@ impl LibraryGrid {
             ui.painter().rect_filled(full, 0.0, bg);
             self.show_right_pane(ui, session, &valid_recents, target_section, &scope_title, (full, true), t, &mut out);
             if self.drawer_open {
-                let mut close = ui.input(|i| i.key_pressed(Key::Escape));
-                egui::Area::new(Id::unique("studio-library-drawer")).order(egui::Order::Foreground).fixed_pos(full.min).show(ui.ctx(), |ui| {
+                let ctx = ui.ctx();
+                let no_overlay = !ctx.any_popup_open() && !egui::Popup::is_any_open(ctx) && ctx.memory(|m| m.top_modal_layer().is_none());
+                let mut close = no_overlay && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
+                egui::Area::new(Id::unique("studio-library-drawer")).order(egui::Order::Foreground).fixed_pos(full.min).show(ctx, |ui| {
                     ui.set_clip_rect(full);
                     let w = SIDEBAR_WIDTH.min((full.width() - 48.0).max(200.0)).min(full.width());
                     let drawer = Rect::from_min_max(full.min, pos2(full.min.x + w, full.max.y));
                     let scrim = Rect::from_min_max(pos2(drawer.max.x, full.min.y), full.max);
-                    ui.painter().rect_filled(scrim, 0.0, Color32::from_black_alpha(96));
-                    if scrim.width() > 0.0 && ui.interact(scrim, Id::unique("studio-library-drawer-scrim"), Sense::click()).clicked() {
+                    ui.painter().rect_filled(scrim, 0.0, t.scrim);
+                    if scrim.width() > 0.0 && ui.interact(scrim, Id::unique("studio-library-drawer-scrim"), Sense::click_and_drag()).clicked() {
                         close = true;
                     }
                     ui.painter().rect_filled(drawer, 0.0, t.panel);
@@ -241,7 +243,6 @@ impl LibraryGrid {
                 });
             });
             ui.add_space(10.0);
-
             let recents_row = (Path::new("__recents__"), crate::tl_id!("ui.library_recents"), recents.len());
             let recents_layout = (matches!(self.scope, Some(LibraryScope::Recents)), 0, None);
             if sidebar_pill(ui, recents_row, (Icon::Clock, t.accent), recents_layout, None, t, &mut out.actions).0 {
@@ -251,7 +252,6 @@ impl LibraryGrid {
                 }
             }
             ui.add_space(6.0);
-
             egui::ScrollArea::vertical().id_salt("studio-library-tree-scroll").auto_shrink([false, false]).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 3.0;
                 if tree.is_empty() {
@@ -262,7 +262,6 @@ impl LibraryGrid {
                 }
             });
         });
-
         ui.scope_builder(egui::UiBuilder::new().id_salt("studio-library-bottom").max_rect(bottom_rect), |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
@@ -463,6 +462,7 @@ fn sidebar_more_menu(ui: &mut Ui, sync_busy: bool, sync_configured: bool, out: &
     }
     act_btn(ui, crate::tl_id!("ui.kdrive_sync_open_btn"), Act::OpenCloudSync);
     act_btn(ui, crate::tl_id!("ui.theme"), Act::OpenThemes);
+    act_btn(ui, crate::tl_id!("ui.settings"), Act::Options);
     act_btn(ui, crate::tl_id!("ui.file"), Act::File);
     ui.separator();
     act_btn(ui, crate::tl_id!("ui.switch_to_classic_ribbon"), Act::ToggleStudioLayout);

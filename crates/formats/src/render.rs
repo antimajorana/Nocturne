@@ -515,7 +515,14 @@ pub fn blocks_to_html(blocks: &[Block]) -> String {
 fn render_html_list(blocks: &[Block], at: &mut usize, depth: usize, ordered: bool, out: &mut String) {
     out.push_str(if ordered { "<ol>\n" } else { "<ul>\n" });
     while let Some(Block::Item { ordered: item_ordered, task, depth: item_depth, spans, .. }) = blocks.get(*at) {
-        if *item_depth != depth || *item_ordered != ordered {
+        if *item_depth < depth {
+            break;
+        }
+        if *item_depth > depth {
+            render_html_list(blocks, at, depth + 1, *item_ordered, out);
+            continue;
+        }
+        if *item_ordered != ordered {
             break;
         }
         let box_text = match task {
@@ -525,7 +532,7 @@ fn render_html_list(blocks: &[Block], at: &mut usize, depth: usize, ordered: boo
         };
         out.push_str(&format!("<li>{box_text}{}", spans_to_html(spans)));
         *at += 1;
-        if let Some(Block::Item { depth: child_depth, ordered: child_ordered, .. }) = blocks.get(*at)
+        while let Some(Block::Item { depth: child_depth, ordered: child_ordered, .. }) = blocks.get(*at)
             && *child_depth > depth
         {
             render_html_list(blocks, at, depth + 1, *child_ordered, out);
@@ -965,5 +972,21 @@ fn b() {}"
         let html = blocks_to_html(&blocks);
         assert_eq!(parse(&markdown), blocks, "CMGFM round-trips nested formatting: {markdown}");
         assert_eq!(parse(&html::to_markdown(&html)), blocks, "HTML round-trips nested formatting: {html}");
+    }
+
+    #[test]
+    fn nested_mixed_lists_and_depth_jumps_round_trip_in_html() {
+        let mixed = parse("- parent\n  - bullet child\n  1. ordered child\n- sibling\n");
+        let mixed_html = blocks_to_html(&mixed);
+        assert_eq!(mixed_html.matches("<ul>").count(), 2, "outer ul + nested child ul:\n{mixed_html}");
+        assert_eq!(mixed_html.matches("<ol>").count(), 1, "nested child ol inside same parent li:\n{mixed_html}");
+        assert_eq!(parse(&html::to_markdown(&mixed_html)), mixed, "mixed child lists round-trip:\n{mixed_html}");
+
+        for src in ["- parent\n    - grandchild\n- sibling\n", "- parent\n    1. grandchild\n  - child\n- sibling\n"] {
+            let blocks = parse(src);
+            let html = blocks_to_html(&blocks);
+            assert!(!html.contains("<ul>\n</ul>") && !html.contains("<ol>\n</ol>"), "no empty list wrapper:\n{html}");
+            assert_eq!(parse(&html::to_markdown(&html)), blocks, "depth jump round-trips:\n{html}");
+        }
     }
 }

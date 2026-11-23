@@ -404,6 +404,14 @@ Parameters:
 
 - enabled (optional): true, false, or toggle; default: toggle
 
+## `ink.handwriting_ocr_toggle`
+
+Turn general handwriting-to-text recognition on or off.
+
+Parameters:
+
+- enabled (optional): true, false, or toggle; default: toggle
+
 ## `ink.math_ocr_configure`
 
 Choose the service that reads handwritten equations, and give it its key.
@@ -420,12 +428,13 @@ Parameters:
 
 ## `ink.math_ocr_convert`
 
-Read a page's handwritten equation as LaTeX (sends a picture of the ink to the chosen service).
+Read a page's handwritten equation or text (sends a picture of the ink to the chosen service).
 
 Parameters:
 
 - path (required): the page
 - strokes (optional): which strokes, by position, comma separated; default: all of them
+- mode (optional): math (default) or handwriting
 
 ## `ink.math_ocr_remove_model`
 

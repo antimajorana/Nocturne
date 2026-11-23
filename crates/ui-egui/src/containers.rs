@@ -417,6 +417,7 @@ pub fn show_with_touch_and_handles(
     // Which container the caret is in, so that a block added or removed inside it is
     // counted against the right one.
     let caret_box = caret.as_ref().and_then(|c| container::place(boxes, c.block)).map(|(i, _)| i);
+    let mut block_count_box = caret_box;
     let before = blocks.len();
     let mut bottom = area.min.y;
     let mut right = area.min.x;
@@ -1361,7 +1362,12 @@ pub fn show_with_touch_and_handles(
             let target = pageedit::next_writable_block(blocks, block, shown_title);
             let target = target.or_else(|| {
                 let at = block.saturating_add(1).min(blocks.len());
+                if let Some((owner, _)) = container::place(boxes, block) {
+                    block_count_box = Some(owner);
+                }
                 blocks.insert(at, Block::Paragraph(Vec::new()));
+                out.changed.columns |= cols.insert_block(at);
+                out.justified |= justified.insert_block(at);
                 out.changed.blocks = true;
                 Some(at)
             });
@@ -1453,8 +1459,8 @@ pub fn show_with_touch_and_handles(
     // A block was added or taken away inside a container: it belongs to that one.
     let now = blocks.len();
     if now != before {
-        let which = caret_box.unwrap_or(0).min(boxes.len().saturating_sub(1));
-        log::debug!("BLOCK_COUNT: {before} -> {now} credited to box {which} (caret_box={caret_box:?})");
+        let which = block_count_box.unwrap_or(0).min(boxes.len().saturating_sub(1));
+        log::debug!("BLOCK_COUNT: {before} -> {now} credited to box {which} (caret_box={caret_box:?}, block_count_box={block_count_box:?})");
         if let Some(c) = boxes.get_mut(which) {
             let grew = now as i64 - before as i64;
             c.blocks = (c.blocks as i64 + grew).max(0) as usize;
@@ -1526,39 +1532,51 @@ pub fn show_with_touch_and_handles(
         && let Some((container_at, _)) = container::place(boxes, block)
         && block < blocks.len()
     {
+        let mut removed_range: Option<std::ops::Range<usize>> = None;
         // Check if this block is the only one in its container.
         if let Some(container) = boxes.get(container_at) {
             if container.blocks <= 1 {
+                let range = container::blocks_of(boxes, container_at);
                 // Remove the whole container if it only has this one block.
-                remove_container(blocks, boxes, container_at);
+                if remove_container(blocks, boxes, container_at) {
+                    removed_range = Some(range);
+                }
             } else {
                 // Remove just this block; the container remains and owns the others.
                 blocks.remove(block);
+                removed_range = Some(block..block + 1);
                 // Update the container's block count.
                 if let Some(c) = boxes.get_mut(container_at) {
                     c.blocks = c.blocks.saturating_sub(1);
                 }
             }
         }
-        out.changed.blocks = true;
-        out.changed.caret = true;
-        out.boxes = true;
-        *caret = None;
-        ui.ctx().request_repaint();
+        if let Some(range) = removed_range {
+            out.changed.columns |= cols.remove_blocks(range.clone());
+            out.justified |= justified.remove_blocks(range);
+            out.changed.blocks = true;
+            out.changed.caret = true;
+            out.boxes = true;
+            *caret = None;
+            ui.ctx().request_repaint();
+        }
     }
 
     // Delete (the key, or the menu's Cut and Delete): the container and everything in it go.
     // Done after the drawing above so the blocks are not taken out from under it.
-    if let Some(i) = delete_at
-        && remove_container(blocks, boxes, i)
-    {
-        out.changed.blocks = true;
-        out.changed.caret = true;
-        out.boxes = true;
-        *caret = None;
-        sel = None;
-        menu_at = None;
-        ui.ctx().request_repaint();
+    if let Some(i) = delete_at {
+        let range = container::blocks_of(boxes, i);
+        if remove_container(blocks, boxes, i) {
+            out.changed.columns |= cols.remove_blocks(range.clone());
+            out.justified |= justified.remove_blocks(range);
+            out.changed.blocks = true;
+            out.changed.caret = true;
+            out.boxes = true;
+            *caret = None;
+            sel = None;
+            menu_at = None;
+            ui.ctx().request_repaint();
+        }
     }
     // A menu belongs to a selection: with none, there is no menu.
     if sel.is_none() {
@@ -1710,8 +1728,13 @@ pub fn show_with_touch_and_handles(
     {
         let mut gone = group.clone();
         gone.sort_unstable();
+        gone.dedup();
         for &j in gone.iter().rev() {
-            remove_container(blocks, boxes, j);
+            let range = container::blocks_of(boxes, j);
+            if remove_container(blocks, boxes, j) {
+                out.changed.columns |= cols.remove_blocks(range.clone());
+                out.justified |= justified.remove_blocks(range);
+            }
         }
         group.clear();
         out.changed.blocks = true;
@@ -2707,5 +2730,147 @@ more
                 }
             }
         }
+    }
+
+    #[test]
+    fn deleting_containers_and_objects_shifts_columns_and_justified_indices() {
+        let t = Theme::DEFAULT.tokens();
+        let screen = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 800.0));
+        let page_dir = std::path::Path::new("page-delete-shift");
+        let page_key = page_dir.to_string_lossy().into_owned();
+        let del = egui::Event::Key { key: Key::Delete, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+
+        let run_del = |ctx: &egui::Context,
+                       blocks: &mut Vec<Block>,
+                       boxes: &mut Vec<Container>,
+                       cols: &mut nocturne_model::tablecols::Widths,
+                       justified: &mut nocturne_model::justify::Justified|
+         -> Moved {
+            let mut caret: Option<Caret> = None;
+            let mut moved = Moved::default();
+            let mut out = ctx.run_ui(egui::RawInput { events: vec![del.clone()], screen_rect: Some(screen), ..Default::default() }, |ui| {
+                crate::fonts::install_once(ui.ctx());
+                moved = show(ui, blocks, boxes, &mut caret, page_dir, &t, Some(nocturne_model::Dir::Ltr), cols, justified, &mut None, "", 1.0, None);
+            });
+            out.textures_delta.clear();
+            moved
+        };
+
+        // 1. Single-container delete (`delete_at`): deleting container 0 (2 blocks) shifts table & justified by 2.
+        {
+            let ctx = egui::Context::default();
+            let mut blocks = page("a\n\nb\n\n| h1 | h2 |\n| --- | --- |\n| 1 | 2 |\n\njustified\n");
+            let mut boxes = vec![Container::new(0.0, 0.0, 300.0, 2), Container::new(0.0, 120.0, 300.0, 2)];
+            let mut cols = nocturne_model::tablecols::parse("2:120,180");
+            let mut justified = nocturne_model::justify::parse("3");
+            ctx.data_mut(|d| {
+                d.insert_temp(selected_id(), (0usize, page_key.clone()));
+            });
+            let moved = run_del(&ctx, &mut blocks, &mut boxes, &mut cols, &mut justified);
+            assert!(moved.changed.columns, "delete_at must report columns changed");
+            assert!(moved.justified, "delete_at must report justified changed");
+            assert_eq!(cols.of(0), Some([120.0_f32, 180.0].as_slice()));
+            assert!(cols.of(2).is_none());
+            assert!(justified.has(1) && !justified.has(3));
+        }
+
+        // 2. Group delete: deleting containers 0 and 1 (3 blocks total) shifts container 2's table & justified by 3.
+        {
+            let ctx = egui::Context::default();
+            let mut blocks = page("a\n\nb\n\nc\n\n| h1 | h2 |\n| --- | --- |\n| 1 | 2 |\n\njustified\n");
+            let mut boxes = vec![Container::new(0.0, 0.0, 300.0, 1), Container::new(0.0, 80.0, 300.0, 2), Container::new(0.0, 200.0, 300.0, 2)];
+            let mut cols = nocturne_model::tablecols::parse("3:110,190");
+            let mut justified = nocturne_model::justify::parse("4");
+            ctx.data_mut(|d| {
+                d.insert_temp(group_id(), (vec![0usize, 1usize], page_key.clone()));
+            });
+            let moved = run_del(&ctx, &mut blocks, &mut boxes, &mut cols, &mut justified);
+            assert!(moved.changed.columns, "group delete must report columns changed");
+            assert!(moved.justified, "group delete must report justified changed");
+            assert_eq!(cols.of(0), Some([110.0_f32, 190.0].as_slice()));
+            assert!(cols.of(3).is_none());
+            assert!(justified.has(1) && !justified.has(4));
+        }
+
+        // 3a. Embedded object delete (`delete_object`) when object is the sole block in its container.
+        {
+            let ctx = egui::Context::default();
+            let mut blocks = page("![pic](assets/a.png)\n\n| h1 | h2 |\n| --- | --- |\n| 1 | 2 |\n\njustified\n");
+            let mut boxes = vec![Container::new(0.0, 0.0, 300.0, 1), Container::new(0.0, 140.0, 300.0, 2)];
+            let mut cols = nocturne_model::tablecols::parse("1:130,170");
+            let mut justified = nocturne_model::justify::parse("2");
+            ctx.data_mut(|d| {
+                d.insert_temp(selected_object_id(), (0usize, "image".to_string(), page_key.clone()));
+            });
+            let moved = run_del(&ctx, &mut blocks, &mut boxes, &mut cols, &mut justified);
+            assert!(moved.changed.columns, "sole delete_object must report columns changed");
+            assert!(moved.justified, "sole delete_object must report justified changed");
+            assert_eq!(cols.of(0), Some([130.0_f32, 170.0].as_slice()));
+            assert!(justified.has(1) && !justified.has(2));
+        }
+
+        // 3b. Embedded object delete (`delete_object`) when container holds multiple blocks.
+        {
+            let ctx = egui::Context::default();
+            let mut blocks = page("lead\n\n![pic](assets/a.png)\n\n| h1 | h2 |\n| --- | --- |\n| 1 | 2 |\n\njustified\n");
+            let mut boxes = vec![Container::new(0.0, 0.0, 300.0, 2), Container::new(0.0, 180.0, 300.0, 2)];
+            let mut cols = nocturne_model::tablecols::parse("2:140,160");
+            let mut justified = nocturne_model::justify::parse("3");
+            ctx.data_mut(|d| {
+                d.insert_temp(selected_object_id(), (1usize, "image".to_string(), page_key.clone()));
+            });
+            let moved = run_del(&ctx, &mut blocks, &mut boxes, &mut cols, &mut justified);
+            assert!(moved.changed.columns, "in-container delete_object must report columns changed");
+            assert!(moved.justified, "in-container delete_object must report justified changed");
+            assert_eq!(boxes[0].blocks, 1);
+            assert_eq!(cols.of(1), Some([140.0_f32, 160.0].as_slice()));
+            assert!(justified.has(2) && !justified.has(3));
+        }
+    }
+
+    #[test]
+    fn arrow_right_from_embedded_object_in_later_container_grows_owning_container() {
+        let t = Theme::DEFAULT.tokens();
+        let screen = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 800.0));
+        let page_dir = std::path::Path::new("page-arrow-right-box");
+        let page_key = page_dir.to_string_lossy().into_owned();
+        let ctx = egui::Context::default();
+
+        // Container 0 holds block 0 ("first"); container 1 (k = 1 > 0) holds block 1 (an embedded image).
+        let mut blocks = page("first\n\n![pic](assets/a.png)\n");
+        let mut boxes = vec![Container::new(0.0, 0.0, 300.0, 1), Container::new(340.0, 0.0, 300.0, 1)];
+        let mut caret: Option<Caret> = None;
+        let mut cols = nocturne_model::tablecols::Widths::default();
+        let mut justified = nocturne_model::justify::Justified::default();
+
+        ctx.data_mut(|d| {
+            d.insert_temp(selected_object_id(), (1usize, "image".to_string(), page_key));
+        });
+        let right = egui::Event::Key { key: Key::ArrowRight, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        let mut moved = Moved::default();
+        let mut out = ctx.run_ui(egui::RawInput { events: vec![right], screen_rect: Some(screen), ..Default::default() }, |ui| {
+            crate::fonts::install_once(ui.ctx());
+            moved = show(
+                ui,
+                &mut blocks,
+                &mut boxes,
+                &mut caret,
+                page_dir,
+                &t,
+                Some(nocturne_model::Dir::Ltr),
+                &mut cols,
+                &mut justified,
+                &mut None,
+                "",
+                1.0,
+                None,
+            );
+        });
+        out.textures_delta.clear();
+
+        assert!(moved.changed.blocks && moved.boxes);
+        assert_eq!(blocks.len(), 3, "a new empty paragraph is inserted after the embedded image");
+        assert_eq!(boxes.iter().map(|b| b.blocks).collect::<Vec<_>>(), vec![1, 2], "container 1 (not container 0) must own the inserted paragraph");
+        assert_eq!(caret.as_ref().map(|c| c.block), Some(2), "caret moves into the new paragraph inside container 1");
     }
 }

@@ -224,9 +224,39 @@ fn html_pieces(body: &str) -> Vec<Piece> {
     pieces
 }
 
-fn fence(line: &str) -> bool {
+fn fence_open(line: &str) -> Option<(char, usize)> {
     let t = line.trim_start();
-    t.starts_with("```") || t.starts_with("~~~")
+    let (ch, byte) = match t.as_bytes().first().copied()? {
+        b'`' => ('`', b'`'),
+        b'~' => ('~', b'~'),
+        _ => return None,
+    };
+    let len = t.bytes().take_while(|&b| b == byte).count();
+    if len < 3 {
+        return None;
+    }
+    if ch == '`' && t.get(len..).is_some_and(|rest| rest.contains('`')) {
+        return None;
+    }
+    Some((ch, len))
+}
+
+fn fence_closes(line: &str, ch: char, len: usize) -> bool {
+    let t = line.trim();
+    t.len() >= len && t.chars().all(|c| c == ch)
+}
+
+fn update_fence(open_fence: &mut Option<(char, usize)>, line: &str) {
+    match *open_fence {
+        Some((ch, len)) => {
+            if fence_closes(line, ch, len) {
+                *open_fence = None;
+            }
+        }
+        None => {
+            *open_fence = fence_open(line);
+        }
+    }
 }
 
 fn markdown_pieces(body: &str) -> Vec<Piece> {
@@ -234,7 +264,7 @@ fn markdown_pieces(body: &str) -> Vec<Piece> {
     let mut stray: Vec<&str> = Vec::new();
     // The box being collected: its opening tag and the lines so far.
     let mut open: Option<(String, Vec<&str>)> = None;
-    let mut in_fence = false;
+    let mut open_fence: Option<(char, usize)> = None;
     let flush = |stray: &mut Vec<&str>, pieces: &mut Vec<Piece>| {
         let text = stray.join("\n");
         stray.clear();
@@ -249,25 +279,21 @@ fn markdown_pieces(body: &str) -> Vec<Piece> {
         let t = line.trim();
         match open.as_mut() {
             None => {
-                if !in_fence && is_box_tag(t) && t.ends_with('>') {
+                if open_fence.is_none() && is_box_tag(t) && t.ends_with('>') {
                     flush(&mut stray, &mut pieces);
                     open = Some((t.to_string(), Vec::new()));
                     continue;
                 }
-                if fence(line) {
-                    in_fence = !in_fence;
-                }
+                update_fence(&mut open_fence, line);
                 stray.push(line);
             }
             Some((tag, lines)) => {
-                if !in_fence && t == "</div>" {
+                if open_fence.is_none() && t == "</div>" {
                     finish(tag, lines, &mut pieces);
                     open = None;
                     continue;
                 }
-                if fence(line) {
-                    in_fence = !in_fence;
-                }
+                update_fence(&mut open_fence, line);
                 lines.push(line);
             }
         }
@@ -483,5 +509,57 @@ mod tests {
         let body = "<p><span style=\"font-size: 10pt\">kept</span></p><p><span class=\"other\">lost</span></p>";
         let (blocks, _) = read(PageFormat::Html, body);
         assert_eq!(span_audit(body, &blocks), SpanAudit { raw_tags: 2, styled: 1 });
+    }
+
+    #[test]
+    fn markdown_boxes_track_multi_backtick_and_mixed_fences() {
+        // A 4-backtick fence containing a 3-backtick fence and a literal `</div>` must stay one box.
+        let nested_ticks = concat!(
+            "<div class=\"nc-box\" data-x=\"10\" data-y=\"20\" data-width=\"400\">\n\n",
+            "````markdown\n",
+            "```html\n",
+            "</div>\n",
+            "```\n",
+            "````\n\n",
+            "after\n\n",
+            "</div>\n",
+        );
+        let (blocks, boxes) = read(PageFormat::Cmgfm, nested_ticks);
+        assert_eq!(boxes, Some(vec![Container::new(10.0, 20.0, 400.0, 2)]));
+        assert!(matches!(&blocks[0], Block::Code { lang, text } if lang == "markdown" && text.contains("</div>")), "{blocks:?}");
+        assert!(matches!(&blocks[1], Block::Paragraph(_)), "{blocks:?}");
+
+        // A tilde fence containing backticks and `</div>` must not close on backticks.
+        let mixed = concat!(
+            "<div class=\"nc-box\" data-x=\"0\" data-y=\"0\" data-width=\"300\">\n\n",
+            "~~~\n",
+            "```\n",
+            "</div>\n",
+            "~~~\n\n",
+            "</div>\n",
+            "<div class=\"nc-box\" data-x=\"320\" data-y=\"0\" data-width=\"300\">\n\n",
+            "second\n\n",
+            "</div>\n",
+        );
+        let (_, boxes) = read(PageFormat::Cmgfm, mixed);
+        assert_eq!(boxes.as_ref().map(Vec::len), Some(2), "mixed fence kept both boxes intact: {boxes:?}");
+
+        // An inline code span at line start must not open a fence and swallow the closing `</div>`.
+        let inline_span = concat!(
+            "<div class=\"nc-box\" data-x=\"0\" data-y=\"0\" data-width=\"300\">\n\n",
+            "``` `` ```\n\n",
+            "</div>\n",
+            "<div class=\"nc-box\" data-x=\"320\" data-y=\"0\" data-width=\"300\">\n\n",
+            "second\n\n",
+            "</div>\n",
+        );
+        let (_, boxes) = read(PageFormat::Cmgfm, inline_span);
+        assert_eq!(boxes, Some(vec![Container::new(0.0, 0.0, 300.0, 1), Container::new(320.0, 0.0, 300.0, 1)]));
+
+        // A 4-backtick code block outside any box containing a 3-backtick line and an nc-box tag is only code.
+        let outside =
+            concat!("````markdown\n", "```\n", "<div class=\"nc-box\" data-x=\"1\" data-y=\"2\" data-width=\"300\">\n", "</div>\n", "````\n");
+        let (_, boxes) = read(PageFormat::Cmgfm, outside);
+        assert_eq!(boxes, None);
     }
 }

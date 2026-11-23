@@ -95,6 +95,9 @@ pub fn parse(text: &str) -> Vec<Nib> {
 /// Moves the nib at `from` one place along, and says where it ended up. A nib at either
 /// end stays where it is.
 pub fn shift(rack: &mut [Nib], from: usize, left: bool) -> usize {
+    if from >= rack.len() {
+        return from;
+    }
     if left && from > 0 {
         rack.swap(from, from - 1);
         return from - 1;
@@ -184,6 +187,16 @@ mod tests {
         assert_eq!(shift(&mut rack, 0, false), 1, "back the other way");
         let last = rack.len() - 1;
         assert_eq!(shift(&mut rack, last, false), last, "and stops at that end too");
+        // Out-of-bounds indices and empty racks never panic or overflow.
+        let snapshot = rack.clone();
+        let len = rack.len();
+        assert_eq!(shift(&mut rack, len, true), len);
+        assert_eq!(shift(&mut rack, len + 5, true), len + 5);
+        assert_eq!(shift(&mut rack, usize::MAX, false), usize::MAX);
+        assert_eq!(rack, snapshot);
+        let mut empty: Vec<Nib> = Vec::new();
+        assert_eq!(shift(&mut empty, 0, true), 0);
+        assert_eq!(shift(&mut empty, 0, false), 0);
     }
 
     #[test]

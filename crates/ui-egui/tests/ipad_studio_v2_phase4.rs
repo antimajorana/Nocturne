@@ -545,7 +545,7 @@ fn service_failure_shows_redacted_error_and_leaves_ink_intact() {
         [(1, 401u16, "The recognition service did not accept the key."), (2, 500u16, "The recognition service answered with status 500.")]
     {
         server.reply(code, json!({ "error": { "message": format!("err {SECRET} {LEAK}") } }));
-        lasso_page_rect(&mut h, 160.0, 180.0, 240.0, 260.0);
+        lasso_page_rect(&mut h, 145.0, 165.0, 255.0, 275.0);
         click_named(&mut h, "Convert to LaTeX");
         wait_until(&mut h, "failure handled", |h| server.count() == req_no && area(h, "math-ocr-window").is_none());
         assert_eq!((h.state().status(), h.state().ink_stroke_count()), (expected, 2));

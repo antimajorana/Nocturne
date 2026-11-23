@@ -74,7 +74,7 @@ pub fn long_from_iso_at(iso: &str, offset: i32) -> Option<String> {
     let y: i64 = parts.next()?.parse().ok()?;
     let m: u32 = parts.next()?.parse().ok()?;
     let d: u32 = parts.next()?.parse().ok()?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    if parts.next().is_some() || !(-999_999..=999_999).contains(&y) || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
         return None;
     }
     let hm = time.get(..5).filter(|s| {
@@ -87,7 +87,11 @@ pub fn long_from_iso_at(iso: &str, offset: i32) -> Option<String> {
     }
     // Moved onto the user's clock, which can also move the day, the month or the year.
     let shift = if utc { i64::from(offset) } else { 0 };
-    let at = days_from_civil(y, m, d) * 86_400 + hours * 3_600 + minutes * 60 + shift;
+    let at = days_from_civil(y, m, d)
+        .checked_mul(86_400)?
+        .checked_add(hours.checked_mul(3_600)?)?
+        .checked_add(minutes.checked_mul(60)?)?
+        .checked_add(shift)?;
     let days = at.div_euclid(86_400);
     let (y, m, d) = civil_from_days(days);
     let rem = at.rem_euclid(86_400);
@@ -130,6 +134,21 @@ mod tests {
         for bad in ["", "2026-10-17", "x", "2026-13-01T00:00:00Z", "2026-10-99T00:00:00Z", "2026-10-17Txx:yy", "----T::"] {
             assert_eq!(long_from_iso(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn extreme_years_and_extra_date_segments_return_none_without_overflow() {
+        for bad in [
+            "9223372036854775807-01-01T00:00:00Z",
+            "1000000-01-01T00:00:00Z",
+            "999999999999-12-31T23:59:00Z",
+            "2026-10-17-01T18:29:00Z",
+            "2026-10-17-extraT18:29:00Z",
+        ] {
+            assert_eq!(long_from_iso_at(bad, 0), None, "{bad}");
+            assert_eq!(long_from_iso_at(bad, i32::MAX), None, "{bad}");
+        }
+        assert!(long_from_iso_at("999999-12-31T23:59:00Z", 0).is_some());
     }
 
     #[test]

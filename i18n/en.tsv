@@ -1127,3 +1127,12 @@
 @id	ui.ocr_model_remove	Remove model
 @id	ui.ocr_mathpix_incomplete	Mathpix needs both an App ID and a key.
 @id	ui.ocr_error_model_not_installed	Download the local math model first in Tool Settings → Recognition service.
+@id	ui.settings	Settings
+@id	ui.handwriting_ocr_enable	Recognise handwriting (text)
+@id	ui.handwriting_ocr_enable_tip	Turn on handwriting-to-text conversion for lassoed ink strokes.
+@id	ui.ocr_convert_to_text	Convert to Text
+@id	ui.ocr_convert_to_text_tip	Convert the selected handwritten notes into editable text.
+@id	ui.ocr_text_window_title	Recognise handwriting
+@id	ui.ocr_text_edit_label	Recognised text
+@id	ui.ocr_insert_text	Insert text
+@id	ui.ocr_recognition_heading	Handwriting & equation recognition

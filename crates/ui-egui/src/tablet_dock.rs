@@ -8,7 +8,11 @@ use crate::tablet_nibs::{DOCK_NIB_ALONG, nib_colors_for_theme, nib_slot_size, ni
 use crate::theme::{RADIUS_PILL, RADIUS_POPUP, Tokens};
 use egui::{Align2, Context, CornerRadius, Id, Order, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use nocturne_engine::{DockRoster, DockTool, ToolbarDock};
-use nocturne_ink::{Tool, rack, shapes::Shape};
+use nocturne_ink::{
+    Tool,
+    rack::{self, Nib},
+    shapes::Shape,
+};
 
 /// Natural along-axis extent of the visible tools inside the dock scroll region, so horizontal
 /// docks size cleanly on frame 1 (no multi-frame creep) and vertical docks hug their content.
@@ -29,16 +33,14 @@ fn tools_natural_extent(roster: DockRoster, rack_len: usize) -> f32 {
                     add(DOCK_NIB_ALONG);
                 }
             }
-            DockTool::Eraser => {
-                add(40.0);
-                add(40.0);
-            }
             DockTool::History => {
                 add(40.0);
                 add(40.0);
                 add(6.0);
             }
-            DockTool::Write | DockTool::Lasso | DockTool::Select | DockTool::Shapes | DockTool::Picture | DockTool::MathOcr => add(40.0),
+            DockTool::Write | DockTool::Eraser | DockTool::Lasso | DockTool::Select | DockTool::Shapes | DockTool::Picture | DockTool::MathOcr => {
+                add(40.0);
+            }
         }
     }
     extent.max(40.0)
@@ -181,22 +183,6 @@ pub fn show_pencil_pill(
                                                 acts.push(Act::InkPointer(Pointer::Erase));
                                             }
                                         }
-                                        let auto_btn = ui
-                                            .add(
-                                                egui::Button::new(
-                                                    RichText::new(crate::tl_id!("ui.eraser_auto_short")).small().color(if view.eraser_auto_return {
-                                                        t.accent_text
-                                                    } else {
-                                                        t.muted
-                                                    }),
-                                                )
-                                                .selected(view.eraser_auto_return)
-                                                .min_size(vec2(40.0, 40.0)),
-                                            )
-                                            .on_hover_text(crate::tl_id!("ui.eraser_auto_return_tip"));
-                                        if auto_btn.clicked() {
-                                            acts.push(Act::ToggleEraserAutoReturn);
-                                        }
                                     }
                                     DockTool::Lasso => {
                                         if studio_icon_btn(ui, Icon::Lasso, view.pointer == Pointer::Lasso, true, crate::tl_id!("ui.lasso_select"), t)
@@ -295,10 +281,19 @@ pub fn show_pencil_pill(
             });
         });
 
+    let dismiss_popover = popover_open
+        && (ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            || ctx.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !area_resp.response.rect.contains(p))));
+    if dismiss_popover {
+        (palette_for, eraser_open, shapes_open) = (None, false, false);
+    }
     ctx.data_mut(|d| {
         d.insert_temp(palette_id, palette_for);
         d.insert_temp(shapes_open_id, shapes_open);
         d.insert_temp(eraser_open_id, eraser_open);
+        if palette_for.is_none() {
+            d.remove::<Option<usize>>(Id::unique("studio-rgb-picker-open"));
+        }
     });
     (acts, Some(area_resp.response.rect))
 }
@@ -316,19 +311,21 @@ fn draw_tool_popovers(
 ) {
     ui.scope(|ui| {
         ui.set_max_width(popover_max_w);
+        let rgb_open_id = Id::unique("studio-rgb-picker-open");
         if let Some(nib_idx) = *palette_for
             && let Some(&nib) = view.rack.get(nib_idx)
             && view.pointer == Pointer::Draw
             && view.nib == nib_idx
         {
             crate::ribbon::mark_popup_open(ui.ctx());
+            let mut rgb_open = ui.ctx().data(|d| d.get_temp::<Option<usize>>(rgb_open_id)) == Some(Some(nib_idx));
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
                 for tool in Tool::ALL {
                     let chosen_tool = nib.tool == tool;
                     let tool_label = crate::tl!(tool.label());
                     let btn = ui.add(
-                        egui::Button::new(RichText::new(tool_label).small().color(if chosen_tool { t.accent_text } else { t.text }))
+                        egui::Button::new(RichText::new(tool_label).small().color(if chosen_tool { t.strong } else { t.text }))
                             .selected(chosen_tool)
                             .min_size(vec2(56.0, 36.0)),
                     );
@@ -358,10 +355,12 @@ fn draw_tool_popovers(
                         ui.painter().circle_stroke(sw.center(), 13.5, Stroke::new(2.0, t.accent));
                     }
                     if sr.clicked() {
-                        let mut updated = nib;
-                        updated.colour = rgb;
-                        acts.push(Act::InkRack(RackEdit::Set(nib_idx, updated)));
+                        acts.push(Act::InkRack(RackEdit::Set(nib_idx, Nib::new(nib.tool, rgb, nib.tenths))));
                     }
+                }
+                let is_preset = NIB_COLOURS.contains(&nib.colour);
+                if crate::ink_color::custom_color_button(ui, vec2(36.0, 36.0), rgb_open, nib.colour, is_preset, t).clicked() {
+                    rgb_open = !rgb_open;
                 }
                 ui.separator();
                 for tenths in rack::THICKNESSES {
@@ -372,15 +371,21 @@ fn draw_tool_popovers(
                     paint_studio_btn_chrome(ui, wr, &ws, chosen, true, t);
                     ui.painter().circle_filled(wr.center(), (w * 0.5).clamp(1.5, 8.5), if chosen { t.accent } else { t.text });
                     if ws.clicked() {
-                        let mut updated = nib;
-                        updated.tenths = tenths;
-                        acts.push(Act::InkRack(RackEdit::Set(nib_idx, updated)));
+                        acts.push(Act::InkRack(RackEdit::Set(nib_idx, Nib::new(nib.tool, nib.colour, tenths))));
                     }
                 }
             });
+            if rgb_open {
+                ui.add_space(4.0);
+                if let Some(rgb) = crate::ink_color::show_rgb_picker(ui, Id::unique("studio-nib-rgb-picker"), nib.colour, t) {
+                    acts.push(Act::InkRack(RackEdit::Set(nib_idx, Nib::new(nib.tool, rgb, nib.tenths))));
+                }
+            }
+            ui.ctx().data_mut(|d| d.insert_temp(rgb_open_id, rgb_open.then_some(nib_idx)));
             ui.separator();
         } else if palette_for.is_some() {
             *palette_for = None;
+            ui.ctx().data_mut(|d| d.remove::<Option<usize>>(rgb_open_id));
         }
 
         if eraser_open {
@@ -389,7 +394,7 @@ fn draw_tool_popovers(
                 ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
                 for (pixel, label) in [(false, crate::tl_id!("ui.object_eraser")), (true, crate::tl_id!("ui.pixel_eraser"))] {
                     let chosen = view.eraser_pixel == pixel;
-                    let button = egui::Button::new(RichText::new(label).small().color(if chosen { t.accent_text } else { t.text }))
+                    let button = egui::Button::new(RichText::new(label).small().color(if chosen { t.strong } else { t.text }))
                         .selected(chosen)
                         .min_size(vec2(96.0, 36.0));
                     if ui.add(button).clicked() && !chosen {
@@ -409,6 +414,14 @@ fn draw_tool_popovers(
                         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                         acts.push(Act::EraserWidthTenths((width * 10.0).round() as u16));
                     }
+                }
+                ui.separator();
+                let auto_color = if view.eraser_auto_return { t.strong } else { t.text };
+                let auto_btn = egui::Button::new(RichText::new(crate::tl_id!("ui.eraser_auto_return")).small().color(auto_color))
+                    .selected(view.eraser_auto_return)
+                    .min_size(vec2(140.0, 36.0));
+                if ui.add(auto_btn).on_hover_text(crate::tl_id!("ui.eraser_auto_return_tip")).clicked() {
+                    acts.push(Act::ToggleEraserAutoReturn);
                 }
             });
             ui.separator();

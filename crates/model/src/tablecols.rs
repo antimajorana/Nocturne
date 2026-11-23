@@ -232,7 +232,12 @@ impl Widths {
     /// Sets one column's width, leaving the others as they are. `all` is what the table's
     /// columns are at now, so a table dragged for the first time keeps the look it had.
     pub fn set(&mut self, block: usize, column: usize, width: f32, all: &[f32]) {
-        if column >= all.len() || all.len() > MAX_COLUMNS || self.tables.len() >= MAX_TABLES && self.layout(block).is_none() {
+        if !width.is_finite()
+            || all.iter().any(|w| !w.is_finite())
+            || column >= all.len()
+            || all.len() > MAX_COLUMNS
+            || self.tables.len() >= MAX_TABLES && self.layout(block).is_none()
+        {
             return;
         }
         let mut widths: Vec<f32> = all.iter().map(|w| w.clamp(MIN_WIDTH, MAX_WIDTH)).collect();
@@ -266,6 +271,9 @@ impl Widths {
     /// width stays with the column it was dragged for (issue #154). True when anything
     /// changed; a table never dragged has nothing kept and stays that way.
     pub fn insert_column(&mut self, block: usize, at: usize, width: f32) -> bool {
+        if !width.is_finite() {
+            return false;
+        }
         // An aligned cell keeps its alignment, moved along with its column (issue #170).
         let cells = self.move_cells(block, |(r, c)| Some((r, if c >= at { c + 1 } else { c })));
         let Some(layout) = self.tables.iter_mut().find(|l| l.block == block) else { return cells };
@@ -364,6 +372,7 @@ pub fn parse(text: &str) -> Widths {
             .filter(|w| !w.is_empty())
             .take(MAX_COLUMNS)
             .filter_map(|w| w.parse::<f32>().ok())
+            .filter(|v| v.is_finite())
             .map(|w| w.clamp(MIN_WIDTH, MAX_WIDTH))
             .collect();
         if widths.is_empty() && !borderless || tables.iter().any(|have| have.block == at) {
@@ -656,5 +665,22 @@ mod tests {
         assert!(parse("2:").is_empty(), "a table with no widths is no entry");
         assert_eq!(parse("1:bad,200").of(1), Some([200.0].as_slice()), "what can be read is kept");
         assert_eq!(parse("1:100; 1:200").of(1), Some([100.0].as_slice()), "the first entry for a table wins");
+    }
+
+    #[test]
+    fn non_finite_widths_are_rejected_everywhere() {
+        assert!(parse("1:NaN,inf,-inf").is_empty());
+        assert_eq!(parse("1:NaN,180,inf").of(1), Some([180.0].as_slice()));
+
+        let mut widths = Widths::default();
+        widths.set(1, 0, f32::NAN, &[120.0, 160.0]);
+        widths.set(1, 0, f32::INFINITY, &[120.0, 160.0]);
+        widths.set(1, 0, 140.0, &[120.0, f32::NAN]);
+        assert!(widths.is_empty());
+
+        widths.set(1, 0, 140.0, &[120.0, 160.0]);
+        assert!(!widths.insert_column(1, 1, f32::NAN));
+        assert!(!widths.insert_column(1, 1, f32::NEG_INFINITY));
+        assert_eq!(widths.of(1), Some([140.0, 160.0].as_slice()));
     }
 }
