@@ -365,7 +365,10 @@ fn openai_gets_a_chat_completion_with_the_picture_as_a_data_address() {
     assert!(body["max_completion_tokens"].as_u64().is_some() && body.get("max_tokens").is_none());
     let content = &body["messages"][0]["content"];
     assert_eq!(content[0]["type"], "text");
-    assert_eq!(content[1], json!({ "type": "image_url", "image_url": { "url": format!("data:image/png;base64,{}", base64(&job.png)) } }));
+    assert_eq!(
+        content[1],
+        json!({ "type": "image_url", "image_url": { "url": format!("data:image/png;base64,{}", base64(&job.png)), "detail": "high" } })
+    );
 
     server.reply(200, json!({ "choices": [{ "finish_reason": "stop", "message": { "content": null, "refusal": "I cannot help with that." } }] }));
     assert!(matches!(recognise(&s), Err(OcrError::Refused)));

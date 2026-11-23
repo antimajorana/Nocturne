@@ -167,8 +167,9 @@ pub struct Pad {
     erased_since_press: bool,
     /// Latched on pointer release when `erased_since_press` was true; consumed by [`Pad::take_finished_erase`].
     finished_erase_gesture: bool,
-    /// Where the pointer was when a move or a stretch began, and the box as it was then.
-    grabbed: Option<(egui::Pos2, (f32, f32, f32, f32), Grab)>,
+    /// Where the pointer was when a move or a stretch began, the box as it was then, the grab kind,
+    /// and whether the pointer has actually moved since the grab started.
+    grabbed: Option<(egui::Pos2, (f32, f32, f32, f32), Grab, bool)>,
     /// How far held ink was moved by hand in the ordinary pointer since the window last asked,
     /// in page points: the boxes picked up with it follow ([`Pad::take_shift`]).
     shift: (f32, f32),
@@ -615,14 +616,15 @@ fn update_held_hit_cache(
 ) -> Option<((f32, f32, f32, f32), egui::Rect, egui::Rect)> {
     let b = pick::bounds(&pad.drawing, &pad.held)?;
     let held_box = egui::Rect::from_min_max(origin + vec2(b.0 * zoom, b.1 * zoom), origin + vec2(b.2 * zoom, b.3 * zoom)).expand(3.0);
-    let area = held_box.expand(handle_reach).intersect(body);
+    let area = held_box.intersect(body);
+    let interact_area = held_box.expand(handle_reach).intersect(body);
     let corners = [held_box.left_top(), held_box.right_top(), held_box.left_bottom(), held_box.right_bottom()]
         .map(|corner| egui::Rect::from_center_size(corner, vec2(handle_reach * 2.0, handle_reach * 2.0)).intersect(body));
     ctx.data_mut(|d| {
         d.insert_temp(held_area_id(), area);
         d.insert_temp(held_handles_id(), corners);
     });
-    Some((b, held_box, area))
+    Some((b, held_box, interact_area))
 }
 
 /// Moves or scales `pad.held` from its initial `was` bounds by `(dx, dy)` page points.
@@ -658,6 +660,63 @@ fn apply_grab_transform(pad: &mut Pad, was: (f32, f32, f32, f32), grab: Grab, dx
     }
 }
 
+/// Returns the page-space bounds and screen-space selection box around `held`, if any strokes exist.
+fn held_box_rect(drawing: &Drawing, held: &[usize], origin: egui::Pos2, zoom: f32) -> (Option<(f32, f32, f32, f32)>, Option<egui::Rect>) {
+    let bounds = pick::bounds(drawing, held);
+    let rect =
+        bounds.map(|(x0, y0, x1, y1)| egui::Rect::from_min_max(origin + vec2(x0 * zoom, y0 * zoom), origin + vec2(x1 * zoom, y1 * zoom)).expand(3.0));
+    (bounds, rect)
+}
+
+/// Advances an active move or corner-resize grab while `down` is held, or finishes it on release.
+/// Returns `true` when the grab finished and committed a change.
+fn step_grab(ui: &Ui, pad: &mut Pad, down: bool, here: Option<egui::Pos2>, zoom: f32) -> bool {
+    let Some((from, was, grab, moved)) = pad.grabbed else {
+        return false;
+    };
+    if down {
+        if let Some(here_pos) = here {
+            // The ink follows the pointer from where it was taken hold of, so a
+            // long drag cannot drift away from the hand.
+            let z = zoom.max(0.01);
+            let (dx, dy) = ((here_pos.x - from.x) / z, (here_pos.y - from.y) / z);
+            if dx != 0.0 || dy != 0.0 {
+                apply_grab_transform(pad, was, grab, dx, dy, false);
+                if let Some(g) = pad.grabbed.as_mut() {
+                    g.3 = true;
+                }
+            }
+            ui.ctx().request_repaint();
+        }
+        false
+    } else {
+        pad.grabbed = None;
+        moved
+    }
+}
+
+/// Cursor icon for `Pointer::Lasso`: reflects active grabs, hover over held-ink handles/body, or crosshair.
+fn lasso_cursor(pad: &Pad, origin: egui::Pos2, zoom: f32, handle_reach: f32, here: Option<egui::Pos2>) -> egui::CursorIcon {
+    match pad.grabbed {
+        Some((_, _, Grab::Move, _)) => egui::CursorIcon::Grabbing,
+        Some((_, _, Grab::Corner(r, b), _)) if r == b => egui::CursorIcon::ResizeNwSe,
+        Some((_, _, Grab::Corner(..), _)) => egui::CursorIcon::ResizeNeSw,
+        None if pad.loop_now.is_empty() && !pad.held.is_empty() => {
+            let (_, held_box) = held_box_rect(&pad.drawing, &pad.held, origin, zoom);
+            match (held_box, here) {
+                (Some(box_), Some(pos)) => match grab_corner(box_, pos, handle_reach) {
+                    Some(Grab::Corner(r, b)) if r == b => egui::CursorIcon::ResizeNwSe,
+                    Some(Grab::Corner(..)) => egui::CursorIcon::ResizeNeSw,
+                    _ if box_.contains(pos) => egui::CursorIcon::Grab,
+                    _ => egui::CursorIcon::Crosshair,
+                },
+                _ => egui::CursorIcon::Crosshair,
+            }
+        }
+        None => egui::CursorIcon::Crosshair,
+    }
+}
+
 /// Held ink in the ordinary pointer (a selection box picked it up): a drag inside its box moves
 /// it, one on a corner stretches it, Delete throws it away and Escape lets go. Only the box
 /// takes the pointer, so the words and boxes around it are as they always are.
@@ -675,7 +734,7 @@ fn held_in_write(
     let resp = ui.interact(area, ui.id().with("ink-held"), Sense::drag());
     let here = ui.ctx().pointer_interact_pos();
     if resp.hovered() || resp.dragged() {
-        let corner = pad.grabbed.map(|(.., g)| g).or_else(|| here.and_then(|p| grab_corner(held_box, p, handle_reach)));
+        let corner = pad.grabbed.map(|(_, _, g, _)| g).or_else(|| here.and_then(|p| grab_corner(held_box, p, handle_reach)));
         ui.ctx().set_cursor_icon(match corner {
             Some(Grab::Corner(right, bottom)) if right == bottom => egui::CursorIcon::ResizeNwSe,
             Some(Grab::Corner(..)) => egui::CursorIcon::ResizeNeSw,
@@ -703,20 +762,25 @@ fn held_in_write(
     if resp.drag_started()
         && let Some(from) = ui.input(|i| i.pointer.press_origin()).or(here)
     {
-        pad.grabbed = Some((from, b, grab_corner(held_box, from, handle_reach).unwrap_or(Grab::Move)));
+        pad.grabbed = Some((from, b, grab_corner(held_box, from, handle_reach).unwrap_or(Grab::Move), false));
     }
     let mut changed = false;
-    if let Some((from, was, grab)) = pad.grabbed {
+    if let Some((from, was, grab, moved)) = pad.grabbed {
         if resp.dragged() {
             if let Some(here) = here {
                 let z = zoom.max(0.01);
                 let (dx, dy) = ((here.x - from.x) / z, (here.y - from.y) / z);
-                apply_grab_transform(pad, was, grab, dx, dy, true);
+                if dx != 0.0 || dy != 0.0 {
+                    apply_grab_transform(pad, was, grab, dx, dy, true);
+                    if let Some(g) = pad.grabbed.as_mut() {
+                        g.3 = true;
+                    }
+                }
                 ui.ctx().request_repaint();
             }
         } else {
             pad.grabbed = None;
-            changed = true;
+            changed = moved;
         }
     }
     if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -802,7 +866,7 @@ pub fn show_with_input_and_handles(
         pad.eraser_last = None;
         pad.erased_since_press = false;
         pad.loop_now.clear();
-        dropped_grab = pad.grabbed.take().is_some();
+        dropped_grab = pad.grabbed.take().is_some_and(|(.., moved)| moved);
         pad.dirty |= dropped_grab;
         pad.touched |= dropped_grab;
     }
@@ -911,7 +975,7 @@ pub fn show_with_input_and_handles(
             if allow_stroke {
                 changed |= held_in_write(ui, origin, pad, zoom, handle_reach, b, held_box, area);
             } else {
-                changed |= pad.grabbed.take().is_some();
+                changed |= pad.grabbed.take().is_some_and(|(.., moved)| moved);
             }
         } else {
             pad.let_go();
@@ -938,7 +1002,7 @@ pub fn show_with_input_and_handles(
         pad.predict_history.clear();
         pad.shape_from = None;
         pad.eraser_last = None;
-        changed |= pad.grabbed.take().is_some();
+        changed |= pad.grabbed.take().is_some_and(|(.., moved)| moved);
         if !pad.held.is_empty() && update_held_hit_cache(ui.ctx(), body, origin, pad, zoom, handle_reach).is_none() {
             pad.let_go();
             clear_held_hit_cache(ui.ctx());
@@ -985,14 +1049,6 @@ pub fn show_with_input_and_handles(
         laser(ui, &painter, body, origin, zoom, resp.is_pointer_button_down_on() && !over_foreground);
         return dropped_grab;
     }
-    ui.ctx().set_cursor_icon(match pen.pointer {
-        Pointer::Erase => egui::CursorIcon::NotAllowed,
-        Pointer::Pick => egui::CursorIcon::Grab,
-        // The page itself moves under the hand (the window does the moving, `app.rs`).
-        Pointer::Pan if resp.is_pointer_button_down_on() => egui::CursorIcon::Grabbing,
-        Pointer::Pan => egui::CursorIcon::Grab,
-        _ => egui::CursorIcon::Crosshair,
-    });
 
     // Not egui's drag, which only begins once the pointer has travelled far enough: a pen
     // put down and lifted in one place is a dot, and a dot is ink.
@@ -1173,7 +1229,28 @@ pub fn show_with_input_and_handles(
             }
         }
         Pointer::Lasso => {
-            if down {
+            if !pad.held.is_empty()
+                && down
+                && pad.grabbed.is_none()
+                && pad.loop_now.is_empty()
+                && let Some(here_pos) = here
+            {
+                let (held_bounds, held_box) = held_box_rect(&pad.drawing, &pad.held, origin, zoom);
+                let corner = held_box.and_then(|b| grab_corner(b, here_pos, handle_reach));
+                match (corner, held_box, held_bounds) {
+                    (Some(c), _, Some(bounds)) => pad.grabbed = Some((here_pos, bounds, c, false)),
+                    (None, Some(b), Some(bounds)) if b.contains(here_pos) => pad.grabbed = Some((here_pos, bounds, Grab::Move, false)),
+                    _ => {
+                        if let Some((x, y)) = at {
+                            pad.loop_now.push((x, y));
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                }
+            }
+            if pad.grabbed.is_some() {
+                changed |= step_grab(ui, pad, down, here, zoom);
+            } else if down {
                 if let Some((x, y)) = at {
                     // Only every few points: a loop of every frame's position is far more
                     // than a ray-casting test needs, and it is thrown away at the end.
@@ -1188,10 +1265,7 @@ pub fn show_with_input_and_handles(
             }
         }
         Pointer::Pick => {
-            let held_bounds = pick::bounds(&pad.drawing, &pad.held);
-            let held_box = held_bounds.map(|(x0, y0, x1, y1)| {
-                egui::Rect::from_min_max(origin + vec2(x0 * zoom, y0 * zoom), origin + vec2(x1 * zoom, y1 * zoom)).expand(3.0)
-            });
+            let (held_bounds, held_box) = held_box_rect(&pad.drawing, &pad.held, origin, zoom);
             if down
                 && pad.grabbed.is_none()
                 && let Some(here_pos) = here
@@ -1202,13 +1276,13 @@ pub fn show_with_input_and_handles(
                 let corner = held_box.and_then(|b| grab_corner(b, here_pos, handle_reach));
                 let pick_radius = if touch_handles { 10.0 / zoom.max(0.15) } else { 3.0 };
                 match (corner, held_box, held_bounds, at) {
-                    (Some(c), _, Some(bounds), _) => pad.grabbed = Some((here_pos, bounds, c)),
-                    (None, Some(b), Some(bounds), _) if b.contains(here_pos) => pad.grabbed = Some((here_pos, bounds, Grab::Move)),
+                    (Some(c), _, Some(bounds), _) => pad.grabbed = Some((here_pos, bounds, c, false)),
+                    (None, Some(b), Some(bounds), _) if b.contains(here_pos) => pad.grabbed = Some((here_pos, bounds, Grab::Move, false)),
                     (_, _, _, Some((x, y))) => match pick::at(&pad.drawing, x, y, pick_radius) {
                         Some(i) => {
                             pad.held = vec![i];
                             if let Some(b) = pick::bounds(&pad.drawing, &pad.held) {
-                                pad.grabbed = Some((here_pos, b, Grab::Move));
+                                pad.grabbed = Some((here_pos, b, Grab::Move, false));
                             }
                         }
                         None => pad.let_go(),
@@ -1216,31 +1290,27 @@ pub fn show_with_input_and_handles(
                     _ => {}
                 }
             }
-            if let Some((from, was, grab)) = pad.grabbed {
-                if down {
-                    if let Some(here_pos) = here {
-                        // The ink follows the pointer from where it was taken hold of, so a
-                        // long drag cannot drift away from the hand.
-                        let z = zoom.max(0.01);
-                        let (dx, dy) = ((here_pos.x - from.x) / z, (here_pos.y - from.y) / z);
-                        apply_grab_transform(pad, was, grab, dx, dy, false);
-                        ui.ctx().request_repaint();
-                    }
-                } else {
-                    pad.grabbed = None;
-                    changed = true;
-                }
-            }
+            changed |= step_grab(ui, pad, down, here, zoom);
         }
         Pointer::Write | Pointer::Pan | Pointer::Laser => {}
     }
-    // Delete throws away whatever is held, however it was picked up, unless a text field owns the keyboard.
-    if !pad.held.is_empty()
-        && !ui.ctx().egui_wants_keyboard_input()
-        && ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
-    {
-        changed |= pad.delete_held();
+    // Escape lets go of held ink in Lasso/Pick; Delete throws away whatever is held, unless a text field owns the keyboard.
+    if !pad.held.is_empty() && !ui.ctx().egui_wants_keyboard_input() {
+        if matches!(pen.pointer, Pointer::Lasso | Pointer::Pick) && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            pad.let_go();
+        } else if ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
+            changed |= pad.delete_held();
+        }
     }
+    ui.ctx().set_cursor_icon(match pen.pointer {
+        Pointer::Erase => egui::CursorIcon::NotAllowed,
+        Pointer::Lasso => lasso_cursor(pad, origin, zoom, handle_reach, here),
+        Pointer::Pick => egui::CursorIcon::Grab,
+        // The page itself moves under the hand (the window does the moving, `app.rs`).
+        Pointer::Pan if resp.is_pointer_button_down_on() => egui::CursorIcon::Grabbing,
+        Pointer::Pan => egui::CursorIcon::Grab,
+        _ => egui::CursorIcon::Crosshair,
+    });
     if pad.held.is_empty() {
         clear_held_hit_cache(ui.ctx());
     } else if update_held_hit_cache(ui.ctx(), body, origin, pad, zoom, handle_reach).is_none() {
@@ -2148,5 +2218,335 @@ mod tests {
         assert_eq!(pad.strokes(), 1, "first undo removes only stroke 2");
         assert!(pad.undo());
         assert_eq!(pad.strokes(), 0, "second undo removes stroke 1");
+    }
+
+    #[test]
+    fn lasso_select_then_immediately_drag_moves_stroke_without_switching_tool() {
+        use crate::ribbon::Pointer;
+        let t = TempDir::new("ink-lasso-auto-move");
+        let mut pad = Pad::of_page(t.path());
+        let mut s = Stroke::new(Tool::Pen, Rgb::BLACK, 4.0);
+        s.add(Dab::new(100.0, 100.0, 1.0));
+        s.add(Dab::new(200.0, 200.0, 1.0));
+        pad.drawing.add(s);
+        pad.kept = pad.drawing.strokes.clone();
+        let before = pick::bounds(&pad.drawing, &[0]).expect("bounds");
+
+        let ctx = egui::Context::default();
+        let body = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(800.0, 600.0));
+        let tokens = crate::theme::Theme::DEFAULT.tokens();
+        let pen = Pen { pointer: Pointer::Lasso, ..Pen::default() };
+
+        let run = |pad: &mut Pad, events: Vec<egui::Event>| -> (bool, egui::CursorIcon) {
+            let input = egui::RawInput { events, screen_rect: Some(body), ..Default::default() };
+            let mut changed = false;
+            let mut out = ctx.run_ui(input, |ui| {
+                changed |= show_with_input_and_handles(ui, body, body, egui::Pos2::ZERO, pad, pen, 1.0, &tokens, 1.0, true, false, false);
+            });
+            out.textures_delta.clear();
+            (changed, out.platform_output.cursor_icon)
+        };
+
+        let (_, cursor) = run(&mut pad, vec![]);
+        assert_eq!(cursor, egui::CursorIcon::Crosshair);
+
+        // Draw a lasso loop around stroke 0 in Pointer::Lasso.
+        run(&mut pad, vec![egui::Event::PointerMoved(egui::pos2(60.0, 60.0)), button(60.0, 60.0, true)]);
+        run(&mut pad, vec![egui::Event::PointerMoved(egui::pos2(240.0, 60.0))]);
+        run(&mut pad, vec![egui::Event::PointerMoved(egui::pos2(240.0, 240.0))]);
+        run(&mut pad, vec![egui::Event::PointerMoved(egui::pos2(60.0, 240.0))]);
+        let (changed, _) = run(&mut pad, vec![button(60.0, 240.0, false)]);
+        assert!(!changed, "selecting with lasso does not mutate strokes");
+        assert_eq!(pad.held, vec![0], "lasso loop selects stroke 0");
+
+        // Hover inside the selection box shows Grab cursor.
+        let inside = egui::pos2(150.0, 150.0);
+        let (_, cursor) = run(&mut pad, vec![egui::Event::PointerMoved(inside)]);
+        assert_eq!(cursor, egui::CursorIcon::Grab);
+
+        // Press and drag immediately inside the selection box without leaving Pointer::Lasso.
+        let (changed, cursor) = run(&mut pad, vec![button(inside.x, inside.y, true)]);
+        assert!(!changed);
+        assert!(pad.is_grabbed(), "pressing inside lasso selection starts a move grab");
+        assert_eq!(cursor, egui::CursorIcon::Grabbing);
+        assert_eq!(pick::bounds(&pad.drawing, &pad.held), Some(before), "initial grab frame must not jump");
+
+        let dest = egui::pos2(190.0, 175.0);
+        let (changed, cursor) = run(&mut pad, vec![egui::Event::PointerMoved(dest)]);
+        assert!(!changed);
+        assert_eq!(cursor, egui::CursorIcon::Grabbing);
+        let moved = pick::bounds(&pad.drawing, &pad.held).expect("moved bounds");
+        assert!((moved.0 - (before.0 + 40.0)).abs() < 0.05 && (moved.1 - (before.1 + 25.0)).abs() < 0.05, "moved {moved:?} vs {before:?}");
+
+        let (changed, cursor) = run(&mut pad, vec![button(dest.x, dest.y, false)]);
+        assert!(changed, "releasing lasso drag reports changed = true");
+        assert!(!pad.is_grabbed());
+        assert!(pad.dirty);
+        assert_eq!(pad.held, vec![0]);
+        assert_eq!(cursor, egui::CursorIcon::Grab, "hovering moved box returns to Grab cursor");
+
+        assert!(pad.can_undo(), "lasso move settles an undo step");
+        assert!(pad.undo());
+        assert_eq!(pick::bounds(&pad.drawing, &[0]), Some(before), "undo restores pre-move bounds");
+    }
+
+    #[test]
+    fn lasso_corner_drag_resizes_held_stroke_and_updates_cursors() {
+        use crate::ribbon::Pointer;
+        let t = TempDir::new("ink-lasso-corner-resize");
+        let mut pad = Pad::of_page(t.path());
+        let mut s = Stroke::new(Tool::Pen, Rgb::BLACK, 4.0);
+        s.add(Dab::new(100.0, 100.0, 1.0));
+        s.add(Dab::new(200.0, 200.0, 1.0));
+        pad.drawing.add(s);
+        pad.held = vec![0];
+        let before = pick::bounds(&pad.drawing, &pad.held).expect("bounds");
+
+        let ctx = egui::Context::default();
+        let body = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(800.0, 600.0));
+        let tokens = crate::theme::Theme::DEFAULT.tokens();
+        let pen = Pen { pointer: Pointer::Lasso, ..Pen::default() };
+
+        let run = |pad: &mut Pad, events: Vec<egui::Event>| -> (bool, egui::CursorIcon) {
+            let input = egui::RawInput { events, screen_rect: Some(body), ..Default::default() };
+            let mut changed = false;
+            let mut out = ctx.run_ui(input, |ui| {
+                changed |= show_with_input_and_handles(ui, body, body, egui::Pos2::ZERO, pad, pen, 1.0, &tokens, 1.0, true, false, false);
+            });
+            out.textures_delta.clear();
+            (changed, out.platform_output.cursor_icon)
+        };
+
+        run(&mut pad, vec![]);
+
+        let right_top = egui::pos2(before.2 + 3.0, before.1 - 3.0);
+        let left_bottom = egui::pos2(before.0 - 3.0, before.3 + 3.0);
+        let left_top = egui::pos2(before.0 - 3.0, before.1 - 3.0);
+        let right_bottom = egui::pos2(before.2 + 3.0, before.3 + 3.0);
+
+        assert_eq!(run(&mut pad, vec![egui::Event::PointerMoved(right_top)]).1, egui::CursorIcon::ResizeNeSw);
+        assert_eq!(run(&mut pad, vec![egui::Event::PointerMoved(left_bottom)]).1, egui::CursorIcon::ResizeNeSw);
+        assert_eq!(run(&mut pad, vec![egui::Event::PointerMoved(left_top)]).1, egui::CursorIcon::ResizeNwSe);
+        assert_eq!(run(&mut pad, vec![egui::Event::PointerMoved(right_bottom)]).1, egui::CursorIcon::ResizeNwSe);
+
+        let (changed, cursor) = run(&mut pad, vec![button(right_bottom.x, right_bottom.y, true)]);
+        assert!(!changed);
+        assert!(pad.is_grabbed(), "pressing corner handle in Pointer::Lasso starts resize grab");
+        assert_eq!(cursor, egui::CursorIcon::ResizeNwSe);
+        assert_eq!(pick::bounds(&pad.drawing, &pad.held), Some(before), "initial corner press must not stretch");
+
+        let drag_to = egui::pos2(right_bottom.x + 40.0, right_bottom.y + 30.0);
+        let (_, cursor) = run(&mut pad, vec![egui::Event::PointerMoved(drag_to)]);
+        assert_eq!(cursor, egui::CursorIcon::ResizeNwSe);
+
+        let (changed, _) = run(&mut pad, vec![button(drag_to.x, drag_to.y, false)]);
+        assert!(changed, "releasing corner drag reports changed = true");
+        assert!(!pad.is_grabbed());
+        assert!(pad.dirty);
+
+        let after = pick::bounds(&pad.drawing, &pad.held).expect("resized bounds");
+        let want_w = (before.2 - before.0) + 40.0;
+        let want_h = (before.3 - before.1) + 30.0;
+        assert!(((after.2 - after.0) - want_w).abs() < 1.0, "width {after:?} want {want_w}");
+        assert!(((after.3 - after.1) - want_h).abs() < 1.0, "height {after:?} want {want_h}");
+    }
+
+    #[test]
+    fn lasso_press_outside_starts_new_loop_and_tap_outside_clears_selection() {
+        use crate::ribbon::Pointer;
+        let t = TempDir::new("ink-lasso-outside-loop");
+        let mut pad = Pad::of_page(t.path());
+        let mut s0 = Stroke::new(Tool::Pen, Rgb::BLACK, 4.0);
+        s0.add(Dab::new(100.0, 100.0, 1.0));
+        s0.add(Dab::new(180.0, 180.0, 1.0));
+        pad.drawing.add(s0);
+        let mut s1 = Stroke::new(Tool::Pen, Rgb::BLACK, 4.0);
+        s1.add(Dab::new(400.0, 100.0, 1.0));
+        s1.add(Dab::new(480.0, 180.0, 1.0));
+        pad.drawing.add(s1);
+        pad.held = vec![0];
+        let before0 = pick::bounds(&pad.drawing, &[0]).expect("bounds 0");
+
+        let ctx = egui::Context::default();
+        let body = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(800.0, 600.0));
+        let tokens = crate::theme::Theme::DEFAULT.tokens();
+        let pen = Pen { pointer: Pointer::Lasso, ..Pen::default() };
+
+        let run = |pad: &mut Pad, events: Vec<egui::Event>| -> (bool, egui::CursorIcon) {
+            let input = egui::RawInput { events, screen_rect: Some(body), ..Default::default() };
+            let mut changed = false;
+            let mut out = ctx.run_ui(input, |ui| {
+                changed |= show_with_input_and_handles(ui, body, body, egui::Pos2::ZERO, pad, pen, 1.0, &tokens, 1.0, true, false, false);
+            });
+            out.textures_delta.clear();
+            (changed, out.platform_output.cursor_icon)
+        };
+
+        run(&mut pad, vec![]);
+
+        // Hover outside held box shows Crosshair.
+        assert_eq!(run(&mut pad, vec![egui::Event::PointerMoved(egui::pos2(350.0, 50.0))]).1, egui::CursorIcon::Crosshair);
+
+        // Press and drag outside stroke 0's box to draw a new lasso loop around stroke 1.
+        let (_, cursor) = run(&mut pad, vec![egui::Event::PointerMoved(egui::pos2(360.0, 60.0)), button(360.0, 60.0, true)]);
+        assert!(!pad.is_grabbed(), "pressing outside held box must not grab");
+        assert!(!pad.loop_now.is_empty(), "pressing outside starts a new lasso loop");
+        assert_eq!(cursor, egui::CursorIcon::Crosshair);
+
+        run(&mut pad, vec![egui::Event::PointerMoved(egui::pos2(520.0, 60.0))]);
+        run(&mut pad, vec![egui::Event::PointerMoved(egui::pos2(520.0, 220.0))]);
+        run(&mut pad, vec![egui::Event::PointerMoved(egui::pos2(360.0, 220.0))]);
+        let (changed, _) = run(&mut pad, vec![button(360.0, 220.0, false)]);
+        assert!(!changed);
+        assert_eq!(pad.held, vec![1], "new lasso loop selects stroke 1");
+        assert_eq!(pick::bounds(&pad.drawing, &[0]), Some(before0), "previous stroke was not moved");
+
+        // Dragging a new loop started outside across the old held box must not hijack into a grab.
+        run(&mut pad, vec![egui::Event::PointerMoved(egui::pos2(350.0, 140.0)), button(350.0, 140.0, true)]);
+        let (_, cursor) = run(&mut pad, vec![egui::Event::PointerMoved(egui::pos2(440.0, 140.0))]);
+        assert!(!pad.is_grabbed(), "active lasso loop crossing old selection must not grab");
+        assert_eq!(cursor, egui::CursorIcon::Crosshair);
+        run(&mut pad, vec![button(440.0, 140.0, false)]);
+        assert!(pad.held.is_empty(), "2-point loop clears selection on release");
+
+        // Re-select stroke 1 and tap outside to cleanly deselect.
+        pad.held = vec![1];
+        run(&mut pad, vec![egui::Event::PointerMoved(egui::pos2(20.0, 20.0)), button(20.0, 20.0, true)]);
+        let (changed, _) = run(&mut pad, vec![button(20.0, 20.0, false)]);
+        assert!(!changed);
+        assert!(pad.held.is_empty(), "tapping outside selection box clears held ink");
+        assert!(!pad.is_grabbed());
+    }
+
+    #[test]
+    fn escape_clears_held_selection_in_lasso_and_pick() {
+        use crate::ribbon::Pointer;
+        let body = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(800.0, 600.0));
+        let tokens = crate::theme::Theme::DEFAULT.tokens();
+
+        for pointer in [Pointer::Lasso, Pointer::Pick] {
+            let t = TempDir::new("ink-escape-clear");
+            let mut pad = Pad::of_page(t.path());
+            let mut s = Stroke::new(Tool::Pen, Rgb::BLACK, 4.0);
+            s.add(Dab::new(100.0, 100.0, 1.0));
+            s.add(Dab::new(200.0, 200.0, 1.0));
+            pad.drawing.add(s);
+            pad.held = vec![0];
+
+            let ctx = egui::Context::default();
+            let pen = Pen { pointer, ..Pen::default() };
+            let run = |pad: &mut Pad, events: Vec<egui::Event>| -> (bool, egui::CursorIcon) {
+                let input = egui::RawInput { events, screen_rect: Some(body), ..Default::default() };
+                let mut changed = false;
+                let mut out = ctx.run_ui(input, |ui| {
+                    changed |= show_with_input_and_handles(ui, body, body, egui::Pos2::ZERO, pad, pen, 1.0, &tokens, 1.0, true, false, false);
+                });
+                out.textures_delta.clear();
+                (changed, out.platform_output.cursor_icon)
+            };
+
+            let (_, cursor) = run(&mut pad, vec![egui::Event::PointerMoved(egui::pos2(150.0, 150.0))]);
+            if pointer == Pointer::Lasso {
+                assert_eq!(cursor, egui::CursorIcon::Grab);
+            }
+
+            let esc = egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+            let (changed, cursor) = run(&mut pad, vec![esc]);
+            assert!(!changed, "{pointer:?}: Escape only deselects and does not delete ink");
+            assert!(pad.held.is_empty(), "{pointer:?}: Escape clears pad.held");
+            assert!(!pad.is_grabbed(), "{pointer:?}: Escape clears pad.grabbed");
+            assert_eq!(pad.strokes(), 1, "{pointer:?}: stroke remains in drawing");
+            if pointer == Pointer::Lasso {
+                assert_eq!(cursor, egui::CursorIcon::Crosshair, "cursor reverts to Crosshair immediately after Escape");
+            }
+        }
+    }
+
+    #[test]
+    fn held_area_is_unexpanded_box_while_handles_cover_corners() {
+        use crate::ribbon::Pointer;
+        let t = TempDir::new("ink-held-area-unexpanded");
+        let mut pad = Pad::of_page(t.path());
+        let mut s = Stroke::new(Tool::Pen, Rgb::BLACK, 4.0);
+        s.add(Dab::new(100.0, 100.0, 1.0));
+        s.add(Dab::new(200.0, 200.0, 1.0));
+        pad.drawing.add(s);
+        pad.held = vec![0];
+        let b = pick::bounds(&pad.drawing, &pad.held).expect("bounds");
+        let expected_box = egui::Rect::from_min_max(egui::pos2(b.0, b.1), egui::pos2(b.2, b.3)).expand(3.0);
+
+        let ctx = egui::Context::default();
+        let body = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(800.0, 600.0));
+        let tokens = crate::theme::Theme::DEFAULT.tokens();
+        for pointer in [Pointer::Write, Pointer::Lasso, Pointer::Pick] {
+            let pen = Pen { pointer, ..Pen::default() };
+            let input = egui::RawInput { screen_rect: Some(body), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                show_with_input_and_handles(ui, body, body, egui::Pos2::ZERO, &mut pad, pen, 1.0, &tokens, 1.0, true, false, true);
+            });
+            out.textures_delta.clear();
+
+            assert_eq!(held_area(&ctx), Some(expected_box), "{pointer:?}: held_area must be unexpanded held_box");
+            let edge_outside = egui::pos2(expected_box.center().x, expected_box.min.y - 10.0);
+            assert!(!held_area(&ctx).is_some_and(|r| r.contains(edge_outside)), "{pointer:?}: 10pt outside top edge must not be inside held_area");
+            assert!(!held_handle_at(&ctx, edge_outside), "{pointer:?}: 10pt outside top edge midpoint must not hit a corner handle");
+
+            let outer_corner = expected_box.right_bottom() + vec2(10.0, 10.0);
+            assert!(
+                !held_area(&ctx).is_some_and(|r| r.contains(outer_corner)),
+                "{pointer:?}: outer corner reach is in held_handles_id, not held_area"
+            );
+            assert!(held_handle_at(&ctx, outer_corner), "{pointer:?}: outer corner handle must still hit via held_handle_at");
+
+            let inside = expected_box.center();
+            assert!(held_area(&ctx).is_some_and(|r| r.contains(inside)));
+            assert!(held_handle_at(&ctx, inside));
+        }
+    }
+
+    #[test]
+    fn zero_movement_click_on_held_ink_does_not_mark_dirty() {
+        use crate::ribbon::Pointer;
+        let body = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(800.0, 600.0));
+        let tokens = crate::theme::Theme::DEFAULT.tokens();
+        let center = egui::pos2(150.0, 150.0);
+
+        for pointer in [Pointer::Lasso, Pointer::Pick, Pointer::Write] {
+            let t = TempDir::new("ink-zero-drag-clean");
+            let mut pad = Pad::of_page(t.path());
+            let mut s = Stroke::new(Tool::Pen, Rgb::BLACK, 4.0);
+            s.add(Dab::new(100.0, 100.0, 1.0));
+            s.add(Dab::new(200.0, 200.0, 1.0));
+            pad.drawing.add(s);
+            pad.kept = pad.drawing.strokes.clone();
+            pad.held = vec![0];
+            let before = pick::bounds(&pad.drawing, &pad.held).expect("bounds");
+
+            let ctx = egui::Context::default();
+            let pen = Pen { pointer, ..Pen::default() };
+            let run = |pad: &mut Pad, events: Vec<egui::Event>, allow: bool, cancel: bool| -> bool {
+                let input = egui::RawInput { events, screen_rect: Some(body), ..Default::default() };
+                let mut changed = false;
+                let mut out = ctx.run_ui(input, |ui| {
+                    changed |= show_with_input_and_handles(ui, body, body, egui::Pos2::ZERO, pad, pen, 1.0, &tokens, 1.0, allow, cancel, false);
+                });
+                out.textures_delta.clear();
+                changed
+            };
+
+            assert!(!run(&mut pad, vec![], true, false));
+            assert!(!run(&mut pad, vec![egui::Event::PointerMoved(center), button(center.x, center.y, true)], true, false));
+            let changed = run(&mut pad, vec![button(center.x, center.y, false)], true, false);
+            assert!(!changed, "{pointer:?}: zero-movement click on held ink must not report changed");
+            assert!(!pad.dirty, "{pointer:?}: zero-movement click must not mark pad dirty");
+            assert!(!pad.can_undo(), "{pointer:?}: zero-movement click must not record an undo step");
+            assert_eq!(pick::bounds(&pad.drawing, &pad.held), Some(before));
+
+            // Also verify cutting short a grab before any movement does not mark dirty.
+            assert!(!run(&mut pad, vec![egui::Event::PointerMoved(center), button(center.x, center.y, true)], true, false));
+            let changed_cancel = run(&mut pad, vec![], false, true);
+            assert!(!changed_cancel, "{pointer:?}: canceling an unmoved grab must not report changed");
+            assert!(!pad.dirty, "{pointer:?}: canceling an unmoved grab must not mark dirty");
+        }
     }
 }

@@ -105,7 +105,11 @@ pub fn split_extension(name: &str) -> (&str, &str) {
 /// in through here too, so the name it makes is still a safe name (issue #131).
 pub fn fit_file_name(stem: &str, extension: &str, suffix: &str) -> String {
     let room = MAX_FILE_NAME.saturating_sub(extension.chars().count() + suffix.chars().count());
-    let stem: String = stem.chars().take(room).collect();
+    let mut stem: String = stem.chars().take(room).collect();
+    let trimmed = stem.trim_end_matches(['.', '-']);
+    if suffix.is_empty() && is_reserved_name(trimmed.split('.').next().unwrap_or(trimmed)) {
+        stem = format!("file-{trimmed}").chars().take(room).collect();
+    }
     let stem = stem.trim_end_matches(['.', '-']);
     let stem = if stem.is_empty() { "file" } else { stem };
     format!("{stem}{suffix}{extension}")
@@ -180,6 +184,23 @@ mod tests {
             let once = safe_file_name(name);
             assert_eq!(safe_file_name(&once), once, "applying it again changes nothing: {name}");
         }
+    }
+
+    #[test]
+    fn truncation_never_exposes_a_windows_reserved_name() {
+        for raw in [
+            format!("CON{}tail.txt", "-".repeat(80)),
+            format!("lpt1{}tail.pdf", "-".repeat(80)),
+            format!("aux{}tail", "-".repeat(90)),
+            format!("NUL{}tail.docx", " ".repeat(80)),
+        ] {
+            let safe = safe_file_name(&raw);
+            assert!(validate_component(&safe).is_ok(), "{raw:?} -> {safe:?}");
+            assert!(safe.chars().count() <= MAX_FILE_NAME, "{safe:?}");
+            assert_eq!(safe_file_name(&safe), safe, "idempotent: {safe:?}");
+        }
+        assert_eq!(fit_file_name("CON.abc", ".txt", ""), "file-CON.abc.txt");
+        assert_eq!(fit_file_name(&format!("CON{}", "-".repeat(80)), ".txt", "-2"), "CON-2.txt");
     }
 
     /// Issue #131: the suffix of a second copy fits inside the limit with the extension kept, so

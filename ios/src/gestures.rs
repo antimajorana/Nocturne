@@ -109,6 +109,14 @@ pub fn is_palm_touch_radius(major_radius_pts: f32) -> bool {
     major_radius_pts.is_finite() && major_radius_pts >= PALM_MAJOR_RADIUS_PTS
 }
 
+/// Contact radius threshold (in UIKit points) at or above which a `UITouch` is rejected by
+/// `UIPinchGestureRecognizer` when Apple Pencil is not active.
+///
+/// A slightly flat thumb during a two-finger pinch on iPadOS frequently reports `majorRadius`
+/// around `40–60 pt`, which exceeds [`PALM_MAJOR_RADIUS_PTS`]. Only large palm contacts
+/// (`>= 65 pt`) are rejected for pinch when no stylus is active.
+pub const PINCH_PALM_MAJOR_RADIUS_PTS: f32 = 65.0;
+
 /// Returns `true` when a `UITouch` should be accepted by native finger pan/pinch/tap recognizers.
 ///
 /// Rejects non-direct touches (such as Apple Pencil), resting palms
@@ -119,6 +127,24 @@ pub fn should_receive_gesture_touch(is_direct_finger: bool, major_radius_pts: f3
         return false;
     }
     !(is_pan_recognizer && stylus_active)
+}
+
+/// Returns `true` when a `UITouch` should be accepted by the native `UIPinchGestureRecognizer`.
+///
+/// Rejects non-direct touches (such as Apple Pencil), rejects resting palms
+/// (`>= PALM_MAJOR_RADIUS_PTS`) while an Apple Pencil stroke is active, and when no stylus is
+/// active only rejects large palm contacts (`>= PINCH_PALM_MAJOR_RADIUS_PTS`) so a flat thumb
+/// (`40–60 pt`) during a two-finger pinch is never dropped.
+#[must_use]
+pub fn should_receive_pinch_touch(is_direct_finger: bool, major_radius_pts: f32, stylus_active: bool) -> bool {
+    if !is_direct_finger {
+        return false;
+    }
+    if !major_radius_pts.is_finite() {
+        return true;
+    }
+    let threshold = if stylus_active { PALM_MAJOR_RADIUS_PTS } else { PINCH_PALM_MAJOR_RADIUS_PTS };
+    major_radius_pts < threshold
 }
 
 /// Shared state between UIKit pan/pinch/tap recognizers and the per-frame `eframe` shell hook.
@@ -317,6 +343,45 @@ pub fn should_begin_native_pinch(touch_count: usize, in_canvas: bool, egui_using
     !egui_using_pointer && in_canvas && touch_count >= 2
 }
 
+/// Returns `true` when the native `UIPinchGestureRecognizer` should begin based on the individual
+/// touch positions (in egui logical points) rather than only their midpoint.
+///
+/// Requires `!blocked`, at least two touches, a valid `canvas_rect`, and at least one touch (or
+/// the finite midpoint of the touches) inside `canvas_rect`, so placing one finger near the canvas
+/// margin/edge and the other on the page still pinches reliably.
+#[must_use]
+pub fn should_begin_native_pinch_for_touches(
+    touch_count: usize,
+    canvas_rect: Option<GestureRect>,
+    touch_positions: &[[f32; 2]],
+    blocked: bool,
+) -> bool {
+    if blocked || touch_count < 2 {
+        return false;
+    }
+    let Some(rect) = canvas_rect else {
+        return false;
+    };
+    if touch_positions.iter().any(|&[x, y]| rect.contains(x, y)) {
+        return true;
+    }
+    let mut sum_x = 0.0_f32;
+    let mut sum_y = 0.0_f32;
+    let mut finite_count = 0usize;
+    for &[x, y] in touch_positions {
+        if x.is_finite() && y.is_finite() {
+            sum_x += x;
+            sum_y += y;
+            finite_count += 1;
+        }
+    }
+    if finite_count == 0 {
+        return false;
+    }
+    let count_f = finite_count as f32;
+    rect.contains(sum_x / count_f, sum_y / count_f)
+}
+
 /// Returns `true` when a native 2-finger Undo or 3-finger Redo tap gesture should begin/fire.
 #[must_use]
 pub fn should_begin_native_multi_finger_tap(required_touches: usize, in_canvas: bool, egui_using_pointer: bool, stylus_active: bool) -> bool {
@@ -330,6 +395,51 @@ pub fn latest_pointer_pos_in_events(events: &[egui::Event]) -> Option<egui::Pos2
         egui::Event::Touch { pos, .. } | egui::Event::PointerMoved(pos) | egui::Event::PointerButton { pos, .. } if pos.is_finite() => Some(*pos),
         _ => None,
     })
+}
+
+/// Extracts the most recent finite position from *active* touch/pointer contacts in an
+/// `egui::RawInput` event batch, ignoring lift/cancel events (`TouchPhase::End | Cancel`,
+/// `PointerButton { pressed: false, .. }`, `PointerGone`) so releasing a finger on a foreground
+/// overlay never latches `egui_using_pointer = true` into subsequent frames.
+#[must_use]
+pub fn latest_active_pointer_pos_in_events(events: &[egui::Event]) -> Option<egui::Pos2> {
+    let mut active_touches: Vec<(egui::TouchId, egui::Pos2)> = Vec::new();
+    let mut active_pointer: Option<egui::Pos2> = None;
+    let mut saw_release_or_end = false;
+    let mut saw_active_press = false;
+
+    for ev in events {
+        match ev {
+            egui::Event::Touch { id, phase: egui::TouchPhase::Start | egui::TouchPhase::Move, pos, .. } => {
+                active_touches.retain(|(tid, _)| tid != id);
+                if pos.is_finite() {
+                    active_touches.push((*id, *pos));
+                }
+            }
+            egui::Event::Touch { id, phase: egui::TouchPhase::End | egui::TouchPhase::Cancel, .. } => {
+                active_touches.retain(|(tid, _)| tid != id);
+                active_pointer = None;
+                saw_release_or_end = true;
+            }
+            egui::Event::PointerButton { pos, pressed: true, .. } => {
+                if pos.is_finite() {
+                    active_pointer = Some(*pos);
+                    saw_active_press = true;
+                }
+            }
+            egui::Event::PointerButton { pressed: false, .. } | egui::Event::PointerGone => {
+                active_pointer = None;
+                saw_release_or_end = true;
+                saw_active_press = false;
+            }
+            egui::Event::PointerMoved(pos) if pos.is_finite() && (saw_active_press || !saw_release_or_end) => {
+                active_pointer = Some(*pos);
+            }
+            _ => {}
+        }
+    }
+
+    active_touches.last().map(|(_, pos)| *pos).or(active_pointer)
 }
 
 /// Returns `true` when an egui popup, modal, dialog window (`Order::Middle`+), foreground overlay,
@@ -355,6 +465,39 @@ pub fn egui_overlay_blocks_native_gesture(ctx: &egui::Context, show_source: bool
         }
     }
     false
+}
+
+/// Returns `true` when an egui popup, modal, canvas-blocking overlay, or foreground UI chrome
+/// should block a native two-finger pinch gesture.
+///
+/// Unlike [`egui_overlay_blocks_native_gesture`]:
+/// - Single-finger resize/held-ink handles are ignored because a two-finger pinch is never a
+///   one-finger handle drag.
+/// - Individual finger positions are inspected so straddling a floating pill (midpoint on the pill,
+///   fingers on the canvas) or touching one finger on open canvas does not block pinch; pinch is
+///   blocked only when *all* finite touch positions land on `Order::Middle`+ UI chrome.
+#[must_use]
+pub fn egui_overlay_blocks_native_pinch(ctx: &egui::Context, canvas_overlay_blocked: bool, touch_positions: &[egui::Pos2]) -> bool {
+    if canvas_overlay_blocked || ctx.any_popup_open() || ctx.memory(|m| m.top_modal_layer().is_some()) {
+        return true;
+    }
+    let mut saw_finite = false;
+    for &pos in touch_positions {
+        if !pos.is_finite() {
+            continue;
+        }
+        saw_finite = true;
+        let on_overlay = ctx.layer_id_at(pos).is_some_and(|layer| layer.order >= egui::Order::Middle);
+        if !on_overlay {
+            return false;
+        }
+    }
+    if saw_finite {
+        return true;
+    }
+    ctx.input(|i| i.pointer.any_down().then(|| i.pointer.interact_pos()).flatten())
+        .filter(|p| p.is_finite())
+        .is_some_and(|pos| ctx.layer_id_at(pos).is_some_and(|layer| layer.order >= egui::Order::Middle))
 }
 
 /// Returns `true` when a long-press at `pos` lands inside the open page canvas and no modal,
@@ -650,8 +793,9 @@ pub fn filter_pure_events_with_stylus_ids(
 pub mod ios {
     use super::{
         EventKind, GestureBridgeState, GestureHistoryAction, GestureRect, PureTouchPhase, ReleaseEventFns, SharedGestureState,
-        egui_overlay_blocks_native_gesture, filter_events_core, should_begin_native_multi_finger_tap, should_begin_native_pan_for_input,
-        should_begin_native_pinch, should_receive_gesture_touch, uikit_point_to_egui,
+        egui_overlay_blocks_native_gesture, egui_overlay_blocks_native_pinch, filter_events_core, should_begin_native_multi_finger_tap,
+        should_begin_native_pan_for_input, should_begin_native_pinch_for_touches, should_receive_gesture_touch, should_receive_pinch_touch,
+        uikit_point_to_egui,
     };
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
@@ -778,9 +922,13 @@ pub mod ios {
                 fn __should_receive_touch(&self, gesture_recognizer: &UIGestureRecognizer, touch: &UITouch) -> bool {
                     let is_direct = touch.r#type() == UITouchType::Direct;
                     let major_radius_pts = touch.majorRadius() as f32;
-                    let is_pan = self.is_pan(gesture_recognizer);
                     let stylus_active = self.ivars().state.try_borrow().is_ok_and(|s| s.is_stylus_active());
-                    should_receive_gesture_touch(is_direct, major_radius_pts, stylus_active, is_pan)
+                    if self.is_pinch(gesture_recognizer) {
+                        should_receive_pinch_touch(is_direct, major_radius_pts, stylus_active)
+                    } else {
+                        let is_pan = self.is_pan(gesture_recognizer);
+                        should_receive_gesture_touch(is_direct, major_radius_pts, stylus_active, is_pan)
+                    }
                 }
 
                 #[unsafe(method(gestureRecognizerShouldBegin:))]
@@ -836,9 +984,7 @@ pub mod ios {
                         return;
                     };
                     let in_canvas = state.point_in_canvas(ex, ey);
-                    let live_blocked =
-                        egui_overlay_blocks_native_gesture(&self.ivars().egui_ctx, state.canvas_overlay_blocked, Some(egui::pos2(ex, ey)));
-                    let blocked = state.egui_using_pointer || live_blocked;
+                    let blocked = egui_overlay_blocks_native_gesture(&self.ivars().egui_ctx, state.canvas_overlay_blocked, Some(egui::pos2(ex, ey)));
                     if should_begin_native_multi_finger_tap(required_touches, in_canvas, blocked, state.is_stylus_active()) {
                         state.push_history_action(action);
                         true
@@ -856,18 +1002,38 @@ pub mod ios {
                     return false;
                 };
                 let view = gesture_recognizer.view();
+                let zoom = state.zoom_factor();
+                let touch_count = gesture_recognizer.numberOfTouches();
+
+                if self.is_pinch(gesture_recognizer) {
+                    let mut touch_arrs = Vec::with_capacity(touch_count);
+                    let mut touch_pts = Vec::with_capacity(touch_count);
+                    for idx in 0..touch_count {
+                        let pt = gesture_recognizer.locationOfTouch_inView(idx, view.as_deref());
+                        if let Some([ex, ey]) = uikit_point_to_egui([pt.x as f32, pt.y as f32], zoom) {
+                            touch_arrs.push([ex, ey]);
+                            touch_pts.push(egui::pos2(ex, ey));
+                        }
+                    }
+                    if touch_pts.is_empty() {
+                        let loc = gesture_recognizer.locationInView(view.as_deref());
+                        if let Some([ex, ey]) = uikit_point_to_egui([loc.x as f32, loc.y as f32], zoom) {
+                            touch_arrs.push([ex, ey]);
+                            touch_pts.push(egui::pos2(ex, ey));
+                        }
+                    }
+                    let blocked = egui_overlay_blocks_native_pinch(&self.ivars().egui_ctx, state.canvas_overlay_blocked, &touch_pts);
+                    return should_begin_native_pinch_for_touches(touch_count, state.canvas_rect, &touch_arrs, blocked);
+                }
+
                 let loc = gesture_recognizer.locationInView(view.as_deref());
-                let Some([ex, ey]) = uikit_point_to_egui([loc.x as f32, loc.y as f32], state.zoom_factor()) else {
+                let Some([ex, ey]) = uikit_point_to_egui([loc.x as f32, loc.y as f32], zoom) else {
                     return false;
                 };
                 let in_canvas = state.point_in_canvas(ex, ey);
-                let live_blocked = egui_overlay_blocks_native_gesture(&self.ivars().egui_ctx, state.canvas_overlay_blocked, Some(egui::pos2(ex, ey)));
-                let blocked = state.egui_using_pointer || live_blocked;
-                let touch_count = gesture_recognizer.numberOfTouches();
+                let blocked = egui_overlay_blocks_native_gesture(&self.ivars().egui_ctx, state.canvas_overlay_blocked, Some(egui::pos2(ex, ey)));
                 if self.is_pan(gesture_recognizer) {
                     should_begin_native_pan_for_input(touch_count, state.finger_drawing, in_canvas, blocked, state.is_stylus_active())
-                } else if self.is_pinch(gesture_recognizer) {
-                    should_begin_native_pinch(touch_count, in_canvas, blocked)
                 } else if self.is_two_finger_tap(gesture_recognizer) {
                     should_begin_native_multi_finger_tap(2, in_canvas, blocked, state.is_stylus_active())
                 } else if self.is_three_finger_tap(gesture_recognizer) {
@@ -1584,5 +1750,142 @@ mod tests {
             assert_close(scale, 1.5);
             assert_eq!(focal, Some([400.0, 300.0]));
         }
+    }
+
+    #[test]
+    fn flat_thumb_pinch_touch_is_accepted_while_huge_palms_and_stylus_are_rejected() {
+        // Flat thumb radii (40–60 pt) must be accepted for pinch when no stylus is active.
+        assert!(should_receive_pinch_touch(true, 18.0, false));
+        assert!(should_receive_pinch_touch(true, PALM_MAJOR_RADIUS_PTS, false));
+        assert!(should_receive_pinch_touch(true, 52.0, false));
+        assert!(should_receive_pinch_touch(true, PINCH_PALM_MAJOR_RADIUS_PTS - 0.1, false));
+        // Simulator / unavailable / non-finite radii fail open for direct finger touches.
+        assert!(should_receive_pinch_touch(true, 0.0, false));
+        assert!(should_receive_pinch_touch(true, -3.0, false));
+        assert!(should_receive_pinch_touch(true, f32::NAN, false));
+        assert!(should_receive_pinch_touch(true, f32::INFINITY, false));
+
+        // Huge palm contacts (>= PINCH_PALM_MAJOR_RADIUS_PTS) are rejected even without stylus.
+        assert!(!should_receive_pinch_touch(true, PINCH_PALM_MAJOR_RADIUS_PTS, false));
+        assert!(!should_receive_pinch_touch(true, 80.0, false));
+
+        // Non-direct touches (Apple Pencil) are always rejected.
+        assert!(!should_receive_pinch_touch(false, 12.0, false));
+        assert!(!should_receive_pinch_touch(false, 12.0, true));
+
+        // While Apple Pencil is active, resting palms use the stricter PALM_MAJOR_RADIUS_PTS cutoff.
+        assert!(should_receive_pinch_touch(true, 24.0, true));
+        assert!(!should_receive_pinch_touch(true, PALM_MAJOR_RADIUS_PTS, true));
+        assert!(!should_receive_pinch_touch(true, 52.0, true));
+    }
+
+    #[test]
+    fn latest_active_pointer_pos_ignores_lift_and_cancel_events() {
+        let pill = egui::pos2(500.0, 740.0);
+        let canvas = egui::pos2(300.0, 300.0);
+        let touch = |id: u64, phase: egui::TouchPhase, pos: egui::Pos2| egui::Event::Touch {
+            device_id: egui::TouchDeviceId(0),
+            id: egui::TouchId(id),
+            phase,
+            pos,
+            force: None,
+        };
+        let btn = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        // Active Start / Move / pressed:true report their latest active position.
+        assert_eq!(latest_active_pointer_pos_in_events(&[touch(1, egui::TouchPhase::Start, pill), btn(pill, true)]), Some(pill));
+        assert_eq!(latest_active_pointer_pos_in_events(&[touch(1, egui::TouchPhase::Move, canvas)]), Some(canvas));
+        assert_eq!(latest_active_pointer_pos_in_events(&[egui::Event::PointerMoved(canvas)]), Some(canvas));
+
+        // Lift / cancel / single-frame tap releases MUST return None so foreground overlays do not latch.
+        assert_eq!(latest_active_pointer_pos_in_events(&[touch(1, egui::TouchPhase::End, pill)]), None);
+        assert_eq!(latest_active_pointer_pos_in_events(&[touch(1, egui::TouchPhase::Cancel, pill)]), None);
+        assert_eq!(latest_active_pointer_pos_in_events(&[egui::Event::PointerMoved(pill), btn(pill, false), egui::Event::PointerGone]), None);
+        assert_eq!(
+            latest_active_pointer_pos_in_events(&[touch(1, egui::TouchPhase::End, pill), egui::Event::PointerMoved(pill), btn(pill, false)]),
+            None
+        );
+        assert_eq!(latest_active_pointer_pos_in_events(&[egui::Event::PointerMoved(pill), btn(pill, true), btn(pill, false)]), None);
+
+        // If finger 1 lifts while finger 2 stays active in the same frame, finger 2's active position wins.
+        assert_eq!(
+            latest_active_pointer_pos_in_events(&[touch(1, egui::TouchPhase::End, pill), touch(2, egui::TouchPhase::Move, canvas)]),
+            Some(canvas)
+        );
+        assert_eq!(
+            latest_active_pointer_pos_in_events(&[touch(2, egui::TouchPhase::Start, canvas), touch(1, egui::TouchPhase::End, pill)]),
+            Some(canvas)
+        );
+    }
+
+    #[test]
+    fn pinch_overlay_gating_allows_straddling_pill_and_handles_and_edge_placement() {
+        let ctx = egui::Context::default();
+        let pill_rect = egui::Rect::from_min_size(egui::pos2(420.0, 680.0), egui::vec2(180.0, 48.0));
+        // Settle two frames with a Foreground floating pill over an open canvas.
+        for _ in 0..2 {
+            let raw =
+                egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024.0, 768.0))), ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| {
+                egui::Area::new(ui.scope_id().with("floating-pill")).order(egui::Order::Foreground).fixed_pos(pill_rect.min).show(ui.ctx(), |ui| {
+                    ui.allocate_exact_size(pill_rect.size(), egui::Sense::click());
+                });
+            });
+            out.textures_delta.clear();
+        }
+
+        // 1. Two fingers straddling the floating pill: midpoint hits the pill, but both fingers are on canvas.
+        let left_finger = egui::pos2(300.0, 704.0);
+        let right_finger = egui::pos2(720.0, 704.0);
+        let midpoint = egui::pos2(510.0, 704.0);
+        assert!(pill_rect.contains(midpoint));
+        assert!(egui_overlay_blocks_native_gesture(&ctx, false, Some(midpoint)), "midpoint lands on foreground pill");
+        assert!(
+            !egui_overlay_blocks_native_pinch(&ctx, false, &[left_finger, right_finger]),
+            "straddling a floating pill must NOT block 2-finger pinch"
+        );
+
+        // 2. One finger on the floating pill + one finger on the open canvas -> pinch still allowed.
+        assert!(!egui_overlay_blocks_native_pinch(&ctx, false, &[midpoint, left_finger]));
+
+        // 3. BOTH fingers inside the floating pill -> pinch yields to the overlay (e.g. minimap).
+        let pill_left = egui::pos2(450.0, 704.0);
+        let pill_right = egui::pos2(560.0, 704.0);
+        assert!(egui_overlay_blocks_native_pinch(&ctx, false, &[pill_left, pill_right]));
+
+        // 4. Canvas-blocking overlay (e.g. source view / modal) still blocks pinch.
+        assert!(egui_overlay_blocks_native_pinch(&ctx, true, &[left_finger, right_finger]));
+
+        // 5. Held-ink handle & touch resize handle block 1-finger pan, but MUST NOT block 2-finger pinch.
+        let handle_pos = egui::pos2(260.0, 260.0);
+        let handle_rect = egui::Rect::from_center_size(handle_pos, egui::vec2(48.0, 48.0));
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::unique("inkpad-held-area"), handle_rect);
+            d.insert_temp(egui::Id::unique("containers-touch-handles"), vec![handle_rect]);
+        });
+        assert!(egui_overlay_blocks_native_gesture(&ctx, false, Some(handle_pos)), "1-finger gesture yields to active handle");
+        assert!(
+            !egui_overlay_blocks_native_pinch(&ctx, false, &[handle_pos, egui::pos2(360.0, 320.0)]),
+            "2-finger pinch over held-ink/resize handle must NOT be blocked"
+        );
+
+        // 6. `should_begin_native_pinch_for_touches` allows one finger in the margin + one on canvas.
+        let canvas = Some(GestureRect::from_bounds([100.0, 100.0, 900.0, 700.0]));
+        // Even when the midpoint [80, 300] falls outside the left edge, touch [110, 300] is on canvas -> allowed!
+        assert!(should_begin_native_pinch_for_touches(2, canvas, &[[50.0, 300.0], [110.0, 300.0]], false));
+        // Midpoint inside canvas when touches span across it -> allowed!
+        assert!(should_begin_native_pinch_for_touches(2, canvas, &[[50.0, 300.0], [950.0, 300.0]], false));
+        // Both touches and midpoint outside canvas -> rejected!
+        assert!(!should_begin_native_pinch_for_touches(2, canvas, &[[20.0, 20.0], [60.0, 40.0]], false));
+        // Blocked, single-touch, missing canvas rect, or non-finite positions -> rejected!
+        assert!(!should_begin_native_pinch_for_touches(2, canvas, &[[300.0, 300.0], [400.0, 300.0]], true));
+        assert!(!should_begin_native_pinch_for_touches(1, canvas, &[[300.0, 300.0]], false));
+        assert!(!should_begin_native_pinch_for_touches(2, None, &[[300.0, 300.0], [400.0, 300.0]], false));
+        assert!(!should_begin_native_pinch_for_touches(2, canvas, &[[f32::NAN, 300.0], [f32::INFINITY, 300.0]], false));
     }
 }

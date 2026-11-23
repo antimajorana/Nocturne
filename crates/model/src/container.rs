@@ -74,8 +74,8 @@ pub fn fit(containers: &[Container], blocks: usize, width: f32) -> Vec<Container
     if blocks == 0 {
         return containers.to_vec();
     }
-    let counted: usize = containers.iter().map(|c| c.blocks).sum();
-    if !containers.is_empty() && counted == blocks {
+    let counted = containers.iter().try_fold(0usize, |acc, c| acc.checked_add(c.blocks));
+    if !containers.is_empty() && counted == Some(blocks) {
         return containers.to_vec();
     }
     vec![Container::new(0.0, 0.0, width, blocks)]
@@ -83,21 +83,22 @@ pub fn fit(containers: &[Container], blocks: usize, width: f32) -> Vec<Container
 
 /// Which container a block belongs to, and which block of that container it is.
 pub fn place(containers: &[Container], block: usize) -> Option<(usize, usize)> {
-    let mut first = 0;
+    let mut first = 0usize;
     for (i, c) in containers.iter().enumerate() {
-        if block < first + c.blocks {
+        let end = first.saturating_add(c.blocks);
+        if block < end {
             return Some((i, block - first));
         }
-        first += c.blocks;
+        first = end;
     }
     None
 }
 
 /// The range of blocks in container `at`.
 pub fn blocks_of(containers: &[Container], at: usize) -> std::ops::Range<usize> {
-    let first: usize = containers.iter().take(at).map(|c| c.blocks).sum();
+    let first = containers.iter().take(at).fold(0usize, |acc, c| acc.saturating_add(c.blocks));
     let count = containers.get(at).map(|c| c.blocks).unwrap_or(0);
-    first..first + count
+    first..first.saturating_add(count)
 }
 
 /// Adds a container of its own for `added` new blocks that were appended to a page that had
@@ -193,5 +194,16 @@ mod tests {
         assert_eq!(blocks_of(&boxes, 0), 0..2);
         assert_eq!(blocks_of(&boxes, 1), 2..5);
         assert_eq!(blocks_of(&boxes, 9), 5..5);
+    }
+
+    #[test]
+    fn overflowing_block_counts_fall_back_without_panicking() {
+        let boxes = vec![Container::new(0.0, 0.0, 400.0, usize::MAX), Container::new(420.0, 0.0, 200.0, 2)];
+        assert_eq!(fit(&boxes, 1, 700.0), vec![Container::new(0.0, 0.0, 700.0, 1)]);
+        assert_eq!(place(&boxes, 0), Some((0, 0)));
+        assert_eq!(place(&boxes, usize::MAX), None);
+        assert_eq!(blocks_of(&boxes, 0), 0..usize::MAX);
+        assert_eq!(blocks_of(&boxes, 1), usize::MAX..usize::MAX);
+        assert_eq!(blocks_of(&boxes, 2), usize::MAX..usize::MAX);
     }
 }

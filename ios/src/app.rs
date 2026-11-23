@@ -409,7 +409,7 @@ impl eframe::App for Shell {
                 }
             }
 
-            let touch_pos = gestures::latest_pointer_pos_in_events(&raw_input.events);
+            let touch_pos = gestures::latest_active_pointer_pos_in_events(&raw_input.events);
             let canvas_overlay = self.app.has_canvas_blocking_overlay();
             let egui_blocked = gestures::egui_overlay_blocks_native_gesture(ctx, canvas_overlay, touch_pos);
             let visible_canvas = self.app.page_view_rect().or_else(|| self.app.page_rect());

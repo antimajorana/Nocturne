@@ -54,6 +54,12 @@ pub enum Act {
     OpenCloudSync,
     /// Toggle between Tablet Studio layout and Classic Ribbon.
     ToggleStudioLayout,
+    /// Turn handwritten equation recognition on or off.
+    ToggleMathOcr,
+    /// Turn general handwriting-to-text recognition on or off.
+    ToggleHandwritingOcr,
+    /// Open the recognition service setup dialog.
+    OpenMathOcrSetup,
     ResetPreferences,
     /// Another page of the File screen: Info, New or Open.
     Page(&'static str),
@@ -136,6 +142,8 @@ pub fn show(
     languages: &[crate::i18n::LanguageChoice],
     ui_scale: u16,
     layout_mode: UiLayoutMode,
+    math_ocr_enabled: bool,
+    handwriting_ocr_enabled: bool,
     update: &crate::update::Status,
     t: &Tokens,
 ) -> Vec<Act> {
@@ -172,6 +180,8 @@ pub fn show(
                             languages,
                             ui_scale,
                             layout_mode,
+                            math_ocr_enabled,
+                            handwriting_ocr_enabled,
                             update,
                             t,
                             &mut acts,
@@ -535,6 +545,8 @@ fn options_page(
     languages: &[crate::i18n::LanguageChoice],
     ui_scale: u16,
     layout_mode: UiLayoutMode,
+    math_ocr_enabled: bool,
+    handwriting_ocr_enabled: bool,
     update: &crate::update::Status,
     t: &Tokens,
     acts: &mut Vec<Act>,
@@ -599,6 +611,27 @@ fn options_page(
     ui.horizontal_wrapped(|ui| {
         if modal::primary_button(ui, crate::tl_id!("ui.kdrive_sync_open_btn"), t).clicked() {
             acts.push(Act::OpenCloudSync);
+        }
+    });
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new(crate::tl_id!("ui.ocr_recognition_heading")).strong().size(15.0).color(t.strong));
+    ui.add_space(4.0);
+    let mut math_ocr = math_ocr_enabled;
+    if ui.checkbox(&mut math_ocr, crate::tl_id!("ui.recognise_handwritten_equations")).changed() {
+        acts.push(Act::ToggleMathOcr);
+    }
+    let mut handwriting_ocr = handwriting_ocr_enabled;
+    if ui
+        .checkbox(&mut handwriting_ocr, crate::tl_id!("ui.handwriting_ocr_enable"))
+        .on_hover_text(crate::tl_id!("ui.handwriting_ocr_enable_tip"))
+        .changed()
+    {
+        acts.push(Act::ToggleHandwritingOcr);
+    }
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        if modal::secondary_button(ui, crate::tl_id!("ui.recognition_service_open"), t).clicked() {
+            acts.push(Act::OpenMathOcrSetup);
         }
     });
     ui.add_space(12.0);
@@ -693,6 +726,8 @@ mod tests {
                 &crate::i18n::available_languages(),
                 100,
                 UiLayoutMode::Auto,
+                false,
+                false,
                 &crate::update::Status::Idle,
                 &t,
             );
@@ -727,6 +762,8 @@ mod tests {
                     &languages,
                     100,
                     UiLayoutMode::TabletStudio,
+                    true,
+                    true,
                     &crate::update::Status::Idle,
                     &t,
                 );

@@ -1220,6 +1220,16 @@ fn scrolled_page_view_rect_and_foreground_pill_do_not_steal_or_poison_native_ges
         },
     );
     // Note: intentionally omit `PointerGone` above to prove lingering `pointer_latest_pos` does NOT poison idle frames!
+    let release_events = vec![
+        egui::Event::Touch { device_id: egui::TouchDeviceId(0), id: egui::TouchId(9), phase: egui::TouchPhase::End, pos: pill_pos, force: None },
+        egui::Event::PointerMoved(pill_pos),
+        egui::Event::PointerButton { pos: pill_pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
+    ];
+    assert_eq!(
+        nocturne_ios::gestures::latest_active_pointer_pos_in_events(&release_events),
+        None,
+        "lifting a finger from the floating Foreground pill must not report an active pointer pos"
+    );
     step_app_frame(&ctx, &mut app, egui::RawInput::default());
     assert!(
         !nocturne_ios::gestures::egui_overlay_blocks_native_gesture(&ctx, app.has_canvas_blocking_overlay(), None),
@@ -1229,5 +1239,21 @@ fn scrolled_page_view_rect_and_foreground_pill_do_not_steal_or_poison_native_ges
     assert!(
         !nocturne_ios::gestures::egui_overlay_blocks_native_gesture(&ctx, app.has_canvas_blocking_overlay(), Some(open_canvas_pos)),
         "subsequent touch on open canvas must allow native pan/pinch immediately"
+    );
+
+    // A 2-finger pinch straddling the floating Foreground Pencil pill (midpoint on pill, fingers on canvas)
+    // must NOT be blocked, and placing one finger near the canvas edge + one on canvas must begin pinch.
+    let pinch_left = Pos2::new((view_page.min.x + 24.0).min(pill_pos.x - 160.0), pill_pos.y);
+    let pinch_right = Pos2::new((view_page.max.x - 24.0).max(pill_pos.x + 160.0), pill_pos.y);
+    let pinch_blocked = nocturne_ios::gestures::egui_overlay_blocks_native_pinch(&ctx, app.has_canvas_blocking_overlay(), &[pinch_left, pinch_right]);
+    assert!(!pinch_blocked, "2-finger pinch straddling the floating Foreground pill must not be blocked");
+    assert!(
+        nocturne_ios::gestures::should_begin_native_pinch_for_touches(
+            2,
+            Some(visible_rect),
+            &[[view_page.min.x - 20.0, open_canvas_pos.y], [open_canvas_pos.x, open_canvas_pos.y]],
+            pinch_blocked,
+        ),
+        "2-finger pinch with one finger in the margin and one on the canvas must begin"
     );
 }

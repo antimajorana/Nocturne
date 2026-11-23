@@ -3,11 +3,13 @@
 //!
 //! Each test drives the real `NocturneApp`. Nothing is mocked.
 
+use egui::accesskit::Role;
 use egui::os::OperatingSystem;
-use egui::{Pos2, Rect, pos2, vec2};
+use egui::{Key, Modifiers, Pos2, Rect, pos2, vec2};
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT as _, Queryable as _};
 use nocturne_engine::{EraserKind, Session};
+use nocturne_ink::Rgb;
 use nocturne_store::Settings;
 use nocturne_store::testing::TempDir;
 use nocturne_ui_egui::{NocturneApp, ribbon};
@@ -274,6 +276,34 @@ fn click(h: &mut Harness<'_, NocturneApp>, at: Pos2) {
     h.input_mut().events.extend([button(false, at)]);
     h.step();
     h.step();
+    h.step();
+}
+
+fn label_rect(h: &Harness<'_, NocturneApp>, expected: &str) -> Option<Rect> {
+    let ppp = h.ctx.pixels_per_point();
+    h.query_all(egui_kittest::kittest::by()).find_map(|node| {
+        let ak = node.accesskit_node();
+        let text = ak.label().or_else(|| (ak.role() == Role::Label).then(|| ak.value()).flatten())?;
+        if text.trim() != expected {
+            return None;
+        }
+        let b = ak.bounding_box()?;
+        let rect = Rect::from_min_max(pos2(b.x0 as f32 / ppp, b.y0 as f32 / ppp), pos2(b.x1 as f32 / ppp, b.y1 as f32 / ppp));
+        rect.is_positive().then_some(rect)
+    })
+}
+
+fn text_input_with_value(h: &Harness<'_, NocturneApp>, expected: &str) -> Option<Rect> {
+    let ppp = h.ctx.pixels_per_point();
+    h.query_all(egui_kittest::kittest::by()).find_map(|node| {
+        let ak = node.accesskit_node();
+        if ak.role() != Role::TextInput || ak.value().as_deref().map(str::trim) != Some(expected) {
+            return None;
+        }
+        let b = ak.bounding_box()?;
+        let rect = Rect::from_min_max(pos2(b.x0 as f32 / ppp, b.y0 as f32 / ppp), pos2(b.x1 as f32 / ppp, b.y1 as f32 / ppp));
+        rect.is_positive().then_some(rect)
+    })
 }
 
 #[test]
@@ -287,9 +317,13 @@ fn tapping_the_eraser_again_offers_object_or_pixel_and_a_size() {
     for _ in 0..4 {
         h.step();
     }
+    assert_eq!(labelled(&h, |l| l == "Auto"), None, "eraser auto-return is not placed on the dock bar");
+    assert_eq!(labelled(&h, |l| l == "Auto-return to pen"), None, "auto-return stays inside the eraser popover");
     let eraser = labelled(&h, |l| l.starts_with("Switch between the eraser")).expect("the eraser on the tool pill");
     click(&mut h, eraser.center());
     assert_eq!(labelled(&h, |l| l == "Pixel eraser"), None, "the first tap only picks the eraser up");
+    assert_eq!(labelled(&h, |l| l == "Auto"), None, "picking the eraser still puts no Auto button on the dock bar");
+    assert_eq!(labelled(&h, |l| l == "Auto-return to pen"), None, "the first tap does not open the eraser popover");
     click(&mut h, eraser.center());
     let pixel = labelled(&h, |l| l == "Pixel eraser").expect("a second tap offers the pixel eraser");
     click(&mut h, pixel.center());
@@ -300,6 +334,58 @@ fn tapping_the_eraser_again_offers_object_or_pixel_and_a_size() {
     let object = labelled(&h, |l| l == "Object eraser").expect("and the object eraser");
     click(&mut h, object.center());
     assert_eq!(h.state().session().ink_options().eraser_kind, EraserKind::Object);
+    let auto_return = labelled(&h, |l| l == "Auto-return to pen").expect("auto-return toggle inside the eraser popover");
+    click(&mut h, auto_return.center());
+    assert_eq!(h.state().session().settings.get("eraser_auto_return").as_deref(), Some("true"));
+    let auto_return = labelled(&h, |l| l == "Auto-return to pen").expect("auto-return stays open to toggle off");
+    click(&mut h, auto_return.center());
+    assert_eq!(h.state().session().settings.get("eraser_auto_return").as_deref(), Some("false"));
+}
+
+#[test]
+fn tapping_an_active_pen_opens_rgb_picker_and_updates_nib_colour() {
+    let tmp = TempDir::new("p2-pen-rgb-picker");
+    let (session, page) = session_with_page(&tmp);
+    let mut app = NocturneApp::new(session);
+    app.open_path(&page.to_string_lossy());
+    let mut h = Harness::builder().with_size(SCREEN).with_accessibility_check(false).build_ui_state(|ui, app: &mut NocturneApp| app.show(ui), app);
+    h.ctx.set_os(OperatingSystem::IOS);
+    for _ in 0..4 {
+        h.step();
+    }
+    let initial = h.state().pen_rack()[0].colour;
+    let pen = labelled(&h, |l| l == "Pen").expect("pen on the tool pill");
+    click(&mut h, pen.center());
+    if labelled(&h, |l| l == "More Colours").is_none() {
+        let active_pen = labelled(&h, |l| l == "Pen").expect("active pen on the tool pill");
+        click(&mut h, active_pen.center());
+    }
+    h.step();
+    let more = labelled(&h, |l| l == "More Colours").expect("active pen popover offers More Colours");
+    assert_eq!(label_rect(&h, "R"), None, "RGB picker starts collapsed until More Colours is tapped");
+    click(&mut h, more.center());
+    h.step();
+    assert!(label_rect(&h, "R").is_some(), "More Colours reveals the R channel slider");
+    assert!(label_rect(&h, "G").is_some(), "More Colours reveals the G channel slider");
+    assert!(label_rect(&h, "B").is_some(), "More Colours reveals the B channel slider");
+
+    let hex_box = text_input_with_value(&h, &initial.hex()).expect("hex input inside RGB picker");
+    click(&mut h, hex_box.center());
+    let key = |k, pressed, modifiers| egui::Event::Key { key: k, physical_key: Some(k), pressed, repeat: false, modifiers };
+    h.input_mut().events.extend([
+        key(Key::A, true, Modifiers::COMMAND),
+        key(Key::A, false, Modifiers::COMMAND),
+        key(Key::Backspace, true, Modifiers::NONE),
+        key(Key::Backspace, false, Modifiers::NONE),
+    ]);
+    h.step();
+    h.input_mut().events.push(egui::Event::Text("#1a9c7e".to_string()));
+    for _ in 0..3 {
+        h.step();
+    }
+    assert_eq!(h.state().pen_rack()[0].colour, Rgb(0x1a, 0x9c, 0x7e), "custom RGB colour updates the active rack nib");
+    assert!(labelled(&h, |l| l == "More Colours").is_some(), "setting a custom colour keeps the popover open");
+    assert!(label_rect(&h, "R").is_some(), "setting a custom colour keeps the RGB picker open");
 }
 
 /// Small handwriting is short and low, and still not a line: a zigzag sixteen points wide and

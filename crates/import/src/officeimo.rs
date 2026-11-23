@@ -6,6 +6,7 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::io::Read;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -109,7 +110,32 @@ pub fn run_with_progress(
 
 fn run_one(source: &Path, output: &Path, format: Format, cancelled: &AtomicBool) -> Result<String, String> {
     let bridge = locate()?;
-    let mut command = Command::new(&bridge);
+    run_bridge(&bridge, source, output, format, cancelled)
+}
+
+fn drain_pipe(pipe: Option<impl Read + Send + 'static>) -> Option<std::thread::JoinHandle<Result<Vec<u8>, std::io::Error>>> {
+    pipe.map(|mut reader| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            reader.read_to_end(&mut buf)?;
+            Ok(buf)
+        })
+    })
+}
+
+fn finish_pipe(handle: Option<std::thread::JoinHandle<Result<Vec<u8>, std::io::Error>>>) -> Result<Vec<u8>, String> {
+    match handle {
+        Some(handle) => match handle.join() {
+            Ok(Ok(bytes)) => Ok(bytes),
+            Ok(Err(e)) => Err(format!("cannot read OfficeIMO bridge output: {e}")),
+            Err(_) => Err("OfficeIMO bridge reader thread ended unexpectedly".to_string()),
+        },
+        None => Ok(Vec::new()),
+    }
+}
+
+fn run_bridge(bridge: &Path, source: &Path, output: &Path, format: Format, cancelled: &AtomicBool) -> Result<String, String> {
+    let mut command = Command::new(bridge);
     command
         .arg("--source")
         .arg(source)
@@ -122,22 +148,34 @@ fn run_one(source: &Path, output: &Path, format: Format, cancelled: &AtomicBool)
         .stderr(Stdio::piped());
     suppress_console(&mut command);
     let mut child = command.spawn().map_err(|e| format!("cannot start OfficeIMO bridge {}: {e}", bridge.display()))?;
-    loop {
+    let stdout_reader = drain_pipe(child.stdout.take());
+    let stderr_reader = drain_pipe(child.stderr.take());
+    let status = loop {
         if cancelled.load(Ordering::Relaxed) {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = finish_pipe(stdout_reader);
+            let _ = finish_pipe(stderr_reader);
             return Err("OfficeIMO import cancelled".to_string());
         }
-        if child.try_wait().map_err(|e| format!("cannot wait for OfficeIMO bridge: {e}"))?.is_some() {
-            break;
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(40)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = finish_pipe(stdout_reader);
+                let _ = finish_pipe(stderr_reader);
+                return Err(format!("cannot wait for OfficeIMO bridge: {e}"));
+            }
         }
-        std::thread::sleep(std::time::Duration::from_millis(40));
-    }
-    let result = child.wait_with_output().map_err(|e| format!("cannot collect OfficeIMO bridge output: {e}"))?;
-    let stdout = String::from_utf8_lossy(&result.stdout).into_owned();
-    if !result.status.success() {
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        return Err(format!("OfficeIMO bridge failed with {}: {}", result.status, stderr.trim()));
+    };
+    let stdout_bytes = finish_pipe(stdout_reader)?;
+    let stderr_bytes = finish_pipe(stderr_reader)?;
+    let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
+        return Err(format!("OfficeIMO bridge failed with {}: {}", status, stderr.trim()));
     }
     Ok(stdout)
 }
@@ -310,23 +348,35 @@ fn normalize_ids(root: &Path) -> Result<(), String> {
     for (index, page) in pages.iter().enumerate() {
         let text = fs::read_to_string(page).map_err(|e| format!("cannot read {}: {e}", page.display()))?;
         let id = format!("{:020}", nodes.len() + index + 1);
-        let updated = text
-            .lines()
-            .map(|line| {
-                if line.trim_start().starts_with("id: ") {
-                    format!("id: {id}")
-                } else if line.contains("name=\"nocturne:id\"") {
-                    format!("<meta name=\"nocturne:id\" content=\"{id}\">")
-                } else {
-                    line.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n";
+        let updated = normalize_page_id(page, &text, &id);
         fs::write(page, updated).map_err(|e| format!("cannot rewrite {}: {e}", page.display()))?;
     }
     Ok(())
+}
+
+fn normalize_page_id(page: &Path, text: &str, id: &str) -> String {
+    match page.file_name().and_then(|name| name.to_str()) {
+        Some("index.md") => {
+            let (front, body) = nocturne_formats::frontmatter::split_front(text);
+            if front.is_empty() {
+                text.to_string()
+            } else {
+                let updated_front = nocturne_formats::frontmatter::set_value(&front, "id", id);
+                format!("{updated_front}{body}")
+            }
+        }
+        Some("index.html") => {
+            let Some(close) = text.to_ascii_lowercase().find("</head>") else {
+                return text.to_string();
+            };
+            let split = close + "</head>".len();
+            let head = text.get(..split).unwrap_or("");
+            let tail = text.get(split..).unwrap_or("");
+            let updated_head = nocturne_formats::html::set_meta(head, "nocturne:id", id);
+            format!("{updated_head}{tail}")
+        }
+        _ => text.to_string(),
+    }
 }
 
 fn collect_nodes(dir: &Path, nodes: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -456,5 +506,61 @@ mod tests {
     #[test]
     fn target_names_are_release_rids() {
         assert!(matches!(target_name(), "win-x64" | "linux-x64" | "osx-x64" | "osx-arm64" | "unsupported"));
+    }
+
+    #[test]
+    fn normalize_ids_rewrites_only_metadata_and_preserves_page_bodies() {
+        let dir = nocturne_store::testing::TempDir::new("officeimo-normalize-ids");
+        let root = dir.path();
+        fs::write(root.join("_node.toml"), "kind = \"notebook\"\ntitle = \"N\"\nid = \"old\"\n").expect("node");
+
+        let md_dir = root.join("01-md");
+        fs::create_dir_all(&md_dir).expect("md dir");
+        let md_body = "\n# Notes\n\n```yaml\nid: keep-me\n  id: indented-keep-me\n```\n\n<meta name=\"nocturne:id\" content=\"literal-body\">\n";
+        let md_page = format!("---\ntitle: MD\nid: old-md\n---\n{md_body}");
+        fs::write(md_dir.join("index.md"), &md_page).expect("write md");
+
+        let html_dir = root.join("02-html");
+        fs::create_dir_all(&html_dir).expect("html dir");
+        let html_tail = "\n<body>\n<pre>id: keep-me\n<meta name=\"nocturne:id\" content=\"example\"></pre>\n</body>\n</html>\n";
+        let html_page = format!("<!doctype html>\n<html>\n<head>\n<meta name=\"nocturne:id\" content=\"old-html\">\n</head>{html_tail}");
+        fs::write(html_dir.join("index.html"), &html_page).expect("write html");
+
+        let html_missing_dir = root.join("03-html-missing");
+        fs::create_dir_all(&html_missing_dir).expect("html missing dir");
+        let html_missing = format!("<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n</head>{html_tail}");
+        fs::write(html_missing_dir.join("index.html"), &html_missing).expect("write html missing");
+
+        normalize_ids(root).expect("normalize_ids");
+
+        let md_after = fs::read_to_string(md_dir.join("index.md")).expect("read md");
+        let (front, body_after) = nocturne_formats::frontmatter::split_front(&md_after);
+        assert_eq!(nocturne_formats::frontmatter::value(&front, "id").as_deref(), Some("00000000000000000002"));
+        assert_eq!(body_after, md_body, "markdown body must remain untouched");
+
+        let html_after = fs::read_to_string(html_dir.join("index.html")).expect("read html");
+        assert_eq!(nocturne_formats::html::meta(&html_after, "nocturne:id").as_deref(), Some("00000000000000000003"));
+        assert!(html_after.ends_with(html_tail), "html body must remain untouched:\n{html_after}");
+
+        let html_missing_after = fs::read_to_string(html_missing_dir.join("index.html")).expect("read html missing");
+        assert_eq!(nocturne_formats::html::meta(&html_missing_after, "nocturne:id").as_deref(), Some("00000000000000000004"));
+        assert!(html_missing_after.ends_with(html_tail), "body meta mention must not be rewritten:\n{html_missing_after}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_bridge_drains_large_stdout_and_stderr_without_deadlocking() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = nocturne_store::testing::TempDir::new("officeimo-pipe-drain");
+        let script = dir.path().join("chatty-bridge.sh");
+        // Write >128 KiB to both stdout and stderr so unread OS pipes would deadlock.
+        let body = "#!/bin/sh\nline='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'\ni=0\nwhile [ \"$i\" -lt 2200 ]; do\n  printf '%s\\n' \"$line\"\n  printf '%s\\n' \"$line\" >&2\n  i=$((i + 1))\ndone\n";
+        fs::write(&script, body).expect("write script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let cancelled = AtomicBool::new(false);
+        let stdout = run_bridge(&script, dir.path(), dir.path(), Format::Html, &cancelled).expect("bridge succeeds");
+        assert!(stdout.len() >= 2200 * 65, "all stdout drained: {} bytes", stdout.len());
     }
 }

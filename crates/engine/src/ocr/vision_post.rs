@@ -54,7 +54,7 @@ struct Item {
 }
 
 impl Item {
-    fn from_observation(obs: &VisionObservation) -> Option<Self> {
+    fn from_observation(obs: &VisionObservation, aspect: f32) -> Option<Self> {
         let trimmed = obs.text.trim();
         if trimmed.is_empty()
             || !obs.x.is_finite()
@@ -69,9 +69,9 @@ impl Item {
         Some(Self {
             raw_text: trimmed.to_string(),
             latex: normalize_math_text(trimmed),
-            x: obs.x,
+            x: obs.x * aspect,
             y: obs.y,
-            width: obs.width,
+            width: obs.width * aspect,
             height: obs.height,
             is_composite: false,
         })
@@ -94,14 +94,152 @@ impl Item {
     }
 }
 
-/// Converts 2D bounding-box text observations into a single line of normalized LaTeX.
+/// Converts 2D bounding-box text observations into a single line of normalized LaTeX,
+/// assuming a square (`1.0`) image aspect ratio.
 #[must_use]
 pub fn observations_to_latex(observations: &[VisionObservation]) -> String {
-    let items: Vec<Item> = observations.iter().filter_map(Item::from_observation).collect();
+    observations_to_latex_with_aspect(observations, 1.0)
+}
+
+/// Converts 2D bounding-box text observations into a single line of normalized LaTeX,
+/// scaling horizontal coordinates by the source image's `aspect` ratio (`width / height`,
+/// clamped to `[0.25, 16.0]`) so horizontal gaps and widths use the same isotropic units
+/// as vertical heights across every 2D layout pass.
+#[must_use]
+pub fn observations_to_latex_with_aspect(observations: &[VisionObservation], aspect: f32) -> String {
+    let aspect = if aspect.is_finite() { aspect.clamp(0.25, 16.0) } else { 1.0 };
+    let items: Vec<Item> = observations.iter().filter_map(|obs| Item::from_observation(obs, aspect)).collect();
     if items.is_empty() {
         return String::new();
     }
     layout_items(items, 0)
+}
+
+#[derive(Clone, Debug)]
+struct TextToken {
+    text: String,
+    x: f32,
+    y: f32,
+    height: f32,
+}
+
+impl TextToken {
+    fn from_observation(obs: &VisionObservation) -> Option<Self> {
+        let trimmed = obs.text.trim();
+        if trimmed.is_empty()
+            || !obs.x.is_finite()
+            || !obs.y.is_finite()
+            || !obs.width.is_finite()
+            || !obs.height.is_finite()
+            || obs.width <= 0.0
+            || obs.height <= 0.0
+        {
+            return None;
+        }
+        Some(Self { text: trimmed.to_string(), x: obs.x, y: obs.y, height: obs.height })
+    }
+
+    fn y_center(&self) -> f32 {
+        self.y + self.height * 0.5
+    }
+
+    fn bottom(&self) -> f32 {
+        self.y + self.height
+    }
+}
+
+struct TextLine {
+    tokens: Vec<TextToken>,
+    top: f32,
+    bottom: f32,
+    center_sum: f32,
+    height_sum: f32,
+}
+
+impl TextLine {
+    fn new(tok: TextToken) -> Self {
+        let top = tok.y;
+        let bottom = tok.bottom();
+        let center_sum = tok.y_center();
+        let height_sum = tok.height;
+        Self { tokens: vec![tok], top, bottom, center_sum, height_sum }
+    }
+
+    fn push(&mut self, tok: TextToken) {
+        self.top = self.top.min(tok.y);
+        self.bottom = self.bottom.max(tok.bottom());
+        self.center_sum += tok.y_center();
+        self.height_sum += tok.height;
+        self.tokens.push(tok);
+    }
+
+    fn avg_center(&self) -> f32 {
+        self.center_sum / self.tokens.len().max(1) as f32
+    }
+
+    fn avg_height(&self) -> f32 {
+        self.height_sum / self.tokens.len().max(1) as f32
+    }
+
+    fn line_height(&self) -> f32 {
+        (self.bottom - self.top).max(1e-4)
+    }
+}
+
+/// Converts 2D bounding-box text observations into plain multi-line handwritten text,
+/// preserving line breaks (`\n`) and larger paragraph breaks (`\n\n`).
+#[must_use]
+pub fn observations_to_text(observations: &[VisionObservation]) -> String {
+    let mut tokens: Vec<TextToken> = observations.iter().filter_map(TextToken::from_observation).collect();
+    if tokens.is_empty() {
+        return String::new();
+    }
+    tokens.sort_by(|a, b| a.y_center().total_cmp(&b.y_center()).then_with(|| a.x.total_cmp(&b.x)));
+
+    let mut lines: Vec<TextLine> = Vec::new();
+    for tok in tokens {
+        let mut best: Option<(usize, f32)> = None;
+        for (idx, line) in lines.iter().enumerate() {
+            let diff = (tok.y_center() - line.avg_center()).abs();
+            let threshold = 0.55 * tok.height.min(line.avg_height());
+            if diff <= threshold && best.is_none_or(|(_, best_diff)| diff < best_diff) {
+                best = Some((idx, diff));
+            }
+        }
+        match best {
+            Some((idx, _)) => lines[idx].push(tok),
+            None => lines.push(TextLine::new(tok)),
+        }
+    }
+
+    for line in &mut lines {
+        line.tokens.sort_by(|a, b| a.x.total_cmp(&b.x));
+    }
+    lines.sort_by(|a, b| a.avg_center().total_cmp(&b.avg_center()));
+
+    let mut heights: Vec<f32> = lines.iter().map(TextLine::line_height).collect();
+    heights.sort_by(f32::total_cmp);
+    let median_line_height = heights[heights.len() / 2].max(1e-4);
+
+    let mut out = String::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if idx > 0 {
+            let prev = &lines[idx - 1];
+            let gap = (line.top - prev.bottom).max(0.0);
+            if gap > 1.6 * median_line_height {
+                out.push_str("\n\n");
+            } else {
+                out.push('\n');
+            }
+        }
+        for (t_idx, tok) in line.tokens.iter().enumerate() {
+            if t_idx > 0 {
+                out.push(' ');
+            }
+            out.push_str(&tok.text);
+        }
+    }
+    out
 }
 
 fn layout_items(mut items: Vec<Item>, depth: usize) -> String {
@@ -906,5 +1044,34 @@ mod tests {
             obs("2", 0.43, 0.30, 0.05, 0.09),
         ];
         assert_eq!(observations_to_latex(&input), "\\sum_{i=1}^{n} k^{2}");
+    }
+
+    #[test]
+    fn wide_8_to_1_equation_does_not_absorb_distant_terms_as_scripts() {
+        // Coordinates on an 800x100 (8:1) image:
+        // - `x` at x=40..60px (0.05..0.075), y=35..75px (h=0.40)
+        // - real superscript `2` right beside `x` at x=64..78px (0.08..0.0975), y=20..42px
+        // - distant slightly-raised `y` way over at x=240..260px (0.30..0.325), y=22..46px
+        let input = vec![obs("x", 0.05, 0.35, 0.025, 0.40), obs("2", 0.08, 0.20, 0.0175, 0.22), obs("y", 0.30, 0.22, 0.025, 0.24)];
+        // Without aspect-ratio scaling, normalized x distances are compressed 8x so `y` is wrongly
+        // captured into the superscript of `x`.
+        assert_eq!(observations_to_latex(&input), "x^{2 y}");
+        // With the true 8:1 aspect ratio, `2` stays a superscript while distant `y` stays separate.
+        assert_eq!(observations_to_latex_with_aspect(&input, 8.0), "x^{2} y");
+    }
+
+    #[test]
+    fn observations_to_text_groups_lines_and_preserves_paragraph_breaks() {
+        let input = vec![
+            obs("   ", 0.01, 0.01, 0.10, 0.05),
+            obs("bad", f32::NAN, 0.10, 0.10, 0.05),
+            obs("New paragraph", 0.05, 0.40, 0.40, 0.06),
+            obs("world", 0.30, 0.105, 0.18, 0.06),
+            obs("Hello", 0.05, 0.10, 0.20, 0.06),
+            obs("line.", 0.30, 0.192, 0.15, 0.06),
+            obs("Second", 0.05, 0.19, 0.22, 0.06),
+        ];
+        assert_eq!(observations_to_text(&input), "Hello world\nSecond line.\n\nNew paragraph");
+        assert_eq!(observations_to_text(&[]), "");
     }
 }

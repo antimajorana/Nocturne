@@ -280,7 +280,7 @@ pub fn to_markdown(html: &str) -> String {
                 // Skip to the matching close tag.
                 let needle = format!("</{name}");
                 let rest: String = chars.get(i..).map(|s| s.iter().collect()).unwrap_or_default();
-                match rest.to_lowercase().find(&needle) {
+                match rest.to_ascii_lowercase().find(&needle) {
                     Some(p) => i += rest.get(..p).map(|s| s.chars().count()).unwrap_or(0),
                     None => i = chars.len(),
                 }
@@ -311,11 +311,20 @@ fn parse_tag(raw: &str) -> (String, bool, String) {
 }
 
 fn attr(attrs: &str, key: &str) -> Option<String> {
-    let lower = attrs.to_lowercase();
-    let marker = format!("{key}=\"");
-    let start = lower.find(&marker)? + marker.len();
-    let end = attrs.get(start..)?.find('"')?;
-    attrs.get(start..start + end).map(unescape)
+    let lower = attrs.to_ascii_lowercase();
+    let marker = format!("{}=\"", key.to_ascii_lowercase());
+    let mut offset = 0;
+    while let Some(rel) = lower.get(offset..)?.find(&marker) {
+        let pos = offset + rel;
+        let at_boundary = pos == 0 || lower.as_bytes().get(pos - 1).is_some_and(u8::is_ascii_whitespace);
+        if at_boundary {
+            let start = pos + marker.len();
+            let end = attrs.get(start..)?.find('"')?;
+            return attrs.get(start..start + end).map(unescape);
+        }
+        offset = pos + marker.len();
+    }
+    None
 }
 
 fn font_size(attrs: &str) -> Option<u8> {
@@ -352,9 +361,9 @@ struct Writer {
     /// Where the open code block's fence starts in `out`, so it can be made longer when the
     /// code turns out to hold a fence of its own.
     fence_at: Option<usize>,
-    in_math: bool,
+    math_depth: usize,
     in_math_block: bool,
-    span_sizes: Vec<bool>,
+    span_stack: Vec<(bool, bool)>, // (styled, math)
     href: Vec<Option<String>>,
     row: Option<Vec<String>>,
     cell: String,
@@ -454,7 +463,7 @@ impl Writer {
                 last_space = false;
             }
         }
-        if self.in_math || self.in_code {
+        if self.math_depth > 0 || self.in_code {
             // Keep the TeX as written between dollar signs.
             self.push(&s);
         } else {
@@ -603,8 +612,10 @@ impl Writer {
             ("span", false) => {
                 let size = font_size(attrs);
                 let family = font_family(attrs);
-                self.span_sizes.push(size.is_some() || family.is_some());
-                if size.is_some() || family.is_some() {
+                let styled = size.is_some() || family.is_some();
+                let is_math = attr(attrs, "class").is_some_and(|c| c.split_whitespace().any(|tok| tok.eq_ignore_ascii_case("math")));
+                self.span_stack.push((styled, is_math));
+                if styled {
                     let mut styles = Vec::new();
                     if let Some(family) = family {
                         styles.push(format!("font-family: {}", escape(&crate::markdown::font_family_css(&family))));
@@ -614,15 +625,18 @@ impl Writer {
                     }
                     self.push(&format!("<span style=\"{}\">", styles.join("; ")));
                 }
-                if attrs.to_lowercase().contains("math") {
-                    self.in_math = true;
+                if is_math {
+                    self.math_depth += 1;
                 }
             }
             ("span", true) => {
-                if self.span_sizes.pop().unwrap_or(false) {
-                    self.push("</span>");
-                } else {
-                    self.in_math = false;
+                if let Some((styled, is_math)) = self.span_stack.pop() {
+                    if styled {
+                        self.push("</span>");
+                    }
+                    if is_math {
+                        self.math_depth = self.math_depth.saturating_sub(1);
+                    }
                 }
             }
             ("a", false) => {
@@ -884,5 +898,37 @@ mod tests {
         for junk in ["<", "<<>>", "<p", "</p></p></div>", "<li>x", "&", "<script>never closed"] {
             let _ = to_markdown(junk);
         }
+    }
+
+    #[test]
+    fn cambria_math_font_and_styled_math_spans_do_not_latch_math_mode() {
+        let cambria = to_markdown("<p><span style=\"font-family: Cambria Math\">a * b</span> and c * d</p>");
+        assert!(cambria.contains("a \\* b"), "Cambria Math font is not math mode: {cambria}");
+        assert!(cambria.contains("c \\* d"), "text after Cambria Math stays escaped: {cambria}");
+
+        let styled_math = to_markdown("<p><span class=\"math\" style=\"font-size: 18pt\">$x^2$</span> and a * b</p>");
+        assert!(styled_math.contains("<span style=\"font-size: 18pt\">$x^2$</span>"), "{styled_math}");
+        assert!(styled_math.contains("a \\* b"), "math mode exits when styled math span closes: {styled_math}");
+
+        let nested_math = to_markdown("<p><span class=\"equation math\"><span>$a*b$</span> $c*d$</span> and e * f</p>");
+        assert!(nested_math.contains("$a*b$") && nested_math.contains("$c*d$"), "{nested_math}");
+        assert!(nested_math.contains("e \\* f"), "{nested_math}");
+
+        let non_math_class = to_markdown("<p><span class=\"mathematics\">a * b</span></p>");
+        assert!(non_math_class.contains("a \\* b"), "{non_math_class}");
+    }
+
+    #[test]
+    fn unicode_case_expansion_does_not_corrupt_attrs_or_script_skip() {
+        // Turkish dotted capital 'İ' expands from 2 bytes to 3 bytes under Unicode `.to_lowercase()`.
+        let img = to_markdown("<p><img alt=\"İ\" src=\"assets/pic.png\" width=\"80\"></p>");
+        assert_eq!(img, "<img src=\"assets/pic.png\" alt=\"İ\" width=\"80\">\n");
+
+        let boundary = to_markdown("<p><img data-src=\"wrong.png\" src=\"right.png\" data-width=\"999\" width=\"48\"></p>");
+        assert_eq!(boundary, "<img src=\"right.png\" alt=\"\" width=\"48\">\n");
+
+        let script = to_markdown("<p>before</p><script>var s = \"İ\";</script><p>after</p>");
+        assert!(!script.contains("var s"), "{script}");
+        assert!(script.contains("before") && script.contains("after"), "{script}");
     }
 }

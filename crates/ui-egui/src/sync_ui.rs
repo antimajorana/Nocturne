@@ -128,75 +128,81 @@ pub fn show_sync_dialog(ctx: &Context, form: &mut CloudSyncForm, supported: bool
                 ui.label(RichText::new(crate::tl_id!("ui.kdrive_sync_intro")).small().color(tokens.muted));
                 ui.add_space(10.0);
 
-                ui.label(RichText::new(crate::tl_id!("ui.kdrive_token_label")).strong().color(tokens.text));
-                ui.add_space(2.0);
-                let hint =
-                    if form.has_saved_token { crate::tl_id!("ui.kdrive_token_saved_hint") } else { crate::tl_id!("ui.kdrive_token_paste_hint") };
-                if stacked {
-                    ui.add(egui::TextEdit::singleline(&mut form.token_input).password(true).hint_text(hint).desired_width((avail - 8.0).max(120.0)));
-                    if form.has_saved_token {
-                        ui.add_space(4.0);
-                        if modal::danger_button(ui, crate::tl_id!("ui.kdrive_clear_token"), tokens).clicked() {
-                            out.clear_token = true;
+                ui.add_enabled_ui(!sync_busy, |ui| {
+                    ui.label(RichText::new(crate::tl_id!("ui.kdrive_token_label")).strong().color(tokens.text));
+                    ui.add_space(2.0);
+                    let hint =
+                        if form.has_saved_token { crate::tl_id!("ui.kdrive_token_saved_hint") } else { crate::tl_id!("ui.kdrive_token_paste_hint") };
+                    if stacked {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut form.token_input).password(true).hint_text(hint).desired_width((avail - 8.0).max(120.0)),
+                        );
+                        if form.has_saved_token {
+                            ui.add_space(4.0);
+                            if modal::danger_button(ui, crate::tl_id!("ui.kdrive_clear_token"), tokens).clicked() {
+                                out.clear_token = true;
+                            }
                         }
+                    } else {
+                        ui.horizontal(|ui| {
+                            let input_w = if form.has_saved_token { (avail - 124.0).max(140.0) } else { (avail - 8.0).max(140.0) };
+                            ui.add(egui::TextEdit::singleline(&mut form.token_input).password(true).hint_text(hint).desired_width(input_w));
+                            if form.has_saved_token && modal::danger_button(ui, crate::tl_id!("ui.kdrive_clear_token"), tokens).clicked() {
+                                out.clear_token = true;
+                            }
+                        });
                     }
-                } else {
-                    ui.horizontal(|ui| {
-                        let input_w = if form.has_saved_token { (avail - 124.0).max(140.0) } else { (avail - 8.0).max(140.0) };
-                        ui.add(egui::TextEdit::singleline(&mut form.token_input).password(true).hint_text(hint).desired_width(input_w));
-                        if form.has_saved_token && modal::danger_button(ui, crate::tl_id!("ui.kdrive_clear_token"), tokens).clicked() {
-                            out.clear_token = true;
-                        }
-                    });
-                }
 
-                ui.add_space(8.0);
-                if stacked {
-                    let field_w = (avail - 8.0).max(120.0);
-                    ui.label(RichText::new(crate::tl_id!("ui.kdrive_remote_folder_label")).color(tokens.text));
-                    ui.add(egui::TextEdit::singleline(&mut form.remote_path).hint_text(DEFAULT_KDRIVE_REMOTE_PATH).desired_width(field_w));
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(crate::tl_id!("ui.kdrive_drive_id_label")).color(tokens.text));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut form.drive_id_input)
-                            .hint_text(crate::tl_id!("ui.kdrive_drive_id_auto_hint"))
-                            .desired_width(field_w),
-                    );
-                } else {
-                    let remote_w = (avail * 0.62 - 8.0).max(140.0);
-                    let drive_w = (avail - remote_w - 20.0).max(96.0);
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(crate::tl_id!("ui.kdrive_remote_folder_label")).color(tokens.text));
-                            ui.add(egui::TextEdit::singleline(&mut form.remote_path).hint_text(DEFAULT_KDRIVE_REMOTE_PATH).desired_width(remote_w));
+                    ui.add_space(8.0);
+                    if stacked {
+                        let field_w = (avail - 8.0).max(120.0);
+                        ui.label(RichText::new(crate::tl_id!("ui.kdrive_remote_folder_label")).color(tokens.text));
+                        ui.add(egui::TextEdit::singleline(&mut form.remote_path).hint_text(DEFAULT_KDRIVE_REMOTE_PATH).desired_width(field_w));
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(crate::tl_id!("ui.kdrive_drive_id_label")).color(tokens.text));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut form.drive_id_input)
+                                .hint_text(crate::tl_id!("ui.kdrive_drive_id_auto_hint"))
+                                .desired_width(field_w),
+                        );
+                    } else {
+                        let remote_w = (avail * 0.62 - 8.0).max(140.0);
+                        let drive_w = (avail - remote_w - 20.0).max(96.0);
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(crate::tl_id!("ui.kdrive_remote_folder_label")).color(tokens.text));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut form.remote_path).hint_text(DEFAULT_KDRIVE_REMOTE_PATH).desired_width(remote_w),
+                                );
+                            });
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(crate::tl_id!("ui.kdrive_drive_id_label")).color(tokens.text));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut form.drive_id_input)
+                                        .hint_text(crate::tl_id!("ui.kdrive_drive_id_auto_hint"))
+                                        .desired_width(drive_w),
+                                );
+                            });
                         });
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(crate::tl_id!("ui.kdrive_drive_id_label")).color(tokens.text));
-                            ui.add(
-                                egui::TextEdit::singleline(&mut form.drive_id_input)
-                                    .hint_text(crate::tl_id!("ui.kdrive_drive_id_auto_hint"))
-                                    .desired_width(drive_w),
-                            );
-                        });
-                    });
-                }
+                    }
 
-                ui.add_space(8.0);
-                ui.collapsing(crate::tl_id!("ui.kdrive_advanced_section"), |ui| {
-                    ui.label(RichText::new(crate::tl_id!("ui.kdrive_endpoint_label")).small().color(tokens.muted));
-                    let ep_w = (ui.available_width() - 8.0).max(120.0);
-                    ui.add(egui::TextEdit::singleline(&mut form.endpoint).hint_text(DEFAULT_KDRIVE_ENDPOINT).desired_width(ep_w));
-                    ui.checkbox(&mut form.propagate_deletes, crate::tl_id!("ui.kdrive_propagate_deletes_label"));
+                    ui.add_space(8.0);
+                    ui.collapsing(crate::tl_id!("ui.kdrive_advanced_section"), |ui| {
+                        ui.label(RichText::new(crate::tl_id!("ui.kdrive_endpoint_label")).small().color(tokens.muted));
+                        let ep_w = (ui.available_width() - 8.0).max(120.0);
+                        ui.add(egui::TextEdit::singleline(&mut form.endpoint).hint_text(DEFAULT_KDRIVE_ENDPOINT).desired_width(ep_w));
+                        ui.checkbox(&mut form.propagate_deletes, crate::tl_id!("ui.kdrive_propagate_deletes_label"));
+                    });
+
+                    ui.add_space(8.0);
+                    ui.checkbox(&mut form.markdown_default, crate::tl_id!("ui.kdrive_markdown_default_label"));
+                    ui.add_space(4.0);
+                    if modal::secondary_button(ui, crate::tl_id!("ui.kdrive_convert_notebooks_md_btn"), tokens).clicked() {
+                        out.convert_existing_to_markdown = true;
+                    }
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut form.auto_sync, crate::tl_id!("ui.kdrive_auto_sync_label"));
                 });
-
-                ui.add_space(8.0);
-                ui.checkbox(&mut form.markdown_default, crate::tl_id!("ui.kdrive_markdown_default_label"));
-                ui.add_space(4.0);
-                if modal::secondary_button(ui, crate::tl_id!("ui.kdrive_convert_notebooks_md_btn"), tokens).clicked() {
-                    out.convert_existing_to_markdown = true;
-                }
-                ui.add_space(4.0);
-                ui.checkbox(&mut form.auto_sync, crate::tl_id!("ui.kdrive_auto_sync_label"));
 
                 if let Some((ref msg, is_err)) = form.last_message {
                     ui.add_space(8.0);

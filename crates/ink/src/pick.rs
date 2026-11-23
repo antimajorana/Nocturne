@@ -81,6 +81,9 @@ pub fn touching(drawing: &Drawing, rect: (f32, f32, f32, f32)) -> Vec<usize> {
 /// crosses it: an odd number means inside. The path is treated as closed whether or not its
 /// last point meets its first, because a hand drawing a loop rarely closes it exactly.
 pub fn encloses(loop_: &[(f32, f32)], x: f32, y: f32) -> bool {
+    if loop_.len() < 3 {
+        return false;
+    }
     let mut inside = false;
     let mut j = loop_.len() - 1;
     for i in 0..loop_.len() {
@@ -258,6 +261,10 @@ mod tests {
         // A hand never closes a loop exactly, and it must not have to.
         let open = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0), (0.0, 1.0)];
         assert!(encloses(&open, 5.0, 5.0));
+        // Fewer than three points cannot enclose anything and must never panic.
+        assert!(!encloses(&[], 0.0, 0.0));
+        assert!(!encloses(&[(0.0, 0.0)], 0.0, 0.0));
+        assert!(!encloses(&[(0.0, 0.0), (10.0, 10.0)], 5.0, 5.0));
     }
 
     #[test]

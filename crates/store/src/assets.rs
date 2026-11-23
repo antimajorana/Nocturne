@@ -84,7 +84,7 @@ pub fn ensure_icon(page_dir: &Path, file_name: &str) -> Result<()> {
     #[cfg(target_os = "windows")]
     if icon_slot_free(page_dir, &format!("{safe}.png")) {
         let target = dir.join(format!("{safe}.png"));
-        let source = dir.join(file_name);
+        let source = dir.join(&safe);
         match platform::shell_icon(&source, &target) {
             Ok(()) => {
                 set_recorded(page_dir, &format!("{safe}.png"), true)?;
@@ -110,7 +110,7 @@ pub fn ensure_icon(page_dir: &Path, file_name: &str) -> Result<()> {
         log::warn!("attachment icon not written: a file of the user's is already called {icon:?}");
         return Ok(());
     }
-    let ext = file_name.rsplit_once('.').map(|(_, e)| e.to_ascii_uppercase()).unwrap_or_else(|| "FILE".into());
+    let ext = safe.rsplit_once('.').map(|(_, e)| e.to_ascii_uppercase()).filter(|e| !e.is_empty()).unwrap_or_else(|| "FILE".into());
     let target = dir.join(&icon);
     let colour = match ext.as_str() {
         "PDF" => "#d93025",
@@ -477,5 +477,22 @@ mod tests {
         assert_eq!(media_kind("a.mp3"), MediaKind::Audio);
         assert_eq!(media_kind("a.pdf"), MediaKind::Other);
         assert_eq!(media_kind("noext"), MediaKind::Other);
+    }
+
+    #[test]
+    fn ensure_icon_sanitizes_svg_extension_and_keeps_paths_inside_assets() {
+        let t = TempDir::new("assets-icon-sanitize");
+        let p = page(&t);
+        for hostile in ["evil.<script>&\"'tag>", "../../secret.<svg>payload"] {
+            ensure_icon(&p, hostile).expect("icon");
+            let safe = names::safe_file_name(hostile);
+            let svg_path = p.join("assets").join(format!("{safe}.svg"));
+            assert!(svg_path.is_file(), "icon should be written under sanitized path: {svg_path:?}");
+            let svg = fs::read_to_string(&svg_path).expect("read svg");
+            assert!(!svg.contains("<script"), "SVG must not contain injected tags: {svg}");
+            let label = svg.split("<text ").nth(1).and_then(|rest| rest.split_once('>')).map(|(_, tail)| tail).unwrap_or("");
+            let label = label.strip_suffix("</text></svg>").expect("text element");
+            assert!(!label.contains(['<', '>', '&', '"', '\'']), "label must be XML-safe: {label:?}");
+        }
     }
 }

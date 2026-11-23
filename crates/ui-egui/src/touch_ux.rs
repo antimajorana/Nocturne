@@ -276,6 +276,16 @@ pub fn compute_multitouch_canvas_step(translation_delta: egui::Vec2, zoom_delta:
     MultiTouchStep { scroll_y, pan_x, new_zoom }
 }
 
+/// Sanitizes multi-touch translation and pinch zoom deltas without the 1.5% per-frame deadzone,
+/// allowing slow pinches with wide finger spacing to accumulate smoothly.
+#[must_use]
+pub fn sanitize_multitouch_canvas_delta(translation_delta: egui::Vec2, zoom_delta: f32) -> (egui::Vec2, Option<f32>) {
+    let pan_x = if translation_delta.x.is_finite() { translation_delta.x } else { 0.0 };
+    let scroll_y = if translation_delta.y.is_finite() { translation_delta.y } else { 0.0 };
+    let zoom = (zoom_delta.is_finite() && zoom_delta > 0.0 && (zoom_delta - 1.0).abs() > 0.0005).then_some(zoom_delta);
+    (egui::vec2(pan_x, scroll_y), zoom)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PendingLongPress {
     id: egui::TouchId,
@@ -557,6 +567,25 @@ mod tests {
         assert_eq!(step(vec2(12.5, -24.0), 1.25, 100), MultiTouchStep { scroll_y: -24.0, pan_x: 12.5, new_zoom: Some(125) });
         assert_eq!(step(vec2(f32::NAN, f32::INFINITY), f32::NAN, 100), MultiTouchStep { scroll_y: 0.0, pan_x: 0.0, new_zoom: None });
         assert_eq!(step(vec2(f32::NAN, 8.0), -2.0, 100), MultiTouchStep { scroll_y: 8.0, pan_x: 0.0, new_zoom: None });
+    }
+
+    #[test]
+    fn sanitize_multitouch_canvas_delta_preserves_small_wide_finger_pinch_steps() {
+        // Wide-finger slow pinch ratios (well below the legacy 1.5% deadzone) pass through cleanly.
+        assert_eq!(sanitize_multitouch_canvas_delta(vec2(4.0, -6.0), 1.004), (vec2(4.0, -6.0), Some(1.004)));
+        assert_eq!(sanitize_multitouch_canvas_delta(Vec2::ZERO, 0.996), (Vec2::ZERO, Some(0.996)));
+        assert_eq!(sanitize_multitouch_canvas_delta(Vec2::ZERO, 1.0006), (Vec2::ZERO, Some(1.0006)));
+
+        // Unity and sub-0.05% floating-point noise collapse to None.
+        assert_eq!(sanitize_multitouch_canvas_delta(Vec2::ZERO, 1.0), (Vec2::ZERO, None));
+        assert_eq!(sanitize_multitouch_canvas_delta(Vec2::ZERO, 1.0004), (Vec2::ZERO, None));
+        assert_eq!(sanitize_multitouch_canvas_delta(Vec2::ZERO, 0.9996), (Vec2::ZERO, None));
+
+        // Non-finite translation axes and non-finite / non-positive zoom deltas are sanitized safely.
+        assert_eq!(sanitize_multitouch_canvas_delta(vec2(f32::NAN, f32::INFINITY), f32::NAN), (Vec2::ZERO, None));
+        assert_eq!(sanitize_multitouch_canvas_delta(vec2(f32::NEG_INFINITY, 8.0), 0.0), (vec2(0.0, 8.0), None));
+        assert_eq!(sanitize_multitouch_canvas_delta(vec2(3.5, f32::NAN), -1.2), (vec2(3.5, 0.0), None));
+        assert_eq!(sanitize_multitouch_canvas_delta(Vec2::ZERO, f32::INFINITY), (Vec2::ZERO, None));
     }
 
     #[test]

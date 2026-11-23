@@ -25,6 +25,7 @@ pub struct ToolSettingsIn<'a> {
     pub hold_to_straighten: bool,
     pub eraser_pixel: bool,
     pub math_ocr_enabled: bool,
+    pub handwriting_ocr_enabled: bool,
     pub library_view: LibraryView,
     pub studio: StudioOptions,
     pub rack: &'a [Nib],
@@ -65,7 +66,7 @@ fn heading(ui: &mut Ui, label: &str, t: &Tokens) {
 /// One of a row of choices of which one is taken.
 // i18n-ui-text: label
 fn choice(ui: &mut Ui, label: &str, chosen: bool, t: &Tokens) -> bool {
-    let button = egui::Button::new(RichText::new(label).color(if chosen { t.accent_text } else { t.text }))
+    let button = egui::Button::new(RichText::new(label).color(if chosen { t.strong } else { t.text }))
         .fill(if chosen { t.row_selected } else { t.panel })
         .stroke(if chosen { Stroke::new(1.5, t.accent) } else { Stroke::new(1.0, t.border) })
         .corner_radius(CornerRadius::same(RADIUS_CONTROL))
@@ -167,6 +168,9 @@ pub fn show(ctx: &Context, view: Rect, input: &ToolSettingsIn<'_>, t: &Tokens) -
                         });
                 });
         });
+    if !acts.contains(&Act::ToggleToolSettings) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        acts.push(Act::ToggleToolSettings);
+    }
     acts
 }
 
@@ -196,10 +200,18 @@ fn switches(ui: &mut Ui, input: &ToolSettingsIn<'_>, acts: &mut Vec<Act>, t: &To
             }
         }
     });
-    ui.add_space(6.0);
+    heading(ui, crate::tl_id!("ui.ocr_recognition_heading"), t);
     let mut math_ocr = input.math_ocr_enabled;
     if ui.checkbox(&mut math_ocr, crate::tl_id!("ui.recognise_handwritten_equations")).changed() {
         acts.push(Act::ToggleMathOcr);
+    }
+    let mut handwriting_ocr = input.handwriting_ocr_enabled;
+    if ui
+        .checkbox(&mut handwriting_ocr, crate::tl_id!("ui.handwriting_ocr_enable"))
+        .on_hover_text(crate::tl_id!("ui.handwriting_ocr_enable_tip"))
+        .changed()
+    {
+        acts.push(Act::ToggleHandwritingOcr);
     }
     let ocr_btn = ui.add(
         egui::Button::new(RichText::new(crate::tl_id!("ui.recognition_service_open")).color(t.text))
@@ -300,6 +312,8 @@ fn pens(ui: &mut Ui, input: &ToolSettingsIn<'_>, acts: &mut Vec<Act>, t: &Tokens
         });
         // The pen in hand, when it is of this kind: its colour and its thickness.
         if let Some(nib) = input.rack.get(input.nib).copied().filter(|nib| nib.tool == tool) {
+            let rgb_open_id = Id::unique("tool-settings-rgb-picker-open");
+            let mut rgb_open = ui.ctx().data(|d| d.get_temp::<Option<usize>>(rgb_open_id)) == Some(Some(input.nib));
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
                 ui.add_space(96.0);
@@ -317,6 +331,10 @@ fn pens(ui: &mut Ui, input: &ToolSettingsIn<'_>, acts: &mut Vec<Act>, t: &Tokens
                         acts.push(Act::InkRack(RackEdit::Set(input.nib, Nib { colour: rgb, ..nib })));
                     }
                 }
+                let is_preset = NIB_COLOURS.contains(&nib.colour);
+                if crate::ink_color::custom_color_button(ui, vec2(34.0, 34.0), rgb_open, nib.colour, is_preset, t).clicked() {
+                    rgb_open = !rgb_open;
+                }
                 ui.separator();
                 for tenths in rack::THICKNESSES {
                     let chosen = nib.tenths.abs_diff(tenths) <= 3;
@@ -329,6 +347,58 @@ fn pens(ui: &mut Ui, input: &ToolSettingsIn<'_>, acts: &mut Vec<Act>, t: &Tokens
                     }
                 }
             });
+            if rgb_open {
+                ui.add_space(4.0);
+                if let Some(rgb) = crate::ink_color::show_rgb_picker(ui, Id::unique("tool-settings-nib-rgb-picker"), nib.colour, t) {
+                    acts.push(Act::InkRack(RackEdit::Set(input.nib, Nib::new(nib.tool, rgb, nib.tenths))));
+                }
+            }
+            ui.ctx().data_mut(|d| d.insert_temp(rgb_open_id, rgb_open.then_some(input.nib)));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::{Theme, contrast};
+    use egui::pos2;
+
+    #[test]
+    fn escape_closes_tool_settings_and_selected_choice_passes_contrast_in_all_themes() {
+        for theme in Theme::all() {
+            let t = theme.tokens();
+            assert!(contrast(t.strong, t.row_selected) >= 4.5, "{} choice selected contrast < 4.5", theme.id());
+        }
+        let ctx = Context::default();
+        let theme = Theme::DEFAULT;
+        ctx.set_visuals(theme.visuals());
+        let t = theme.tokens();
+        let rack = rack::fresh();
+        let input = ToolSettingsIn {
+            finger_drawing: false,
+            hold_to_straighten: true,
+            eraser_pixel: false,
+            math_ocr_enabled: false,
+            handwriting_ocr_enabled: false,
+            library_view: LibraryView::StudioGrid,
+            studio: StudioOptions::default(),
+            rack: &rack,
+            nib: 0,
+        };
+        let mut raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 640.0))), ..Default::default() };
+        raw.events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let mut acts = Vec::new();
+        let mut out = ctx.run_ui(raw, |ui| {
+            acts = show(ui.ctx(), Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 640.0)), &input, &t);
+        });
+        out.textures_delta.clear();
+        assert!(acts.contains(&Act::ToggleToolSettings), "Escape must close Tool Settings");
     }
 }

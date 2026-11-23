@@ -268,7 +268,10 @@ pub fn set_containers(dir: &Path, arrangement: &[Container]) -> Result<()> {
     let (blocks, _) = boxes::read(format, &body);
     let wanted = (!arrangement.is_empty()).then_some(arrangement);
     if let Some(wanted) = wanted {
-        let counted: usize = wanted.iter().map(|c| c.blocks).sum();
+        let counted = wanted
+            .iter()
+            .try_fold(0usize, |acc, c| acc.checked_add(c.blocks))
+            .ok_or_else(|| StoreError::invalid("the boxes hold too many blocks"))?;
         if counted != blocks.len() {
             return Err(StoreError::invalid(format!("the boxes hold {counted} blocks but the page has {}", blocks.len())));
         }
@@ -854,5 +857,14 @@ mod tests {
         let body = "caf\u{e9} \u{1F600}\r\nline two\n\n    indented\n--- not front matter\n";
         save_body(&page, body).expect("save");
         assert_eq!(load_page(&page).expect("load").body, body);
+    }
+
+    #[test]
+    fn overflowing_container_block_counts_are_rejected_without_panicking() {
+        let (_t, page) = setup("page-container-overflow", PageFormat::Cmgfm);
+        save_body(&page, "hello\n").expect("save");
+        let overflowing = [Container::new(0.0, 0.0, 300.0, usize::MAX), Container::new(320.0, 0.0, 300.0, 1)];
+        let err = set_containers(&page, &overflowing).expect_err("overflowing counts must fail");
+        assert!(matches!(err, StoreError::Invalid(_)), "unexpected error: {err:?}");
     }
 }

@@ -403,6 +403,12 @@ pub(crate) fn item_marker_size(spans: &[Span], zoom: f32) -> f32 {
 /// link. The lookup goes through parley, the same way the drawing did, so a click on a
 /// right-to-left or mixed line lands on the word under the pointer.
 pub fn link_at_point(block: &Block, at: egui::Vec2, width: f32, page: Option<Dir>) -> Option<String> {
+    link_at_point_zoomed(block, at, width, page, 1.0)
+}
+
+/// Like [`link_at_point`], scaled to the page's current `zoom`.
+pub fn link_at_point_zoomed(block: &Block, at: egui::Vec2, width: f32, page: Option<Dir>, zoom: f32) -> Option<String> {
+    let zoom = zoom.max(0.01);
     let spans = match block {
         Block::Heading { spans, .. } | Block::Paragraph(spans) | Block::Quote(spans) | Block::Item { spans, .. } => spans,
         _ => return None,
@@ -414,9 +420,9 @@ pub fn link_at_point(block: &Block, at: egui::Vec2, width: f32, page: Option<Dir
     // label text. The text mapper deliberately skips image spans, so handle
     // the card's own 48x56 hit area before mapping the remaining words.
     if at.x >= 0.0
-        && at.x <= 56.0
+        && at.x <= 56.0 * zoom
         && at.y >= 0.0
-        && at.y <= 64.0
+        && at.y <= 64.0 * zoom
         && spans.iter().any(|s| s.image.is_some())
         && let Some(href) = spans.iter().find_map(|s| s.link.clone())
     {
@@ -424,7 +430,7 @@ pub fn link_at_point(block: &Block, at: egui::Vec2, width: f32, page: Option<Dir
     }
     // What is drawn: the words without a tag's marker, beside the mark or the bullet.
     let (spans, mark) = match tagged(spans) {
-        Some((_, stripped)) => (stripped, 21.0),
+        Some((_, stripped)) => (stripped, 21.0 * zoom),
         None => (spans.clone(), 0.0),
     };
     let text = text_of(&spans);
@@ -433,8 +439,8 @@ pub fn link_at_point(block: &Block, at: egui::Vec2, width: f32, page: Option<Dir
     }
     let lead = mark
         + match block {
-            Block::Item { depth, .. } => 8.0 + *depth as f32 * 18.0 + 22.0,
-            Block::Quote(_) => 18.0,
+            Block::Item { depth, .. } => (8.0 + *depth as f32 * 18.0 + 22.0) * zoom,
+            Block::Quote(_) => 18.0 * zoom,
             _ => 0.0,
         };
     // A right-to-left row puts its bullet or mark on the right, so the words start at the
@@ -442,7 +448,7 @@ pub fn link_at_point(block: &Block, at: egui::Vec2, width: f32, page: Option<Dir
     let rtl = dir_of(&spans, page).is_rtl();
     let x = if rtl { at.x } else { at.x - lead };
     let column = (width - lead).max(32.0);
-    let byte = crate::bidi::hit(&text, egui::vec2(x, at.y), size_of_block(block), column, page);
+    let byte = crate::bidi::hit(&text, egui::vec2(x, at.y), size_of_block(block) * zoom, column, page);
     let mut start = 0usize;
     for s in &spans {
         if s.image.is_some() {
@@ -553,10 +559,12 @@ pub fn show_zoomed(
         let resp = out.response;
         if resp.clicked()
             && let Some(p) = resp.interact_pointer_pos()
-            && let Some(href) = crate::pageedit::link_under(ui, block, &resp, p, tokens, page)
+            && let Some(href) = crate::pageedit::link_under_zoomed(ui, block, &resp, p, tokens, page, zoom)
         {
             link = Some(href);
-        } else if resp.hovered() && resp.hover_pos().and_then(|p| crate::pageedit::link_under(ui, block, &resp, p, tokens, page)).is_some() {
+        } else if resp.hovered()
+            && resp.hover_pos().and_then(|p| crate::pageedit::link_under_zoomed(ui, block, &resp, p, tokens, page, zoom)).is_some()
+        {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
     }
@@ -1434,5 +1442,41 @@ mod tests {
         assert_eq!(images[1].block, 1);
         assert_eq!(images[1].src, "assets/inline.png");
         assert!(images[1].rect.width() > 0.0 && images[1].rect.height() > 0.0);
+    }
+
+    #[test]
+    fn link_at_point_zoomed_scales_bidi_and_attachment_hit_targets() {
+        let cards = blocks_for(
+            PageFormat::Html,
+            r#"<p><a href="assets/brief.docx"><img src="assets/brief.docx.png" alt="" width="48"><br>brief.docx</a></p>"#,
+        );
+        // At zoom=2.0 the attachment card hit box doubles (112x128); at zoom=0.5 it halves (28x32).
+        assert_eq!(link_at_point_zoomed(&cards[0], egui::vec2(80.0, 80.0), 800.0, Some(Dir::Ltr), 1.0), None);
+        assert_eq!(link_at_point_zoomed(&cards[0], egui::vec2(80.0, 80.0), 800.0, Some(Dir::Ltr), 2.0).as_deref(), Some("assets/brief.docx"));
+        assert_eq!(link_at_point_zoomed(&cards[0], egui::vec2(40.0, 40.0), 200.0, Some(Dir::Ltr), 0.5), None);
+        assert_eq!(link_at_point_zoomed(&cards[0], egui::vec2(12.0, 14.0), 200.0, Some(Dir::Ltr), 0.5).as_deref(), Some("assets/brief.docx"));
+
+        // For an RTL/Arabic line, doubling width and zoom doubles the screen x span of the link.
+        let rtl = blocks_for(PageFormat::Cmgfm, "مرحبا بالعالم [هذه صفحة](../page-b/) والباقي كلام عادي\n");
+        let block = rtl.first().expect("arabic paragraph");
+        let span_for = |zoom: f32| {
+            let width = 400.0 * zoom;
+            let on: Vec<f32> = (0..(width as i32))
+                .step_by(4)
+                .filter_map(|x| {
+                    let xf = x as f32;
+                    link_at_point_zoomed(block, egui::vec2(xf, 8.0 * zoom), width, Some(Dir::Ltr), zoom).map(|_| xf)
+                })
+                .collect();
+            (*on.first().expect("start"), *on.last().expect("end"))
+        };
+        let (a1, b1) = span_for(1.0);
+        let (a2, b2) = span_for(2.0);
+        let w1 = b1 - a1;
+        let w2 = b2 - a2;
+        assert!(w1 > 20.0 && w2 > w1 * 1.6, "2x zoomed bidi link hit width should scale up: 1x=({a1}..{b1}, w={w1}), 2x=({a2}..{b2}, w={w2})");
+        // Clicking the 1x link midpoint scaled by 2x must still hit the link at 2x zoom.
+        let mid_1x = (a1 + b1) * 0.5;
+        assert_eq!(link_at_point_zoomed(block, egui::vec2(mid_1x * 2.0, 16.0), 800.0, Some(Dir::Ltr), 2.0).as_deref(), Some("../page-b/"));
     }
 }

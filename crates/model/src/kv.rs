@@ -4,7 +4,20 @@
 use std::collections::HashMap;
 
 pub fn quote(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 pub fn unquote(value: &str) -> String {
@@ -13,7 +26,14 @@ pub fn unquote(value: &str) -> String {
         let (mut out, mut escaped) = (String::new(), false);
         for c in rest.chars() {
             if escaped {
-                out.push(c);
+                match c {
+                    'n' => out.push('\n'),
+                    'r' => out.push('\r'),
+                    't' => out.push('\t'),
+                    '\\' => out.push('\\'),
+                    '"' => out.push('"'),
+                    other => out.push(other),
+                }
                 escaped = false;
             } else if c == '\\' {
                 escaped = true;
@@ -85,6 +105,23 @@ mod tests {
         assert_eq!(unquote(&quote(s)), s);
         assert_eq!(unquote("\"html\"   # comment"), "html");
         assert_eq!(unquote("20"), "20");
+    }
+
+    #[test]
+    fn newlines_and_tabs_are_escaped_and_round_trip() {
+        let raw = "line1\nother = \"injected\"\r\n\tindented\\nliteral";
+        let quoted = quote(raw);
+        assert!(!quoted.contains('\n') && !quoted.contains('\r') && !quoted.contains('\t'), "{quoted}");
+        assert_eq!(unquote(&quoted), raw);
+
+        let mut map = HashMap::new();
+        map.insert("title".into(), raw.into());
+        map.insert("path".into(), r"C:\notes\report\todo".into());
+        let rendered = render(&map);
+        let parsed = parse(&rendered);
+        assert_eq!(parsed.len(), 2, "newlines in values must not inject extra keys:\n{rendered}");
+        assert_eq!(parsed.get("title").map(String::as_str), Some(raw));
+        assert_eq!(parsed.get("path").map(String::as_str), Some(r"C:\notes\report\todo"));
     }
 
     #[test]

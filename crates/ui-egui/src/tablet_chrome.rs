@@ -475,6 +475,14 @@ pub fn show_header_pill(
                             out.acts.push(Act::File);
                             ui.close();
                         }
+                        if ui.button(crate::tl_id!("ui.settings")).clicked() {
+                            out.acts.push(Act::Options);
+                            ui.close();
+                        }
+                        if ui.button(crate::tl_id!("ui.tool_settings")).clicked() {
+                            out.acts.push(Act::ToggleToolSettings);
+                            ui.close();
+                        }
                         ui.separator();
                         view_menu(ui, input, &mut out);
                     });
