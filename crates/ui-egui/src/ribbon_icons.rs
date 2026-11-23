@@ -123,6 +123,40 @@ impl Mark {
             _ => ink,
         }
     }
+
+    /// Theme-aware colour for this mark, contrast-checked (>= 3:1 WCAG non-text contrast)
+    /// against the active theme's panel, elevated surface, and page paper.
+    pub fn color_for(self, t: &crate::theme::Tokens) -> Color32 {
+        let dark = crate::theme::luminance(t.panel) < 0.25;
+        let base = match self {
+            Mark::ToDo | Mark::Contact | Mark::Address | Mark::Phone | Mark::Website | Mark::Idea => return t.accent,
+            Mark::Important => t.group,
+            Mark::Question => {
+                if dark {
+                    Color32::from_rgb(0xB8, 0x92, 0xFF)
+                } else {
+                    Color32::from_rgb(0x6E, 0x3C, 0xB8)
+                }
+            }
+            Mark::Remember | Mark::Highlighter => {
+                if dark {
+                    Color32::from_rgb(0xF2, 0xD4, 0x4B)
+                } else {
+                    Color32::from_rgb(0x9E, 0x7A, 0x00)
+                }
+            }
+            Mark::Definition => t.ok,
+            Mark::Critical | Mark::Delete => t.warn,
+            _ => return t.text,
+        };
+        let mut c = crate::theme::readable_on(base, t.panel, 3.0, dark);
+        for bg in [t.surface_elevated, t.editor] {
+            if (crate::theme::luminance(bg) < 0.25) == dark {
+                c = crate::theme::readable_on(c, bg, 3.0, dark);
+            }
+        }
+        c
+    }
 }
 
 struct Grid {
@@ -331,5 +365,25 @@ mod tests {
         // Every mark has a name, and no two share one.
         let names: std::collections::HashSet<&str> = Mark::ALL.iter().map(|m| m.name()).collect();
         assert_eq!(names.len(), Mark::ALL.len());
+    }
+
+    #[test]
+    fn every_mark_meets_wcag_non_text_contrast_in_all_fourteen_themes() {
+        for theme in crate::theme::Theme::all() {
+            let t = theme.tokens();
+            for mark in Mark::ALL {
+                let c = mark.color_for(&t);
+                for (surface_name, bg) in [("panel", t.panel), ("surface_elevated", t.surface_elevated), ("editor", t.editor)] {
+                    let ratio = crate::theme::contrast(c, bg);
+                    assert!(ratio >= 3.0, "{} {}: contrast on {} is {:.2} (expected >= 3.0)", theme.label(), mark.name(), surface_name, ratio);
+                }
+            }
+            let on_band = t.on_band();
+            for mark in Mark::ALL {
+                let c = mark.color_for(&on_band);
+                let ratio = crate::theme::contrast(c, on_band.panel);
+                assert!(ratio >= 3.0, "{} {}: contrast on title band is {:.2} (expected >= 3.0)", theme.label(), mark.name(), ratio);
+            }
+        }
     }
 }

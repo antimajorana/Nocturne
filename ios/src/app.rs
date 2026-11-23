@@ -1,6 +1,6 @@
 //! Native iOS / iPadOS application entry and `eframe::App` shell for Nocturne.
 
-use crate::{clipboard, diagnostics, edit_menu, gestures, http, inbox, keyboard, keychain, pencil, storage, text_input};
+use crate::{clipboard, diagnostics, edit_menu, gestures, http, inbox, keyboard, keychain, pencil, storage, text_input, vision_ocr};
 use nocturne_engine::Session;
 use nocturne_store::Settings;
 use nocturne_ui_egui::clipboard::Board as _;
@@ -242,6 +242,7 @@ pub(crate) fn run() -> Result<(), String> {
     if let Some(mtm) = MainThreadMarker::new() {
         session.set_sync_backends(Arc::new(http::NsUrlSessionClient::new(mtm)), Arc::new(keychain::IosKeychainStore::new(mtm)));
     }
+    session.set_native_ocr_backend(Arc::new(vision_ocr::IosVisionOcr::new()));
 
     let initial_ingest = inbox::ingest_inbox(&layout.inbox, &mut session);
     let app_data = layout.app_data.clone();
@@ -277,7 +278,7 @@ pub(crate) fn run() -> Result<(), String> {
                 }
             }
 
-            let keyboard = keyboard::KeyboardObserver::new();
+            let keyboard = keyboard::KeyboardObserver::new(&cc.egui_ctx);
             let bridge = IosNativeBridge::attach(cc);
             if bridge.is_none() {
                 log::warn!("UIKit view handle unavailable; native gesture, Pencil, text input, and edit menu bridges disabled");
@@ -296,6 +297,8 @@ pub(crate) fn run() -> Result<(), String> {
                 pending_text_commands: VecDeque::new(),
                 move_cursor_focus_wait: 0,
                 active_stylus_touches: BTreeSet::new(),
+                resummon_tracker: text_input::KeyboardResummonTapTracker::new(),
+                soft_keyboard_visible: false,
                 last_geometry: None,
             }))
         }),
@@ -330,6 +333,8 @@ struct Shell {
     pending_text_commands: VecDeque<text_input::TextEditCommand>,
     move_cursor_focus_wait: u8,
     active_stylus_touches: BTreeSet<egui::TouchId>,
+    resummon_tracker: text_input::KeyboardResummonTapTracker,
+    soft_keyboard_visible: bool,
     last_geometry: Option<GeometrySnapshot>,
 }
 
@@ -355,13 +360,13 @@ impl Shell {
 impl eframe::App for Shell {
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         // `egui-winit 0.37` populates iOS `safe_area_insets` and Apple Pencil `Touch { force }`.
-        let raw_safe_bottom = raw_input.safe_area_insets.map_or(0.0, |insets| insets.0.bottom);
-        if let Some(kb) = self.keyboard.as_ref()
-            && let Some(screen_h) = raw_input.screen_rect.map(|r| r.height()).or_else(keyboard::current_screen_height_pts)
-        {
-            let (visible, inset_bottom) = kb.soft_keyboard_state(screen_h, raw_safe_bottom);
+        let zoom = ctx.zoom_factor();
+        if let Some(kb) = self.keyboard.as_ref() {
+            let view = self.bridge.as_ref().map(|b| &*b.view);
+            let fallback_h = raw_input.screen_rect.map(|r| r.height()).or_else(keyboard::current_screen_height_pts).unwrap_or(0.0);
+            let (visible, inset_bottom) = kb.apply_to_raw_input(view, zoom, fallback_h, raw_input);
+            self.soft_keyboard_visible = visible;
             self.app.set_soft_keyboard_visible(visible, inset_bottom);
-            kb.apply_to_raw_input(screen_h, raw_input);
         }
 
         // A Pencil with no pressure sensor (USB-C) reports 0 of a possible 0, which arrives here
@@ -408,12 +413,39 @@ impl eframe::App for Shell {
             let canvas_overlay = self.app.has_canvas_blocking_overlay();
             let egui_blocked = gestures::egui_overlay_blocks_native_gesture(ctx, canvas_overlay, touch_pos);
             let visible_canvas = self.app.page_view_rect().or_else(|| self.app.page_rect());
-            bridge.gestures.sync_from_app(self.app.is_finger_drawing(), visible_canvas, egui_blocked, canvas_overlay);
+            bridge.gestures.sync_from_app(
+                self.app.is_finger_drawing(),
+                visible_canvas,
+                egui_blocked,
+                canvas_overlay,
+                zoom,
+                !frame_stylus_ids.is_empty(),
+            );
             if let Some(delta) = bridge.gestures.drain_pan_delta() {
                 self.app.apply_external_pan(delta);
             }
             if let Some((scale, focal)) = bridge.gestures.drain_pinch() {
                 self.app.apply_external_pinch_zoom(scale, focal);
+            }
+            for action in bridge.gestures.drain_history_actions() {
+                let key = match action {
+                    gestures::GestureHistoryAction::Undo => egui::Key::Z,
+                    gestures::GestureHistoryAction::Redo => egui::Key::Y,
+                };
+                raw_input.events.push(egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                });
+                raw_input.events.push(egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed: false,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                });
             }
             bridge.gestures.filter_raw_input(raw_input, pointer_was_down, &frame_stylus_ids);
         }
@@ -436,6 +468,11 @@ impl eframe::App for Shell {
         }
 
         let now_secs = raw_input.time.unwrap_or_else(|| ctx.input(|i| i.time));
+        // Drop any move/lift events belonging to a finger that presented the native edit menu
+        // before long-press tracking sees them, so lifting the finger never clears selection.
+        if let Some(bridge) = self.bridge.as_ref() {
+            bridge.edit_menu.filter_raw_input(raw_input);
+        }
         // What is left of a finger whose long press already became a context click: its lift
         // must not click the menu shut, nor count as a tap on the page under it.
         self.long_press.filter_consumed(&mut raw_input.events);
@@ -460,7 +497,7 @@ impl eframe::App for Shell {
                         let mut board = clipboard::IosPasteboard::new();
                         board.text().is_some() || board.has_picture() || board.html().is_some()
                     };
-                    bridge.edit_menu.present(&bridge.view, target_rect, has_selection, can_paste, is_writable);
+                    bridge.edit_menu.present_for_long_press(&bridge.view, target_rect, zoom, has_selection, can_paste, is_writable, raw_input);
                 } else {
                     self.long_press.consume_as_context_click(&mut raw_input.events, long_press_pos);
                 }
@@ -470,6 +507,10 @@ impl eframe::App for Shell {
         if let Some(delay) = self.long_press.next_wakeup_delay(now_secs) {
             ctx.request_repaint_after(delay);
         }
+
+        // Observe remaining single-finger taps after gesture/edit-menu/long-press filters so
+        // tapping an already-focused text surface re-summons a dismissed software keyboard.
+        self.resummon_tracker.observe_events(now_secs, &raw_input.events);
 
         raw_input.events.extend(self.app.take_events());
     }
@@ -496,6 +537,7 @@ impl eframe::App for Shell {
             );
         }
         if self.focused && !focused {
+            self.resummon_tracker.reset();
             self.app.save_page_now();
             export_current_diagnostics_log();
         } else if !self.focused && focused {
@@ -532,9 +574,10 @@ impl eframe::App for Shell {
                 }
             }
         }
+        let should_focus = caret_rect.is_some() || self.egui_wants_ime;
+        let effective_caret = if self.egui_wants_ime { ime_cursor_rect.or(caret_rect) } else { caret_rect };
+        let resummon = self.resummon_tracker.take_resummon_request(should_focus, effective_caret, self.app.page_rect(), self.egui_wants_ime);
         if let Some(bridge) = self.bridge.as_ref() {
-            let should_focus = caret_rect.is_some() || self.egui_wants_ime;
-            let effective_caret = if self.egui_wants_ime { ime_cursor_rect.or(caret_rect) } else { caret_rect };
             let selected_text = if self.egui_wants_ime { String::new() } else { self.app.selected_text_for_platform() };
             let pointer_is_write = caret_rect.is_some() || self.egui_wants_ime;
             let is_writable = should_focus;
@@ -544,7 +587,18 @@ impl eframe::App for Shell {
             let field = if self.egui_wants_ime { self.app.focused_text_field(&ctx) } else { None };
             let document = field.as_ref().map(|f| (f.text.as_str(), f.selection));
             let pending = !self.pending_text_commands.is_empty();
-            bridge.text_input.sync_state(should_focus, effective_caret, &selected_text, document, pending, pointer_is_write, is_writable);
+            bridge.text_input.sync_state(
+                should_focus,
+                effective_caret,
+                zoom,
+                &selected_text,
+                document,
+                pending,
+                pointer_is_write,
+                is_writable,
+                resummon,
+                self.soft_keyboard_visible,
+            );
         }
     }
 

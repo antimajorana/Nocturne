@@ -159,25 +159,28 @@ pub fn show(ui: &mut Ui, config: &mut Config, enabled: Enabled, t: &Tokens) -> (
     }
     // The arrow stays even when the strip is hidden, so it can be brought back.
     let arrow = customize_button(ui, t);
-    egui::Popup::menu(&arrow).show(|ui| {
+    // The popup floats above the app on its own elevated surface — never inherit `on_band()`
+    // white text onto a light popup background.
+    let popup_t = t.for_popup();
+    egui::Popup::menu(&arrow).style(crate::theme::picker_popup_style(popup_t)).show(|ui| {
         ui.set_width(floating::MENU_W + 20.0);
         ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-        ui.label(egui::RichText::new(crate::tl_id!("ui.customize_quick_access_toolbar")).strong());
+        ui.label(egui::RichText::new(crate::tl_id!("ui.customize_quick_access_toolbar")).strong().color(popup_t.strong));
         ui.add_space(4.0);
         for cmd in Command::ALL {
-            if floating::menu_check_row(ui, config.shows(cmd), cmd.label(), t).clicked() {
+            if floating::menu_check_row(ui, config.shows(cmd), cmd.label(), &popup_t).clicked() {
                 config.show[cmd.index()] = !config.shows(cmd);
                 changed = true;
             }
         }
-        floating::menu_separator(ui, t);
+        floating::menu_separator(ui, &popup_t);
         let place = if config.below { "Show Above the Ribbon" } else { "Show Below the Ribbon" };
-        if floating::menu_row(ui, None, place, t).clicked() {
+        if floating::menu_row(ui, None, place, &popup_t).clicked() {
             config.below = !config.below;
             changed = true;
         }
         let hide = if config.hidden { "Show Quick Access Toolbar" } else { "Hide Quick Access Toolbar" };
-        if floating::menu_row(ui, None, hide, t).clicked() {
+        if floating::menu_row(ui, None, hide, &popup_t).clicked() {
             config.hidden = !config.hidden;
             changed = true;
         }
@@ -189,11 +192,12 @@ fn button(ui: &mut Ui, cmd: Command, enabled: bool, t: &Tokens) -> egui::Respons
     let (rect, resp) = ui.allocate_exact_size(vec2(BTN, BTN), Sense::click());
     let painter = ui.painter_at(rect);
     if enabled && resp.hovered() {
-        painter.rect_filled(rect, 3.0, t.row_hover);
+        painter.rect_filled(rect, crate::theme::RADIUS_CONTROL, t.row_hover);
     }
-    // A faint button: the same picture in the muted text colour.
+    // A faint button: the same picture in the disabled colour.
     let mut faint = *t;
-    faint.text = t.muted;
+    faint.text = t.disabled;
+    faint.accent = t.disabled;
     cmd.glyph().paint(&painter, egui::Rect::from_center_size(rect.center(), vec2(16.0, 16.0)), if enabled { t } else { &faint });
     let name = crate::tl!(cmd.label()).to_string();
     resp.widget_info(move || egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, name.clone()));
@@ -205,7 +209,7 @@ fn customize_button(ui: &mut Ui, t: &Tokens) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(18.0, BTN), Sense::click());
     let painter = ui.painter_at(rect);
     if resp.hovered() {
-        painter.rect_filled(rect, 3.0, t.row_hover);
+        painter.rect_filled(rect, crate::theme::RADIUS_CONTROL, t.row_hover);
     }
     let c = rect.center();
     painter.add(egui::Shape::convex_polygon(
@@ -258,5 +262,32 @@ mod tests {
         assert!(Command::ALL.iter().all(|c| !c.tip().is_empty()));
         let on = Enabled { back: true, forward: false, undo: true, redo: false };
         assert!(on.of(Command::Back) && !on.of(Command::Forward) && on.of(Command::Undo) && !on.of(Command::Redo));
+    }
+
+    #[test]
+    fn customize_popup_keeps_high_contrast_even_when_launched_from_the_band() {
+        for theme in crate::theme::Theme::all() {
+            let on_band = theme.tokens().on_band();
+            let popup = on_band.for_popup();
+            assert!(
+                crate::theme::contrast(popup.text, popup.surface_elevated) >= 7.0,
+                "{}: QAT popup text must remain readable on elevated surface",
+                theme.label()
+            );
+            assert!(
+                crate::theme::contrast(popup.strong, popup.surface_elevated) >= 7.0,
+                "{}: QAT popup title must remain readable on elevated surface",
+                theme.label()
+            );
+            assert!(crate::theme::contrast(popup.border, popup.surface_elevated) >= 3.0, "{}: QAT popup border must remain visible", theme.label());
+            assert!(crate::theme::contrast(popup.text, popup.row_hover) >= 7.0, "{}: QAT popup hovered row must remain readable", theme.label());
+            let ctx = egui::Context::default();
+            ctx.set_visuals(theme.visuals());
+            let mut cfg = Config::default();
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let _ = show(ui, &mut cfg, Enabled::default(), &on_band);
+            });
+            out.textures_delta.clear();
+        }
     }
 }

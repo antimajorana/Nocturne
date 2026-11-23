@@ -48,8 +48,81 @@ impl GestureRect {
     }
 }
 
-/// Shared state between UIKit pan/pinch recognizers and the per-frame `eframe` shell hook.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// Contact radius threshold (in UIKit points) at or above which a `UITouch` is classified as a
+/// resting palm rather than a deliberate finger for native pan/pinch/tap recognizers.
+///
+/// Normal iPad fingertips report `majorRadius` around `12–30 pt`, whereas a resting palm or side
+/// of the hand typically exceeds `40 pt`. Zero, negative, or non-finite values (e.g. simulator)
+/// are never classified as palms.
+pub const PALM_MAJOR_RADIUS_PTS: f32 = 40.0;
+
+/// Canvas history action triggered by native iPadOS multi-finger tap gestures
+/// (2-finger tap -> Undo, 3-finger tap -> Redo).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GestureHistoryAction {
+    Undo,
+    Redo,
+}
+
+/// Maps a multi-finger tap touch count to a [`GestureHistoryAction`].
+#[must_use]
+pub const fn resolve_multi_finger_tap_action(touch_count: usize) -> Option<GestureHistoryAction> {
+    match touch_count {
+        2 => Some(GestureHistoryAction::Undo),
+        3 => Some(GestureHistoryAction::Redo),
+        _ => None,
+    }
+}
+
+/// Sanitizes `egui::Context::zoom_factor()`, falling back to `1.0` for non-finite or non-positive values.
+#[must_use]
+pub fn sanitize_zoom_factor(zoom_factor: f32) -> f32 {
+    if zoom_factor.is_finite() && zoom_factor > 0.0 { zoom_factor } else { 1.0 }
+}
+
+/// Converts a UIKit view-point position `[x, y]` into egui logical points (`uikit_pts / zoom_factor`).
+#[must_use]
+pub fn uikit_point_to_egui(pos: [f32; 2], zoom_factor: f32) -> Option<[f32; 2]> {
+    if !(pos[0].is_finite() && pos[1].is_finite()) {
+        return None;
+    }
+    let z = sanitize_zoom_factor(zoom_factor);
+    let out = [pos[0] / z, pos[1] / z];
+    (out[0].is_finite() && out[1].is_finite()).then_some(out)
+}
+
+/// Converts a UIKit view-point translation delta `[dx, dy]` into egui logical points
+/// (`uikit_delta / zoom_factor`), collapsing non-finite inputs to `[0.0, 0.0]`.
+#[must_use]
+pub fn uikit_delta_to_egui(delta: [f32; 2], zoom_factor: f32) -> [f32; 2] {
+    if !(delta[0].is_finite() && delta[1].is_finite()) {
+        return [0.0, 0.0];
+    }
+    let z = sanitize_zoom_factor(zoom_factor);
+    let out = [delta[0] / z, delta[1] / z];
+    if out[0].is_finite() && out[1].is_finite() { out } else { [0.0, 0.0] }
+}
+
+/// Returns `true` when `major_radius_pts` indicates a resting-palm contact.
+#[must_use]
+pub fn is_palm_touch_radius(major_radius_pts: f32) -> bool {
+    major_radius_pts.is_finite() && major_radius_pts >= PALM_MAJOR_RADIUS_PTS
+}
+
+/// Returns `true` when a `UITouch` should be accepted by native finger pan/pinch/tap recognizers.
+///
+/// Rejects non-direct touches (such as Apple Pencil), resting palms
+/// (`major_radius_pts >= PALM_MAJOR_RADIUS_PTS`), and pan touches while an Apple Pencil stroke is active.
+#[must_use]
+pub fn should_receive_gesture_touch(is_direct_finger: bool, major_radius_pts: f32, stylus_active: bool, is_pan_recognizer: bool) -> bool {
+    if !is_direct_finger || is_palm_touch_radius(major_radius_pts) {
+        return false;
+    }
+    !(is_pan_recognizer && stylus_active)
+}
+
+/// Shared state between UIKit pan/pinch/tap recognizers and the per-frame `eframe` shell hook.
+#[derive(Clone, Debug, PartialEq)]
 pub struct GestureBridgeState {
     pub finger_drawing: bool,
     pub canvas_rect: Option<GestureRect>,
@@ -59,15 +132,39 @@ pub struct GestureBridgeState {
     pub pinch_active: bool,
     pub pending_pan_delta: [f32; 2],
     pub pending_pinch: Option<(f32, Option<[f32; 2]>)>,
+    pub pending_history_actions: Vec<GestureHistoryAction>,
     pub needs_pointer_release: bool,
     pub known_stylus_ids: BTreeSet<u64>,
+    pub stylus_active: bool,
+    pub zoom_factor: f32,
     /// The contact the window layer is turning into the pointer: the first one down, until it
     /// lifts. Followed here because pointer events do not say which contact made them.
     pub pointer_touch: Option<u64>,
 }
 
+impl Default for GestureBridgeState {
+    fn default() -> Self {
+        Self {
+            finger_drawing: false,
+            canvas_rect: None,
+            egui_using_pointer: false,
+            canvas_overlay_blocked: false,
+            pan_active: false,
+            pinch_active: false,
+            pending_pan_delta: [0.0, 0.0],
+            pending_pinch: None,
+            pending_history_actions: Vec::new(),
+            needs_pointer_release: false,
+            known_stylus_ids: BTreeSet::new(),
+            stylus_active: false,
+            zoom_factor: 1.0,
+            pointer_touch: None,
+        }
+    }
+}
+
 impl GestureBridgeState {
-    /// Creates an idle `GestureBridgeState`.
+    /// Creates an idle `GestureBridgeState` with `zoom_factor = 1.0`.
     pub fn new() -> Self {
         Self::default()
     }
@@ -77,12 +174,55 @@ impl GestureBridgeState {
         self.pan_active || self.pinch_active
     }
 
-    /// Returns `true` when `(x, y)` lies inside the current canvas rect.
+    /// Returns `true` when an Apple Pencil contact is currently active.
+    #[must_use]
+    pub fn is_stylus_active(&self) -> bool {
+        self.stylus_active || !self.known_stylus_ids.is_empty()
+    }
+
+    /// Updates the egui `zoom_factor`, falling back to `1.0` for non-finite or non-positive values.
+    pub fn set_zoom_factor(&mut self, zoom_factor: f32) {
+        self.zoom_factor = sanitize_zoom_factor(zoom_factor);
+    }
+
+    /// Returns the sanitized `zoom_factor` (always finite and positive).
+    #[must_use]
+    pub fn zoom_factor(&self) -> f32 {
+        sanitize_zoom_factor(self.zoom_factor)
+    }
+
+    /// Cancels any in-flight native pan gesture when Apple Pencil begins or continues a stroke.
+    ///
+    /// Clears `pan_active` and drops any unapplied `pending_pan_delta` so the page does not jump
+    /// under the pen tip. Returns `true` if an active pan or pending pan delta was interrupted
+    /// (signaling the UIKit bridge to reset `UIPanGestureRecognizer`).
+    pub fn cancel_pan_for_stylus(&mut self) -> bool {
+        let was_active = self.pan_active || self.pending_pan_delta != [0.0, 0.0];
+        self.pan_active = false;
+        self.pending_pan_delta = [0.0, 0.0];
+        was_active
+    }
+
+    /// Synchronizes stylus activity and immediately cancels any in-flight pan when `stylus_active`
+    /// is `true`. Returns `true` if a live pan was interrupted.
+    pub fn set_stylus_active(&mut self, stylus_active: bool) -> bool {
+        self.stylus_active = stylus_active;
+        if stylus_active { self.cancel_pan_for_stylus() } else { false }
+    }
+
+    /// Returns `true` when `(x, y)` (in egui logical points) lies inside the current canvas rect.
     pub fn point_in_canvas(&self, x: f32, y: f32) -> bool {
         self.canvas_rect.is_some_and(|rect| rect.contains(x, y))
     }
 
-    /// Accumulates an incremental pan delta in logical points.
+    /// Converts `(x_uikit, y_uikit)` from UIKit view points via `self.zoom_factor()` and checks
+    /// whether the resulting egui logical point lies inside `self.canvas_rect`.
+    #[must_use]
+    pub fn point_in_canvas_uikit(&self, x_uikit: f32, y_uikit: f32) -> bool {
+        uikit_point_to_egui([x_uikit, y_uikit], self.zoom_factor()).is_some_and(|[ex, ey]| self.point_in_canvas(ex, ey))
+    }
+
+    /// Accumulates an incremental pan delta in egui logical points.
     pub fn accumulate_pan(&mut self, dx: f32, dy: f32) {
         let [inc_x, inc_y] = compute_incremental_pan(dx, dy);
         if inc_x == 0.0 && inc_y == 0.0 {
@@ -95,7 +235,17 @@ impl GestureBridgeState {
         }
     }
 
-    /// Accumulates a multiplicative incremental pinch scale and latest focal point.
+    /// Converts an incremental UIKit pan translation via `self.zoom_factor()` into egui logical
+    /// points and accumulates it (ignoring pan deltas while a stylus stroke is active).
+    pub fn accumulate_pan_uikit(&mut self, dx_uikit: f32, dy_uikit: f32) {
+        if self.is_stylus_active() {
+            return;
+        }
+        let [dx, dy] = uikit_delta_to_egui([dx_uikit, dy_uikit], self.zoom_factor());
+        self.accumulate_pan(dx, dy);
+    }
+
+    /// Accumulates a multiplicative incremental pinch scale and latest focal point in egui logical points.
     pub fn accumulate_pinch(&mut self, scale: f32, focal: Option<[f32; 2]>) {
         let Some((step_scale, clean_focal)) = compute_incremental_pinch(scale, focal) else {
             return;
@@ -110,16 +260,34 @@ impl GestureBridgeState {
         });
     }
 
-    /// Drains any accumulated finite non-zero pan delta.
+    /// Converts a UIKit pinch focal point via `self.zoom_factor()` into egui logical points and
+    /// accumulates the multiplicative pinch step.
+    pub fn accumulate_pinch_uikit(&mut self, scale: f32, focal_uikit: Option<[f32; 2]>) {
+        let focal_egui = focal_uikit.and_then(|pos| uikit_point_to_egui(pos, self.zoom_factor()));
+        self.accumulate_pinch(scale, focal_egui);
+    }
+
+    /// Queues a native 2-finger Undo or 3-finger Redo tap action and arms stuck-pointer cleanup.
+    pub fn push_history_action(&mut self, action: GestureHistoryAction) {
+        self.pending_history_actions.push(action);
+        self.needs_pointer_release = true;
+    }
+
+    /// Drains any accumulated finite non-zero pan delta in egui logical points.
     pub fn drain_pan_delta(&mut self) -> Option<[f32; 2]> {
         let delta = self.pending_pan_delta;
         self.pending_pan_delta = [0.0, 0.0];
         (delta[0].is_finite() && delta[1].is_finite() && (delta[0] != 0.0 || delta[1] != 0.0)).then_some(delta)
     }
 
-    /// Drains any accumulated pinch scale factor and latest focal point.
+    /// Drains any accumulated pinch scale factor and latest focal point in egui logical points.
     pub fn drain_pinch(&mut self) -> Option<(f32, Option<[f32; 2]>)> {
         self.pending_pinch.take()
+    }
+
+    /// Drains queued multi-finger Undo/Redo tap actions in FIFO order.
+    pub fn drain_history_actions(&mut self) -> Vec<GestureHistoryAction> {
+        std::mem::take(&mut self.pending_history_actions)
     }
 }
 
@@ -131,9 +299,28 @@ pub fn should_begin_native_pan(touch_count: usize, finger_drawing: bool, in_canv
     !egui_using_pointer && in_canvas && if finger_drawing { touch_count >= 2 } else { (1..=2).contains(&touch_count) }
 }
 
+/// Extended pan-gating check that also prevents native pan from starting while an Apple Pencil
+/// stroke is active.
+#[must_use]
+pub fn should_begin_native_pan_for_input(
+    touch_count: usize,
+    finger_drawing: bool,
+    in_canvas: bool,
+    egui_using_pointer: bool,
+    stylus_active: bool,
+) -> bool {
+    !stylus_active && should_begin_native_pan(touch_count, finger_drawing, in_canvas, egui_using_pointer)
+}
+
 /// Returns `true` when the native `UIPinchGestureRecognizer` should begin.
 pub fn should_begin_native_pinch(touch_count: usize, in_canvas: bool, egui_using_pointer: bool) -> bool {
     !egui_using_pointer && in_canvas && touch_count >= 2
+}
+
+/// Returns `true` when a native 2-finger Undo or 3-finger Redo tap gesture should begin/fire.
+#[must_use]
+pub fn should_begin_native_multi_finger_tap(required_touches: usize, in_canvas: bool, egui_using_pointer: bool, stylus_active: bool) -> bool {
+    !egui_using_pointer && !stylus_active && in_canvas && resolve_multi_finger_tap_action(required_touches).is_some()
 }
 
 /// Extracts the most recent finite touch or pointer position from an `egui::RawInput` event batch.
@@ -462,8 +649,9 @@ pub fn filter_pure_events_with_stylus_ids(
 #[cfg(target_os = "ios")]
 pub mod ios {
     use super::{
-        EventKind, GestureBridgeState, GestureRect, PureTouchPhase, ReleaseEventFns, SharedGestureState, egui_overlay_blocks_native_gesture,
-        filter_events_core, should_begin_native_pan, should_begin_native_pinch,
+        EventKind, GestureBridgeState, GestureHistoryAction, GestureRect, PureTouchPhase, ReleaseEventFns, SharedGestureState,
+        egui_overlay_blocks_native_gesture, filter_events_core, should_begin_native_multi_finger_tap, should_begin_native_pan_for_input,
+        should_begin_native_pinch, should_receive_gesture_touch, uikit_point_to_egui,
     };
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
@@ -471,8 +659,8 @@ pub mod ios {
     use objc2_core_foundation::CGPoint;
     use objc2_foundation::{NSArray, NSNumber};
     use objc2_ui_kit::{
-        UIGestureRecognizer, UIGestureRecognizerDelegate, UIGestureRecognizerState, UIPanGestureRecognizer, UIPinchGestureRecognizer, UITouch,
-        UITouchType, UIView,
+        UIGestureRecognizer, UIGestureRecognizerDelegate, UIGestureRecognizerState, UIPanGestureRecognizer, UIPinchGestureRecognizer,
+        UITapGestureRecognizer, UITouch, UITouchType, UIView,
     };
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
@@ -489,6 +677,8 @@ pub mod ios {
             egui_ctx: egui::Context,
             pan_addr: Cell<usize>,
             pinch_addr: Cell<usize>,
+            two_finger_tap_addr: Cell<usize>,
+            three_finger_tap_addr: Cell<usize>,
         }
 
         define_class!(
@@ -500,31 +690,39 @@ pub mod ios {
             impl NocturneGestureDelegate {
                 #[unsafe(method(handlePan:))]
                 fn __handle_pan(&self, recognizer: &UIPanGestureRecognizer) {
-                    let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
-                        return;
+                    let cancel_pan_now = {
+                        let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+                            return;
+                        };
+                        match recognizer.state() {
+                            UIGestureRecognizerState::Began | UIGestureRecognizerState::Changed => {
+                                if state.is_stylus_active() {
+                                    state.cancel_pan_for_stylus();
+                                    true
+                                } else {
+                                    let is_began = recognizer.state() == UIGestureRecognizerState::Began;
+                                    state.pan_active = true;
+                                    if is_began {
+                                        state.needs_pointer_release = true;
+                                    }
+                                    let view = recognizer.view();
+                                    let delta = recognizer.translationInView(view.as_deref());
+                                    state.accumulate_pan_uikit(delta.x as f32, delta.y as f32);
+                                    recognizer.setTranslation_inView(CGPoint::ZERO, view.as_deref());
+                                    false
+                                }
+                            }
+                            UIGestureRecognizerState::Ended | UIGestureRecognizerState::Cancelled | UIGestureRecognizerState::Failed => {
+                                state.pan_active = false;
+                                false
+                            }
+                            _ => false,
+                        }
                     };
-                    match recognizer.state() {
-                        UIGestureRecognizerState::Began => {
-                            state.pan_active = true;
-                            state.needs_pointer_release = true;
-                            let view = recognizer.view();
-                            let delta = recognizer.translationInView(view.as_deref());
-                            state.accumulate_pan(delta.x as f32, delta.y as f32);
-                            recognizer.setTranslation_inView(CGPoint::ZERO, view.as_deref());
-                        }
-                        UIGestureRecognizerState::Changed => {
-                            state.pan_active = true;
-                            let view = recognizer.view();
-                            let delta = recognizer.translationInView(view.as_deref());
-                            state.accumulate_pan(delta.x as f32, delta.y as f32);
-                            recognizer.setTranslation_inView(CGPoint::ZERO, view.as_deref());
-                        }
-                        UIGestureRecognizerState::Ended | UIGestureRecognizerState::Cancelled | UIGestureRecognizerState::Failed => {
-                            state.pan_active = false;
-                        }
-                        _ => {}
+                    if cancel_pan_now {
+                        recognizer.setEnabled(false);
+                        recognizer.setEnabled(true);
                     }
-                    drop(state);
                     // The recognizer cancels its touches out of `WinitView`, so no winit event follows to
                     // run the frame that drains this pan; request it here once the borrow is released.
                     self.ivars().egui_ctx.request_repaint();
@@ -541,14 +739,14 @@ pub mod ios {
                             state.needs_pointer_release = true;
                             let view = recognizer.view();
                             let loc = recognizer.locationInView(view.as_deref());
-                            state.accumulate_pinch(recognizer.scale() as f32, Some([loc.x as f32, loc.y as f32]));
+                            state.accumulate_pinch_uikit(recognizer.scale() as f32, Some([loc.x as f32, loc.y as f32]));
                             recognizer.setScale(1.0);
                         }
                         UIGestureRecognizerState::Changed => {
                             state.pinch_active = true;
                             let view = recognizer.view();
                             let loc = recognizer.locationInView(view.as_deref());
-                            state.accumulate_pinch(recognizer.scale() as f32, Some([loc.x as f32, loc.y as f32]));
+                            state.accumulate_pinch_uikit(recognizer.scale() as f32, Some([loc.x as f32, loc.y as f32]));
                             recognizer.setScale(1.0);
                         }
                         UIGestureRecognizerState::Ended | UIGestureRecognizerState::Cancelled | UIGestureRecognizerState::Failed => {
@@ -561,14 +759,28 @@ pub mod ios {
                     // run the frame that drains this pinch; request it here once the borrow is released.
                     self.ivars().egui_ctx.request_repaint();
                 }
+
+                #[unsafe(method(handleTwoFingerTap:))]
+                fn __handle_two_finger_tap(&self, recognizer: &UITapGestureRecognizer) {
+                    self.handle_multi_finger_tap(recognizer, 2, GestureHistoryAction::Undo);
+                }
+
+                #[unsafe(method(handleThreeFingerTap:))]
+                fn __handle_three_finger_tap(&self, recognizer: &UITapGestureRecognizer) {
+                    self.handle_multi_finger_tap(recognizer, 3, GestureHistoryAction::Redo);
+                }
             }
 
             unsafe impl NSObjectProtocol for NocturneGestureDelegate {}
 
             unsafe impl UIGestureRecognizerDelegate for NocturneGestureDelegate {
                 #[unsafe(method(gestureRecognizer:shouldReceiveTouch:))]
-                fn __should_receive_touch(&self, _gesture_recognizer: &UIGestureRecognizer, touch: &UITouch) -> bool {
-                    touch.r#type() == UITouchType::Direct
+                fn __should_receive_touch(&self, gesture_recognizer: &UIGestureRecognizer, touch: &UITouch) -> bool {
+                    let is_direct = touch.r#type() == UITouchType::Direct;
+                    let major_radius_pts = touch.majorRadius() as f32;
+                    let is_pan = self.is_pan(gesture_recognizer);
+                    let stylus_active = self.ivars().state.try_borrow().is_ok_and(|s| s.is_stylus_active());
+                    should_receive_gesture_touch(is_direct, major_radius_pts, stylus_active, is_pan)
                 }
 
                 #[unsafe(method(gestureRecognizerShouldBegin:))]
@@ -590,15 +802,53 @@ pub mod ios {
 
         impl NocturneGestureDelegate {
             pub(super) fn new(mtm: MainThreadMarker, state: SharedGestureState, egui_ctx: egui::Context) -> Retained<Self> {
-                let this = Self::alloc(mtm).set_ivars(GestureDelegateIvars { state, egui_ctx, pan_addr: Cell::new(0), pinch_addr: Cell::new(0) });
+                let this = Self::alloc(mtm).set_ivars(GestureDelegateIvars {
+                    state,
+                    egui_ctx,
+                    pan_addr: Cell::new(0),
+                    pinch_addr: Cell::new(0),
+                    two_finger_tap_addr: Cell::new(0),
+                    three_finger_tap_addr: Cell::new(0),
+                });
                 // SAFETY: `NSObject::init` is the designated initializer of superclass `NSObject`,
                 // and `MainThreadMarker` guarantees execution on the UIKit main thread.
                 unsafe { msg_send![super(this), init] }
             }
 
-            pub(super) fn set_recognizer_addrs(&self, pan_addr: usize, pinch_addr: usize) {
+            pub(super) fn set_recognizer_addrs(&self, pan_addr: usize, pinch_addr: usize, two_finger_tap_addr: usize, three_finger_tap_addr: usize) {
                 self.ivars().pan_addr.set(pan_addr);
                 self.ivars().pinch_addr.set(pinch_addr);
+                self.ivars().two_finger_tap_addr.set(two_finger_tap_addr);
+                self.ivars().three_finger_tap_addr.set(three_finger_tap_addr);
+            }
+
+            fn handle_multi_finger_tap(&self, recognizer: &UITapGestureRecognizer, required_touches: usize, action: GestureHistoryAction) {
+                if recognizer.state() != UIGestureRecognizerState::Ended {
+                    return;
+                }
+                let queued = {
+                    let Ok(mut state) = self.ivars().state.try_borrow_mut() else {
+                        return;
+                    };
+                    let view = recognizer.view();
+                    let loc = recognizer.locationInView(view.as_deref());
+                    let Some([ex, ey]) = uikit_point_to_egui([loc.x as f32, loc.y as f32], state.zoom_factor()) else {
+                        return;
+                    };
+                    let in_canvas = state.point_in_canvas(ex, ey);
+                    let live_blocked =
+                        egui_overlay_blocks_native_gesture(&self.ivars().egui_ctx, state.canvas_overlay_blocked, Some(egui::pos2(ex, ey)));
+                    let blocked = state.egui_using_pointer || live_blocked;
+                    if should_begin_native_multi_finger_tap(required_touches, in_canvas, blocked, state.is_stylus_active()) {
+                        state.push_history_action(action);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if queued {
+                    self.ivars().egui_ctx.request_repaint();
+                }
             }
 
             fn should_begin(&self, gesture_recognizer: &UIGestureRecognizer) -> bool {
@@ -607,15 +857,21 @@ pub mod ios {
                 };
                 let view = gesture_recognizer.view();
                 let loc = gesture_recognizer.locationInView(view.as_deref());
-                let (lx, ly) = (loc.x as f32, loc.y as f32);
-                let in_canvas = state.point_in_canvas(lx, ly);
-                let live_blocked = egui_overlay_blocks_native_gesture(&self.ivars().egui_ctx, state.canvas_overlay_blocked, Some(egui::pos2(lx, ly)));
+                let Some([ex, ey]) = uikit_point_to_egui([loc.x as f32, loc.y as f32], state.zoom_factor()) else {
+                    return false;
+                };
+                let in_canvas = state.point_in_canvas(ex, ey);
+                let live_blocked = egui_overlay_blocks_native_gesture(&self.ivars().egui_ctx, state.canvas_overlay_blocked, Some(egui::pos2(ex, ey)));
                 let blocked = state.egui_using_pointer || live_blocked;
                 let touch_count = gesture_recognizer.numberOfTouches();
                 if self.is_pan(gesture_recognizer) {
-                    should_begin_native_pan(touch_count, state.finger_drawing, in_canvas, blocked)
+                    should_begin_native_pan_for_input(touch_count, state.finger_drawing, in_canvas, blocked, state.is_stylus_active())
                 } else if self.is_pinch(gesture_recognizer) {
                     should_begin_native_pinch(touch_count, in_canvas, blocked)
+                } else if self.is_two_finger_tap(gesture_recognizer) {
+                    should_begin_native_multi_finger_tap(2, in_canvas, blocked, state.is_stylus_active())
+                } else if self.is_three_finger_tap(gesture_recognizer) {
+                    should_begin_native_multi_finger_tap(3, in_canvas, blocked, state.is_stylus_active())
                 } else {
                     false
                 }
@@ -630,21 +886,35 @@ pub mod ios {
                 let addr = std::ptr::from_ref(recognizer) as usize;
                 addr != 0 && addr == self.ivars().pinch_addr.get()
             }
+
+            fn is_two_finger_tap(&self, recognizer: &UIGestureRecognizer) -> bool {
+                let addr = std::ptr::from_ref(recognizer) as usize;
+                addr != 0 && addr == self.ivars().two_finger_tap_addr.get()
+            }
+
+            fn is_three_finger_tap(&self, recognizer: &UIGestureRecognizer) -> bool {
+                let addr = std::ptr::from_ref(recognizer) as usize;
+                addr != 0 && addr == self.ivars().three_finger_tap_addr.get()
+            }
         }
     }
 
     use delegate_class::NocturneGestureDelegate;
 
-    /// Owns native UIKit finger-only pan & pinch gesture recognizers attached to `WinitView`.
+    /// Owns native UIKit finger-only pan, pinch, 2-finger Undo tap, and 3-finger Redo tap
+    /// gesture recognizers attached to `WinitView`.
     pub struct GestureBridge {
         pan: Retained<UIPanGestureRecognizer>,
         pinch: Retained<UIPinchGestureRecognizer>,
+        two_finger_tap: Retained<UITapGestureRecognizer>,
+        three_finger_tap: Retained<UITapGestureRecognizer>,
         _delegate: Retained<NocturneGestureDelegate>,
         state: SharedGestureState,
     }
 
     impl GestureBridge {
-        /// Attaches finger-only `UIPanGestureRecognizer` and `UIPinchGestureRecognizer` onto `view`.
+        /// Attaches finger-only `UIPanGestureRecognizer`, `UIPinchGestureRecognizer`, and 2-/3-finger
+        /// `UITapGestureRecognizer` instances onto `view`.
         pub fn attach(view: &UIView, mtm: MainThreadMarker, egui_ctx: &egui::Context) -> Self {
             let state = Rc::new(RefCell::new(GestureBridgeState::new()));
             let delegate = NocturneGestureDelegate::new(mtm, Rc::clone(&state), egui_ctx.clone());
@@ -669,8 +939,31 @@ pub mod ios {
                     UIPinchGestureRecognizer::initWithTarget_action(alloc, Some(target_obj), Some(sel!(handlePinch:)))
                 }
             };
+            let two_finger_tap = {
+                let alloc = mtm.alloc::<UITapGestureRecognizer>();
+                #[allow(unsafe_code)]
+                // SAFETY: `target_obj` is a retained `NocturneGestureDelegate` implementing `handleTwoFingerTap:`
+                // with signature `fn(&self, &UITapGestureRecognizer)` on the main thread.
+                unsafe {
+                    UITapGestureRecognizer::initWithTarget_action(alloc, Some(target_obj), Some(sel!(handleTwoFingerTap:)))
+                }
+            };
+            let three_finger_tap = {
+                let alloc = mtm.alloc::<UITapGestureRecognizer>();
+                #[allow(unsafe_code)]
+                // SAFETY: `target_obj` is a retained `NocturneGestureDelegate` implementing `handleThreeFingerTap:`
+                // with signature `fn(&self, &UITapGestureRecognizer)` on the main thread.
+                unsafe {
+                    UITapGestureRecognizer::initWithTarget_action(alloc, Some(target_obj), Some(sel!(handleThreeFingerTap:)))
+                }
+            };
 
-            delegate.set_recognizer_addrs(Retained::as_ptr(&pan) as usize, Retained::as_ptr(&pinch) as usize);
+            delegate.set_recognizer_addrs(
+                Retained::as_ptr(&pan) as usize,
+                Retained::as_ptr(&pinch) as usize,
+                Retained::as_ptr(&two_finger_tap) as usize,
+                Retained::as_ptr(&three_finger_tap) as usize,
+            );
 
             let direct_touch = NSNumber::new_isize(UITouchType::Direct.0);
             let allowed_types = NSArray::from_slice(&[&*direct_touch]);
@@ -688,20 +981,63 @@ pub mod ios {
             pinch.setCancelsTouchesInView(true);
             pinch.setDelegate(Some(delegate_proto));
 
+            two_finger_tap.setAllowedTouchTypes(&allowed_types);
+            two_finger_tap.setDelaysTouchesBegan(false);
+            two_finger_tap.setCancelsTouchesInView(true);
+            two_finger_tap.setNumberOfTapsRequired(1);
+            two_finger_tap.setNumberOfTouchesRequired(2);
+            two_finger_tap.setDelegate(Some(delegate_proto));
+
+            three_finger_tap.setAllowedTouchTypes(&allowed_types);
+            three_finger_tap.setDelaysTouchesBegan(false);
+            three_finger_tap.setCancelsTouchesInView(true);
+            three_finger_tap.setNumberOfTapsRequired(1);
+            three_finger_tap.setNumberOfTouchesRequired(3);
+            three_finger_tap.setDelegate(Some(delegate_proto));
+
+            // Prevent a 3-finger Redo tap from prematurely firing 2-finger Undo.
+            two_finger_tap.requireGestureRecognizerToFail(&three_finger_tap);
+
             view.addGestureRecognizer(&pan);
             view.addGestureRecognizer(&pinch);
+            view.addGestureRecognizer(&two_finger_tap);
+            view.addGestureRecognizer(&three_finger_tap);
 
-            Self { pan, pinch, _delegate: delegate, state }
+            Self { pan, pinch, two_finger_tap, three_finger_tap, _delegate: delegate, state }
         }
 
-        /// Synchronizes `finger_drawing`, visible canvas viewport bounds, and egui overlay ownership each frame.
-        pub fn sync_from_app(&self, finger_drawing: bool, canvas_rect: Option<egui::Rect>, egui_using_pointer: bool, canvas_overlay_blocked: bool) {
-            if let Ok(mut state) = self.state.try_borrow_mut() {
+        /// Synchronizes `finger_drawing`, visible canvas viewport bounds, egui overlay ownership,
+        /// `zoom_factor`, and active stylus state each frame.
+        ///
+        /// If `stylus_active` is `true` while a finger/palm pan is in flight, immediately cancels
+        /// the UIKit `UIPanGestureRecognizer` and drops any unapplied pan delta so Apple Pencil
+        /// strokes never drift under a resting palm.
+        #[allow(clippy::too_many_arguments)]
+        pub fn sync_from_app(
+            &self,
+            finger_drawing: bool,
+            canvas_rect: Option<egui::Rect>,
+            egui_using_pointer: bool,
+            canvas_overlay_blocked: bool,
+            zoom_factor: f32,
+            stylus_active: bool,
+        ) {
+            let cancel_pan = if let Ok(mut state) = self.state.try_borrow_mut() {
                 state.finger_drawing = finger_drawing;
                 state.canvas_rect =
                     canvas_rect.filter(|r| r.is_finite()).map(|r| GestureRect { min_x: r.min.x, min_y: r.min.y, max_x: r.max.x, max_y: r.max.y });
                 state.egui_using_pointer = egui_using_pointer;
                 state.canvas_overlay_blocked = canvas_overlay_blocked;
+                state.set_zoom_factor(zoom_factor);
+                state.set_stylus_active(stylus_active)
+            } else {
+                false
+            };
+            // Drop `RefCell` borrow before touching UIKit recognizer state, since toggling
+            // `setEnabled(false)` may synchronously fire `handlePan:` with `State::Cancelled`.
+            if cancel_pan {
+                self.pan.setEnabled(false);
+                self.pan.setEnabled(true);
             }
             let min_touches = if finger_drawing { 2 } else { 1 };
             if self.pan.minimumNumberOfTouches() != min_touches {
@@ -709,62 +1045,74 @@ pub mod ios {
             }
         }
 
-        /// Drains any accumulated pan delta in logical points.
+        /// Drains any accumulated pan delta in egui logical points.
         pub fn drain_pan_delta(&self) -> Option<egui::Vec2> {
             let mut state = self.state.try_borrow_mut().ok()?;
             state.drain_pan_delta().map(|[dx, dy]| egui::vec2(dx, dy))
         }
 
-        /// Drains any accumulated pinch zoom factor and optional focal position in logical points.
+        /// Drains any accumulated pinch zoom factor and optional focal position in egui logical points.
         pub fn drain_pinch(&self) -> Option<(f32, Option<egui::Pos2>)> {
             let mut state = self.state.try_borrow_mut().ok()?;
             state.drain_pinch().map(|(scale, focal)| (scale, focal.map(|[x, y]| egui::pos2(x, y))))
         }
 
+        /// Drains queued native 2-finger Undo and 3-finger Redo tap actions in FIFO order.
+        pub fn drain_history_actions(&self) -> Vec<GestureHistoryAction> {
+            self.state.try_borrow_mut().map(|mut s| s.drain_history_actions()).unwrap_or_default()
+        }
+
         /// Filters `raw_input.events` while native pan/pinch is active and synthesizes clean pointer release
         /// on `TouchPhase::Cancel` or suppressed pointer events without touching Apple Pencil events.
         pub fn filter_raw_input(&self, raw_input: &mut egui::RawInput, pointer_was_down: bool, active_stylus_ids: &BTreeSet<egui::TouchId>) {
-            let Ok(mut state) = self.state.try_borrow_mut() else {
-                return;
-            };
-            let pure_ids: BTreeSet<u64> = active_stylus_ids.iter().map(|id| id.0).collect();
-            filter_events_core(
-                &mut raw_input.events,
-                &mut state,
-                pointer_was_down,
-                !pure_ids.is_empty(),
-                &pure_ids,
-                |ev| match ev {
-                    egui::Event::Touch { id, phase, pos, force, .. } => EventKind::Touch {
-                        id: id.0,
-                        phase: match phase {
-                            egui::TouchPhase::Start => PureTouchPhase::Start,
-                            egui::TouchPhase::Move => PureTouchPhase::Move,
-                            egui::TouchPhase::End => PureTouchPhase::End,
-                            egui::TouchPhase::Cancel => PureTouchPhase::Cancel,
+            let cancel_pan = {
+                let Ok(mut state) = self.state.try_borrow_mut() else {
+                    return;
+                };
+                let pure_ids: BTreeSet<u64> = active_stylus_ids.iter().map(|id| id.0).collect();
+                filter_events_core(
+                    &mut raw_input.events,
+                    &mut state,
+                    pointer_was_down,
+                    !pure_ids.is_empty(),
+                    &pure_ids,
+                    |ev| match ev {
+                        egui::Event::Touch { id, phase, pos, force, .. } => EventKind::Touch {
+                            id: id.0,
+                            phase: match phase {
+                                egui::TouchPhase::Start => PureTouchPhase::Start,
+                                egui::TouchPhase::Move => PureTouchPhase::Move,
+                                egui::TouchPhase::End => PureTouchPhase::End,
+                                egui::TouchPhase::Cancel => PureTouchPhase::Cancel,
+                            },
+                            is_stylus_force: force.is_some_and(f32::is_finite),
+                            pos: [pos.x, pos.y],
                         },
-                        is_stylus_force: force.is_some_and(f32::is_finite),
-                        pos: [pos.x, pos.y],
+                        egui::Event::PointerMoved(pos) => EventKind::PointerMoved([pos.x, pos.y]),
+                        egui::Event::PointerButton { pos, button, pressed, .. } => {
+                            EventKind::PointerButton { primary: *button == egui::PointerButton::Primary, pressed: *pressed, pos: [pos.x, pos.y] }
+                        }
+                        egui::Event::PointerGone => EventKind::PointerGone,
+                        egui::Event::Zoom(_) => EventKind::Zoom,
+                        _ => EventKind::Other,
                     },
-                    egui::Event::PointerMoved(pos) => EventKind::PointerMoved([pos.x, pos.y]),
-                    egui::Event::PointerButton { pos, button, pressed, .. } => {
-                        EventKind::PointerButton { primary: *button == egui::PointerButton::Primary, pressed: *pressed, pos: [pos.x, pos.y] }
-                    }
-                    egui::Event::PointerGone => EventKind::PointerGone,
-                    egui::Event::Zoom(_) => EventKind::Zoom,
-                    _ => EventKind::Other,
-                },
-                ReleaseEventFns {
-                    pointer_moved: |[x, y]: [f32; 2]| egui::Event::PointerMoved(egui::pos2(x, y)),
-                    primary_release: |[x, y]: [f32; 2]| egui::Event::PointerButton {
-                        pos: egui::pos2(x, y),
-                        button: egui::PointerButton::Primary,
-                        pressed: false,
-                        modifiers: egui::Modifiers::NONE,
+                    ReleaseEventFns {
+                        pointer_moved: |[x, y]: [f32; 2]| egui::Event::PointerMoved(egui::pos2(x, y)),
+                        primary_release: |[x, y]: [f32; 2]| egui::Event::PointerButton {
+                            pos: egui::pos2(x, y),
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                        pointer_gone: || egui::Event::PointerGone,
                     },
-                    pointer_gone: || egui::Event::PointerGone,
-                },
-            );
+                );
+                if !pure_ids.is_empty() || !state.known_stylus_ids.is_empty() { state.set_stylus_active(true) } else { false }
+            };
+            if cancel_pan {
+                self.pan.setEnabled(false);
+                self.pan.setEnabled(true);
+            }
         }
 
         /// Returns `true` when either native pan or native pinch is currently active.
@@ -777,18 +1125,28 @@ pub mod ios {
         fn drop(&mut self) {
             self.pan.setDelegate(None);
             self.pinch.setDelegate(None);
+            self.two_finger_tap.setDelegate(None);
+            self.three_finger_tap.setDelegate(None);
             #[allow(unsafe_code)]
             // SAFETY: Clearing all targets/actions (`None, None`) on live recognizers on the main thread
             // prevents UIKit from sending actions after `self._delegate` is dropped.
             unsafe {
                 self.pan.removeTarget_action(None, None);
                 self.pinch.removeTarget_action(None, None);
+                self.two_finger_tap.removeTarget_action(None, None);
+                self.three_finger_tap.removeTarget_action(None, None);
             }
             if let Some(view) = self.pan.view() {
                 view.removeGestureRecognizer(&self.pan);
             }
             if let Some(view) = self.pinch.view() {
                 view.removeGestureRecognizer(&self.pinch);
+            }
+            if let Some(view) = self.two_finger_tap.view() {
+                view.removeGestureRecognizer(&self.two_finger_tap);
+            }
+            if let Some(view) = self.three_finger_tap.view() {
+                view.removeGestureRecognizer(&self.three_finger_tap);
             }
         }
     }
@@ -1105,5 +1463,126 @@ mod tests {
             ]
         );
         assert!(!state.needs_pointer_release);
+    }
+
+    #[test]
+    fn two_finger_undo_and_three_finger_redo_tap_gating_and_fifo_queue() {
+        assert_eq!(resolve_multi_finger_tap_action(1), None);
+        assert_eq!(resolve_multi_finger_tap_action(2), Some(GestureHistoryAction::Undo));
+        assert_eq!(resolve_multi_finger_tap_action(3), Some(GestureHistoryAction::Redo));
+        assert_eq!(resolve_multi_finger_tap_action(4), None);
+
+        // Allowed only inside canvas when egui overlay and stylus are inactive.
+        assert!(should_begin_native_multi_finger_tap(2, true, false, false));
+        assert!(should_begin_native_multi_finger_tap(3, true, false, false));
+        assert!(!should_begin_native_multi_finger_tap(1, true, false, false));
+        assert!(!should_begin_native_multi_finger_tap(4, true, false, false));
+        assert!(!should_begin_native_multi_finger_tap(2, false, false, false));
+        assert!(!should_begin_native_multi_finger_tap(2, true, true, false));
+        assert!(!should_begin_native_multi_finger_tap(2, true, false, true));
+        assert!(!should_begin_native_multi_finger_tap(3, true, false, true));
+
+        let mut state = GestureBridgeState::new();
+        assert!(state.drain_history_actions().is_empty());
+        assert!(!state.needs_pointer_release);
+
+        state.push_history_action(GestureHistoryAction::Undo);
+        state.push_history_action(GestureHistoryAction::Redo);
+        assert!(state.needs_pointer_release, "multi-finger tap must arm pointer-release cleanup");
+        assert_eq!(state.drain_history_actions(), vec![GestureHistoryAction::Undo, GestureHistoryAction::Redo]);
+        assert!(state.drain_history_actions().is_empty());
+    }
+
+    #[test]
+    fn resting_palm_major_radius_filters_palm_touches_while_keeping_fingers_and_simulator() {
+        // Normal fingertips & thumbs (< PALM_MAJOR_RADIUS_PTS) are NOT palms.
+        assert!(!is_palm_touch_radius(0.0));
+        assert!(!is_palm_touch_radius(16.0));
+        assert!(!is_palm_touch_radius(28.0));
+        assert!(!is_palm_touch_radius(PALM_MAJOR_RADIUS_PTS - 0.1));
+        // Non-finite / negative (unavailable radius) fail open for fingers.
+        assert!(!is_palm_touch_radius(-5.0));
+        assert!(!is_palm_touch_radius(f32::NAN));
+        assert!(!is_palm_touch_radius(f32::INFINITY));
+
+        // Resting palm at or above threshold is rejected.
+        assert!(is_palm_touch_radius(PALM_MAJOR_RADIUS_PTS));
+        assert!(is_palm_touch_radius(55.0));
+        assert!(is_palm_touch_radius(90.0));
+
+        // `should_receive_gesture_touch` enforces direct finger + non-palm + stylus-free pan.
+        assert!(should_receive_gesture_touch(true, 18.0, false, true));
+        assert!(should_receive_gesture_touch(true, 0.0, false, true));
+        assert!(!should_receive_gesture_touch(false, 18.0, false, true), "non-direct (Apple Pencil) must be rejected");
+        assert!(!should_receive_gesture_touch(true, 45.0, false, true), "resting palm must be rejected for pan");
+        assert!(!should_receive_gesture_touch(true, 45.0, false, false), "resting palm must be rejected for pinch/tap too");
+        assert!(!should_receive_gesture_touch(true, 18.0, true, true), "pan touches must be rejected while stylus is active");
+        assert!(should_receive_gesture_touch(true, 18.0, true, false), "non-pan recognizers remain gated separately");
+    }
+
+    #[test]
+    fn stylus_cancels_in_flight_pan_drops_pending_delta_and_blocks_new_pan_until_lift() {
+        let mut state = GestureBridgeState::new();
+        state.canvas_rect = Some(GestureRect::from_bounds([0.0, 0.0, 800.0, 600.0]));
+
+        // Resting palm/finger starts panning before Pencil lands.
+        state.pan_active = true;
+        state.accumulate_pan_uikit(24.0, -36.0);
+        assert!(state.is_native_gesture_active());
+        assert!(should_begin_native_pan_for_input(1, false, true, false, false));
+
+        // Apple Pencil lands -> immediately cancels pan and clears pending pan delta!
+        assert!(state.set_stylus_active(true), "should report that an in-flight pan was cancelled");
+        assert!(!state.pan_active);
+        assert_eq!(state.drain_pan_delta(), None, "pending pan delta must be dropped when stylus cancels pan");
+        assert!(!should_begin_native_pan_for_input(1, false, true, false, state.is_stylus_active()));
+
+        // Stray UIKit pan deltas arriving while stylus is active are ignored.
+        state.accumulate_pan_uikit(50.0, 50.0);
+        assert_eq!(state.drain_pan_delta(), None);
+        assert!(!state.set_stylus_active(true), "no active pan left to cancel");
+
+        // Pencil lifts -> finger pan works again.
+        assert!(!state.set_stylus_active(false));
+        assert!(should_begin_native_pan_for_input(1, false, true, false, state.is_stylus_active()));
+        state.accumulate_pan_uikit(10.0, -20.0);
+        assert_eq!(state.drain_pan_delta(), Some([10.0, -20.0]));
+    }
+
+    #[test]
+    fn zoom_factor_converts_gesture_positions_deltas_pinch_focal_and_canvas_hit_tests() {
+        assert_eq!(uikit_point_to_egui([250.0, 125.0], 1.25), Some([200.0, 100.0]));
+        assert_eq!(uikit_delta_to_egui([25.0, -50.0], 1.25), [20.0, -40.0]);
+
+        // Bad zoom factors safely fall back to 1.0; non-finite coordinates fail closed.
+        for bad_zoom in [0.0, -1.5, f32::NAN, f32::INFINITY] {
+            assert_eq!(sanitize_zoom_factor(bad_zoom), 1.0);
+            assert_eq!(uikit_point_to_egui([250.0, 125.0], bad_zoom), Some([250.0, 125.0]));
+            assert_eq!(uikit_delta_to_egui([25.0, -50.0], bad_zoom), [25.0, -50.0]);
+        }
+        assert_eq!(uikit_point_to_egui([f32::NAN, 10.0], 1.25), None);
+        assert_eq!(uikit_delta_to_egui([f32::INFINITY, 10.0], 1.25), [0.0, 0.0]);
+
+        // End-to-end state conversion at zoom_factor = 1.25:
+        // Canvas rect in egui logical points is [100..500, 100..400], which in UIKit view points
+        // is [125..625, 125..500].
+        let mut state = GestureBridgeState::new();
+        assert_close(state.zoom_factor(), 1.0);
+        state.canvas_rect = Some(GestureRect::from_bounds([100.0, 100.0, 500.0, 400.0]));
+        state.set_zoom_factor(1.25);
+
+        assert!(state.point_in_canvas_uikit(600.0, 450.0), "(600, 450) UIKit == (480, 360) egui -> inside canvas");
+        assert!(!state.point_in_canvas_uikit(120.0, 450.0), "(120, 450) UIKit == (96, 360) egui -> outside left edge");
+
+        state.accumulate_pan_uikit(25.0, -50.0);
+        assert_eq!(state.drain_pan_delta(), Some([20.0, -40.0]));
+
+        state.accumulate_pinch_uikit(1.5, Some([500.0, 375.0]));
+        let drained = state.drain_pinch();
+        assert!(drained.is_some());
+        if let Some((scale, focal)) = drained {
+            assert_close(scale, 1.5);
+            assert_eq!(focal, Some([400.0, 300.0]));
+        }
     }
 }

@@ -9,9 +9,9 @@
 //! same kind of pen are that pen in several colours. Nothing new is stored for them.
 
 use crate::ribbon::{Act, RackEdit};
-use crate::tablet_chrome::{NIB_COLOURS, shown_nib_color};
-use crate::theme::Tokens;
-use egui::{Align2, Context, Id, Order, Rect, RichText, Sense, Stroke, StrokeKind, Ui, vec2};
+use crate::tablet_chrome::{NIB_COLOURS, paint_studio_btn_chrome, shown_nib_color};
+use crate::theme::{RADIUS_CONTROL, RADIUS_POPUP, Tokens};
+use egui::{Align2, Context, CornerRadius, Id, Order, Rect, RichText, Sense, Stroke, StrokeKind, Ui, vec2};
 use nocturne_engine::{DockTool, LibraryView, StudioOptions, ToolbarDock};
 use nocturne_ink::Tool;
 use nocturne_ink::rack::{self, Nib};
@@ -65,22 +65,49 @@ fn heading(ui: &mut Ui, label: &str, t: &Tokens) {
 /// One of a row of choices of which one is taken.
 // i18n-ui-text: label
 fn choice(ui: &mut Ui, label: &str, chosen: bool, t: &Tokens) -> bool {
-    let button = egui::Button::new(RichText::new(label).color(if chosen { t.accent } else { t.text })).selected(chosen).min_size(vec2(78.0, 34.0));
-    ui.add(button).clicked() && !chosen
+    let button = egui::Button::new(RichText::new(label).color(if chosen { t.accent_text } else { t.text }))
+        .fill(if chosen { t.row_selected } else { t.panel })
+        .stroke(if chosen { Stroke::new(1.5, t.accent) } else { Stroke::new(1.0, t.border) })
+        .corner_radius(CornerRadius::same(RADIUS_CONTROL))
+        .selected(chosen)
+        .min_size(vec2(78.0, 36.0));
+    let resp = ui.add(button);
+    if resp.has_focus() {
+        ui.painter().rect_stroke(resp.rect.expand(1.5), CornerRadius::same(RADIUS_CONTROL + 2), Stroke::new(2.0, t.accent), StrokeKind::Outside);
+    }
+    resp.clicked() && !chosen
 }
 
 /// A small square button with a picture on it and a name for what it does. The picture is one
 /// of the drawn icons, not a letter: the fonts the app carries have no arrows or minus sign.
 // i18n-ui-text: name
 fn sign_button(ui: &mut Ui, icon: crate::icons::Icon, name: &str, enabled: bool, t: &Tokens) -> bool {
-    let (rect, response) = ui.allocate_exact_size(vec2(34.0, 30.0), if enabled { Sense::click() } else { Sense::hover() });
+    let (rect, response) = ui.allocate_exact_size(vec2(36.0, 36.0), if enabled { Sense::click() } else { Sense::hover() });
     let name = name.to_string();
     response.widget_info(move || egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &name));
-    if enabled && response.hovered() {
-        ui.painter().rect_filled(rect, 6.0, t.row_hover);
+    let pressed = enabled && response.is_pointer_button_down_on();
+    let r = CornerRadius::same(RADIUS_CONTROL);
+    if pressed {
+        ui.painter().rect_filled(rect, r, t.row_selected);
+        ui.painter().rect_stroke(rect, r, Stroke::new(1.5, t.accent), StrokeKind::Inside);
+    } else if enabled && response.hovered() {
+        ui.painter().rect_filled(rect, r, t.row_hover);
+        ui.painter().rect_stroke(rect, r, Stroke::new(1.0, t.accent), StrokeKind::Inside);
+    } else {
+        ui.painter().rect_filled(rect, r, if enabled { t.panel } else { t.faint });
+        ui.painter().rect_stroke(rect, r, Stroke::new(1.0, if enabled { t.border } else { t.border_subtle }), StrokeKind::Inside);
     }
-    ui.painter().rect_stroke(rect, 6.0, Stroke::new(1.0, t.container_border), StrokeKind::Inside);
-    crate::icons::paint(ui.painter(), Rect::from_center_size(rect.center(), vec2(16.0, 16.0)), icon, if enabled { t.text } else { t.faint });
+    if enabled && response.has_focus() {
+        ui.painter().rect_stroke(rect.expand(1.5), CornerRadius::same(RADIUS_CONTROL + 2), Stroke::new(2.0, t.accent), StrokeKind::Outside);
+    }
+    let fg = if !enabled {
+        t.disabled
+    } else if pressed {
+        t.accent
+    } else {
+        t.text
+    };
+    crate::icons::paint(ui.painter(), Rect::from_center_size(rect.center(), vec2(16.0, 16.0)), icon, fg);
     response.clicked()
 }
 
@@ -88,6 +115,7 @@ fn sign_button(ui: &mut Ui, icon: crate::icons::Icon, name: &str, enabled: bool,
 pub fn show(ctx: &Context, view: Rect, input: &ToolSettingsIn<'_>, t: &Tokens) -> Vec<Act> {
     let mut acts = Vec::new();
     let width = (view.width() - 48.0).clamp(280.0, 460.0);
+    let scroll_height = (view.height() - 120.0).max(160.0);
     egui::Area::new(Id::unique("studio-tool-settings"))
         .order(Order::Foreground)
         .pivot(Align2::CENTER_CENTER)
@@ -95,28 +123,49 @@ pub fn show(ctx: &Context, view: Rect, input: &ToolSettingsIn<'_>, t: &Tokens) -
         .constrain(true)
         .show(ctx, |ui| {
             crate::ribbon::mark_popup_open(ui.ctx());
-            egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(14)).corner_radius(14.0).show(ui, |ui| {
-                ui.set_width(width);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(crate::tl_id!("ui.tool_settings")).strong().size(17.0).color(t.text));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add(egui::Button::new(crate::tl_id!("ui.close")).min_size(vec2(64.0, 32.0))).clicked() {
-                            acts.push(Act::ToggleToolSettings);
-                        }
+            egui::Frame::NONE
+                .fill(t.surface_elevated)
+                .stroke(Stroke::new(1.0, t.border))
+                .corner_radius(CornerRadius::same(RADIUS_POPUP))
+                .shadow(t.shadow_popup())
+                .inner_margin(egui::Margin::same(14))
+                .show(ui, |ui| {
+                    ui.set_width(width);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(crate::tl_id!("ui.tool_settings")).strong().size(17.0).color(t.strong));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let close = ui.add(
+                                egui::Button::new(RichText::new(crate::tl_id!("ui.close")).color(t.text))
+                                    .fill(t.panel)
+                                    .stroke(Stroke::new(1.0, t.border))
+                                    .min_size(vec2(72.0, 36.0)),
+                            );
+                            if close.has_focus() {
+                                ui.painter().rect_stroke(
+                                    close.rect.expand(1.5),
+                                    CornerRadius::same(RADIUS_CONTROL + 2),
+                                    Stroke::new(2.0, t.accent),
+                                    StrokeKind::Outside,
+                                );
+                            }
+                            if close.clicked() {
+                                acts.push(Act::ToggleToolSettings);
+                            }
+                        });
                     });
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt("studio-tool-settings-scroll")
+                        .max_height(scroll_height)
+                        .min_scrolled_height(scroll_height)
+                        .show(ui, |ui| {
+                            ui.set_width(width - 12.0);
+                            ui.spacing_mut().interact_size.y = ui.spacing().interact_size.y.max(36.0);
+                            switches(ui, input, &mut acts, t);
+                            roster(ui, input, &mut acts, t);
+                            pens(ui, input, &mut acts, t);
+                        });
                 });
-                ui.separator();
-                egui::ScrollArea::vertical()
-                    .id_salt("studio-tool-settings-scroll")
-                    .max_height((view.height() - 120.0).max(160.0))
-                    .min_scrolled_height((view.height() - 120.0).max(160.0))
-                    .show(ui, |ui| {
-                        ui.set_width(width - 12.0);
-                        switches(ui, input, &mut acts, t);
-                        roster(ui, input, &mut acts, t);
-                        pens(ui, input, &mut acts, t);
-                    });
-            });
         });
     acts
 }
@@ -132,7 +181,7 @@ fn switches(ui: &mut Ui, input: &ToolSettingsIn<'_>, acts: &mut Vec<Act>, t: &To
         acts.push(Act::ToggleHoldToStraighten);
     }
     heading(ui, crate::tl_id!("ui.tool_settings_eraser"), t);
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         for (pixel, label) in [(false, crate::tl_id!("ui.object_eraser")), (true, crate::tl_id!("ui.pixel_eraser"))] {
             if choice(ui, label, input.eraser_pixel == pixel, t) {
                 acts.push(Act::EraserPixel(pixel));
@@ -140,7 +189,7 @@ fn switches(ui: &mut Ui, input: &ToolSettingsIn<'_>, acts: &mut Vec<Act>, t: &To
         }
     });
     heading(ui, crate::tl_id!("ui.tool_bar_position"), t);
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         for dock in ToolbarDock::ALL {
             if choice(ui, edge_label(dock), input.studio.toolbar_dock == dock, t) {
                 acts.push(Act::ToolbarDock(dock));
@@ -152,19 +201,20 @@ fn switches(ui: &mut Ui, input: &ToolSettingsIn<'_>, acts: &mut Vec<Act>, t: &To
     if ui.checkbox(&mut math_ocr, crate::tl_id!("ui.recognise_handwritten_equations")).changed() {
         acts.push(Act::ToggleMathOcr);
     }
-    if ui
-        .add(
-            egui::Button::new(RichText::new(crate::tl_id!("ui.recognition_service_open")).color(t.text))
-                .fill(t.panel)
-                .stroke(Stroke::new(1.0, t.container_border))
-                .min_size(vec2(160.0, 32.0)),
-        )
-        .clicked()
-    {
+    let ocr_btn = ui.add(
+        egui::Button::new(RichText::new(crate::tl_id!("ui.recognition_service_open")).color(t.text))
+            .fill(t.panel)
+            .stroke(Stroke::new(1.0, t.border))
+            .min_size(vec2(160.0, 36.0)),
+    );
+    if ocr_btn.has_focus() {
+        ui.painter().rect_stroke(ocr_btn.rect.expand(1.5), CornerRadius::same(RADIUS_CONTROL + 2), Stroke::new(2.0, t.accent), StrokeKind::Outside);
+    }
+    if ocr_btn.clicked() {
         acts.push(Act::OpenMathOcrSetup);
     }
     heading(ui, crate::tl_id!("ui.library_view_heading"), t);
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         for (view, label) in
             [(LibraryView::StudioGrid, crate::tl_id!("ui.library_view_grid")), (LibraryView::ClassicTree, crate::tl_id!("ui.library_view_tree"))]
         {
@@ -210,23 +260,23 @@ fn roster(ui: &mut Ui, input: &ToolSettingsIn<'_>, acts: &mut Vec<Act>, t: &Toke
 /// changed from the row of colours under its kind.
 fn pens(ui: &mut Ui, input: &ToolSettingsIn<'_>, acts: &mut Vec<Act>, t: &Tokens) {
     heading(ui, crate::tl_id!("ui.pens_and_colours"), t);
-    let ring = crate::theme::mix(t.panel, t.text, 0.28);
     for tool in Tool::ALL {
         let label = crate::tl!(tool.label());
         let places: Vec<usize> = input.rack.iter().enumerate().filter(|(_, nib)| nib.tool == tool).map(|(i, _)| i).collect();
         ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            ui.add_sized(vec2(92.0, 28.0), egui::Label::new(RichText::new(label).color(t.text)).truncate());
+            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+            ui.add_sized(vec2(92.0, 36.0), egui::Label::new(RichText::new(label).color(t.text)).truncate());
             for (n, &place) in places.iter().enumerate() {
                 let nib = input.rack[place];
                 let in_hand = place == input.nib;
-                let (rect, swatch) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::click());
+                let (rect, swatch) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::click());
                 let name = crate::i18n::format_message_id("ui.colour_slot_named", &[("tool", label), ("n", &(n + 1).to_string())]);
                 swatch.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, in_hand, &name));
-                ui.painter().circle_filled(rect.center(), 10.0, shown_nib_color(nib.colour, t.panel));
-                ui.painter().circle_stroke(rect.center(), 10.0, Stroke::new(0.8, ring));
+                paint_studio_btn_chrome(ui, rect, &swatch, in_hand, true, t);
+                ui.painter().circle_filled(rect.center(), 10.5, shown_nib_color(nib.colour, t.surface_elevated));
+                ui.painter().circle_stroke(rect.center(), 10.5, Stroke::new(1.0, t.border));
                 if in_hand {
-                    ui.painter().rect_stroke(rect, 7.0, Stroke::new(1.6, t.accent), StrokeKind::Inside);
+                    ui.painter().circle_stroke(rect.center(), 13.0, Stroke::new(1.8, t.accent));
                 }
                 if swatch.clicked() {
                     acts.push(Act::InkPen(place));
@@ -251,15 +301,17 @@ fn pens(ui: &mut Ui, input: &ToolSettingsIn<'_>, acts: &mut Vec<Act>, t: &Tokens
         // The pen in hand, when it is of this kind: its colour and its thickness.
         if let Some(nib) = input.rack.get(input.nib).copied().filter(|nib| nib.tool == tool) {
             ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
                 ui.add_space(96.0);
                 for rgb in NIB_COLOURS {
-                    let (rect, swatch) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
+                    let chosen = nib.colour == rgb;
+                    let (rect, swatch) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
                     swatch.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, crate::tl_id!("ui.pen_colour")));
-                    ui.painter().circle_filled(rect.center(), 8.5, shown_nib_color(rgb, t.panel));
-                    ui.painter().circle_stroke(rect.center(), 8.5, Stroke::new(0.8, ring));
-                    if nib.colour == rgb {
-                        ui.painter().circle_stroke(rect.center(), 10.5, Stroke::new(1.8, t.accent));
+                    paint_studio_btn_chrome(ui, rect, &swatch, chosen, true, t);
+                    ui.painter().circle_filled(rect.center(), 9.5, shown_nib_color(rgb, t.surface_elevated));
+                    ui.painter().circle_stroke(rect.center(), 9.5, Stroke::new(1.0, t.border));
+                    if chosen {
+                        ui.painter().circle_stroke(rect.center(), 12.0, Stroke::new(1.8, t.accent));
                     }
                     if swatch.clicked() {
                         acts.push(Act::InkRack(RackEdit::Set(input.nib, Nib { colour: rgb, ..nib })));
@@ -268,12 +320,10 @@ fn pens(ui: &mut Ui, input: &ToolSettingsIn<'_>, acts: &mut Vec<Act>, t: &Tokens
                 ui.separator();
                 for tenths in rack::THICKNESSES {
                     let chosen = nib.tenths.abs_diff(tenths) <= 3;
-                    let (rect, dot) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
+                    let (rect, dot) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
                     dot.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, chosen, crate::tl_id!("ui.pen_thickness")));
-                    if chosen {
-                        ui.painter().rect_filled(rect, 5.0, t.accent.gamma_multiply(0.18));
-                    }
-                    ui.painter().circle_filled(rect.center(), (f32::from(tenths) / 20.0).clamp(1.2, 7.5), t.text);
+                    paint_studio_btn_chrome(ui, rect, &dot, chosen, true, t);
+                    ui.painter().circle_filled(rect.center(), (f32::from(tenths) / 20.0).clamp(1.5, 8.0), if chosen { t.accent } else { t.text });
                     if dot.clicked() {
                         acts.push(Act::InkRack(RackEdit::Set(input.nib, Nib { tenths, ..nib })));
                     }

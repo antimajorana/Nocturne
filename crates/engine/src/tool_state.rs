@@ -381,18 +381,55 @@ impl LibraryView {
     }
 }
 
-/// How Tablet Studio is laid out: where the tool bar is, and what is on it.
+/// Which top-level interface layout Nocturne presents.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UiLayoutMode {
+    #[default]
+    Auto,
+    TabletStudio,
+    ClassicRibbon,
+}
+
+impl UiLayoutMode {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::TabletStudio, Self::ClassicRibbon];
+
+    /// The stable identifier used by commands and in the settings file.
+    #[must_use]
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::TabletStudio => "tablet_studio",
+            Self::ClassicRibbon => "classic_ribbon",
+        }
+    }
+
+    /// Parses a stable identifier or short alias (trimmed, ASCII case-insensitive).
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "tablet_studio" | "tablet-studio" | "tabletstudio" | "tablet" | "studio" => Some(Self::TabletStudio),
+            "classic_ribbon" | "classic-ribbon" | "classicribbon" | "classic" | "ribbon" => Some(Self::ClassicRibbon),
+            _ => None,
+        }
+    }
+}
+
+/// How Tablet Studio is laid out: where the tool bar is, what is on it, library presentation,
+/// and top-level interface layout mode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StudioOptions {
     pub toolbar_dock: ToolbarDock,
     pub roster: DockRoster,
     pub library_view: LibraryView,
+    pub layout_mode: UiLayoutMode,
 }
 
 impl StudioOptions {
     pub(crate) const TOOLBAR_DOCK_KEY: &'static str = "toolbar_dock";
     pub(crate) const DOCK_TOOLS_KEY: &'static str = "studio_dock_tools";
     pub(crate) const LIBRARY_VIEW_KEY: &'static str = "library_view";
+    pub(crate) const LAYOUT_MODE_KEY: &'static str = "ui_layout_mode";
 
     /// Reads the layout from the settings file. Anything missing or unreadable is the default.
     pub(crate) fn load(settings: &nocturne_store::Settings) -> Self {
@@ -400,6 +437,7 @@ impl StudioOptions {
             toolbar_dock: settings.get(Self::TOOLBAR_DOCK_KEY).and_then(|v| ToolbarDock::parse(&v)).unwrap_or_default(),
             roster: settings.get(Self::DOCK_TOOLS_KEY).and_then(|v| DockRoster::parse(&v).ok()).unwrap_or_default(),
             library_view: settings.get(Self::LIBRARY_VIEW_KEY).and_then(|v| LibraryView::parse(&v)).unwrap_or_default(),
+            layout_mode: settings.get(Self::LAYOUT_MODE_KEY).and_then(|v| UiLayoutMode::parse(&v)).unwrap_or_default(),
         }
     }
 }

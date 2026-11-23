@@ -408,7 +408,15 @@ impl Pad {
         self.held.clear();
         self.loop_now.clear();
         self.grabbed = None;
+        self.eraser_last = None;
+        self.erased_since_press = false;
         self.predict_history.clear();
+    }
+
+    /// True while an ink stroke, erase drag, or held-ink grab is still in progress.
+    #[must_use]
+    pub fn gesture_active(&self) -> bool {
+        self.drawing_now.is_some() || self.grabbed.is_some() || self.eraser_last.is_some()
     }
 
     fn with_kept(mut self) -> Pad {
@@ -419,7 +427,7 @@ impl Pad {
     /// Ends a change once the hand is off: what the ink was before it becomes a step undo can go
     /// back to. Called by the window when no button is down, so a drag is one step, not one a frame.
     pub fn settle(&mut self) {
-        if !self.touched || self.drawing_now.is_some() || self.grabbed.is_some() {
+        if !self.touched || self.gesture_active() {
             return;
         }
         self.touched = false;
@@ -617,6 +625,39 @@ fn update_held_hit_cache(
     Some((b, held_box, area))
 }
 
+/// Moves or scales `pad.held` from its initial `was` bounds by `(dx, dy)` page points.
+/// Does nothing when `(dx, dy) == (0.0, 0.0)` so an initial grab frame never jumps or stretches.
+fn apply_grab_transform(pad: &mut Pad, was: (f32, f32, f32, f32), grab: Grab, dx: f32, dy: f32, track_shift: bool) {
+    if dx == 0.0 && dy == 0.0 {
+        return;
+    }
+    let (x0, y0, x1, y1) = was;
+    let now = pick::bounds(&pad.drawing, &pad.held).unwrap_or(was);
+    match grab {
+        Grab::Move => {
+            let step = (x0 + dx - now.0, y0 + dy - now.1);
+            pick::move_by(&mut pad.drawing, &pad.held, step.0, step.1);
+            if track_shift {
+                pad.shift = (pad.shift.0 + step.0, pad.shift.1 + step.1);
+            }
+        }
+        Grab::Corner(right, bottom) => {
+            let (ox, oy) = (if right { x0 } else { x1 }, if bottom { y0 } else { y1 });
+            let orig_w = (x1 - x0).max(0.001);
+            let orig_h = (y1 - y0).max(0.001);
+            let want_w = if right { orig_w + dx } else { orig_w - dx };
+            let want_h = if bottom { orig_h + dy } else { orig_h - dy };
+            let have_w = (now.2 - now.0).max(0.001);
+            let have_h = (now.3 - now.1).max(0.001);
+            let min_w = orig_w.min(4.0);
+            let min_h = orig_h.min(4.0);
+            let fx = if dx == 0.0 && (have_w - orig_w).abs() < 1e-4 { 1.0 } else { want_w.max(min_w) / have_w };
+            let fy = if dy == 0.0 && (have_h - orig_h).abs() < 1e-4 { 1.0 } else { want_h.max(min_h) / have_h };
+            pick::scale_about(&mut pad.drawing, &pad.held, ox, oy, fx, fy);
+        }
+    }
+}
+
 /// Held ink in the ordinary pointer (a selection box picked it up): a drag inside its box moves
 /// it, one on a corner stretches it, Delete throws it away and Escape lets go. Only the box
 /// takes the pointer, so the words and boxes around it are as they always are.
@@ -632,9 +673,9 @@ fn held_in_write(
     area: egui::Rect,
 ) -> bool {
     let resp = ui.interact(area, ui.id().with("ink-held"), Sense::drag());
-    let here = ui.ctx().pointer_interact_pos().unwrap_or(egui::Pos2::ZERO);
+    let here = ui.ctx().pointer_interact_pos();
     if resp.hovered() || resp.dragged() {
-        let corner = pad.grabbed.map(|(.., g)| g).or_else(|| grab_corner(held_box, here, handle_reach));
+        let corner = pad.grabbed.map(|(.., g)| g).or_else(|| here.and_then(|p| grab_corner(held_box, p, handle_reach)));
         ui.ctx().set_cursor_icon(match corner {
             Some(Grab::Corner(right, bottom)) if right == bottom => egui::CursorIcon::ResizeNwSe,
             Some(Grab::Corner(..)) => egui::CursorIcon::ResizeNeSw,
@@ -643,8 +684,12 @@ fn held_in_write(
     }
     // Ctrl and a click on held ink takes the stroke under it out of what is held, or puts it in.
     let ctrl = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
-    if resp.clicked() && ctrl {
-        let (x, y) = ((here.x - origin.x) / zoom, (here.y - origin.y) / zoom);
+    if resp.clicked()
+        && ctrl
+        && let Some(here) = here
+    {
+        let z = zoom.max(0.01);
+        let (x, y) = ((here.x - origin.x) / z, (here.y - origin.y) / z);
         if let Some(i) = pick::at(&pad.drawing, x, y, 3.0) {
             match pad.held.iter().position(|h| *h == i) {
                 Some(k) => {
@@ -655,35 +700,21 @@ fn held_in_write(
         }
         return false;
     }
-    if resp.drag_started() {
-        let from = ui.input(|i| i.pointer.press_origin()).unwrap_or(here);
+    if resp.drag_started()
+        && let Some(from) = ui.input(|i| i.pointer.press_origin()).or(here)
+    {
         pad.grabbed = Some((from, b, grab_corner(held_box, from, handle_reach).unwrap_or(Grab::Move)));
     }
     let mut changed = false;
     if let Some((from, was, grab)) = pad.grabbed {
-        let (dx, dy) = ((here.x - from.x) / zoom, (here.y - from.y) / zoom);
-        let (x0, y0, x1, y1) = was;
         if resp.dragged() {
-            let now = pick::bounds(&pad.drawing, &pad.held).unwrap_or(was);
-            match grab {
-                Grab::Move => {
-                    let step = (x0 + dx - now.0, y0 + dy - now.1);
-                    pick::move_by(&mut pad.drawing, &pad.held, step.0, step.1);
-                    pad.shift = (pad.shift.0 + step.0, pad.shift.1 + step.1);
-                }
-                Grab::Corner(right, bottom) => {
-                    let (ox, oy) = (if right { x0 } else { x1 }, if bottom { y0 } else { y1 });
-                    let (w, h) = ((x1 - x0).max(1.0), (y1 - y0).max(1.0));
-                    let want_w = if right { w + dx } else { w - dx };
-                    let want_h = if bottom { h + dy } else { h - dy };
-                    let have_w = (now.2 - now.0).max(0.001);
-                    let have_h = (now.3 - now.1).max(0.001);
-                    pick::scale_about(&mut pad.drawing, &pad.held, ox, oy, want_w.max(4.0) / have_w, want_h.max(4.0) / have_h);
-                }
+            if let Some(here) = here {
+                let z = zoom.max(0.01);
+                let (dx, dy) = ((here.x - from.x) / z, (here.y - from.y) / z);
+                apply_grab_transform(pad, was, grab, dx, dy, true);
+                ui.ctx().request_repaint();
             }
-            ui.ctx().request_repaint();
-        }
-        if !resp.dragged() {
+        } else {
             pad.grabbed = None;
             changed = true;
         }
@@ -779,6 +810,7 @@ pub fn show_with_input_and_handles(
     // A pen that writes while a palm rests on the glass: the window's pointer is the palm's, so
     // where the pen is and whether it is down are read from the pen's own touch instead.
     let pen_frame = ui.ctx().data(|d| d.get_temp::<crate::stylus::StylusFrame>(crate::stylus::StylusFrame::id()));
+    let stylus_lifted = pen_frame.as_ref().is_some_and(|pen| !pen.down);
     if pen_frame.is_none() {
         pad.pen_on_page = false;
     }
@@ -888,15 +920,21 @@ pub fn show_with_input_and_handles(
         changed |= dropped_grab;
         pad.dirty |= changed;
         pad.touched |= changed;
+        if stylus_lifted {
+            pad.settle();
+        }
         return changed;
     }
 
     clear_held_hit_cache(ui.ctx());
     if !allow_stroke {
         let mut changed = false;
-        if let Some(stroke) = pad.drawing_now.take() {
+        let had_stroke = if let Some(stroke) = pad.drawing_now.take() {
             changed = pad.drawing.add(stroke);
-        }
+            changed
+        } else {
+            false
+        };
         pad.predict_history.clear();
         pad.shape_from = None;
         pad.eraser_last = None;
@@ -908,6 +946,9 @@ pub fn show_with_input_and_handles(
         changed |= dropped_grab;
         pad.dirty |= changed;
         pad.touched |= changed;
+        if had_stroke || stylus_lifted {
+            pad.settle();
+        }
         return changed;
     }
 
@@ -1147,23 +1188,27 @@ pub fn show_with_input_and_handles(
             }
         }
         Pointer::Pick => {
-            let held_box = pick::bounds(&pad.drawing, &pad.held).map(|(x0, y0, x1, y1)| {
+            let held_bounds = pick::bounds(&pad.drawing, &pad.held);
+            let held_box = held_bounds.map(|(x0, y0, x1, y1)| {
                 egui::Rect::from_min_max(origin + vec2(x0 * zoom, y0 * zoom), origin + vec2(x1 * zoom, y1 * zoom)).expand(3.0)
             });
-            let here = here.unwrap_or(egui::Pos2::ZERO);
-            if down && pad.grabbed.is_none() {
+            if down
+                && pad.grabbed.is_none()
+                && let Some(here_pos) = here
+            {
                 // A press on a corner stretches, inside the box moves, on a stroke picks
-                // that stroke up, and anywhere else lets go.
-                let corner = held_box.and_then(|b| grab_corner(b, here, handle_reach));
+                // that stroke up, and anywhere else lets go. Keep the unexpanded page bounds
+                // so the initial grab frame never jumps or stretches by the visual padding.
+                let corner = held_box.and_then(|b| grab_corner(b, here_pos, handle_reach));
                 let pick_radius = if touch_handles { 10.0 / zoom.max(0.15) } else { 3.0 };
-                match (corner, held_box, at) {
-                    (Some(c), Some(b), _) => pad.grabbed = Some((here, as_tuple(b, origin, zoom), c)),
-                    (None, Some(b), _) if b.contains(here) => pad.grabbed = Some((here, as_tuple(b, origin, zoom), Grab::Move)),
-                    (_, _, Some((x, y))) => match pick::at(&pad.drawing, x, y, pick_radius) {
+                match (corner, held_box, held_bounds, at) {
+                    (Some(c), _, Some(bounds), _) => pad.grabbed = Some((here_pos, bounds, c)),
+                    (None, Some(b), Some(bounds), _) if b.contains(here_pos) => pad.grabbed = Some((here_pos, bounds, Grab::Move)),
+                    (_, _, _, Some((x, y))) => match pick::at(&pad.drawing, x, y, pick_radius) {
                         Some(i) => {
                             pad.held = vec![i];
                             if let Some(b) = pick::bounds(&pad.drawing, &pad.held) {
-                                pad.grabbed = Some((here, b, Grab::Move));
+                                pad.grabbed = Some((here_pos, b, Grab::Move));
                             }
                         }
                         None => pad.let_go(),
@@ -1172,28 +1217,15 @@ pub fn show_with_input_and_handles(
                 }
             }
             if let Some((from, was, grab)) = pad.grabbed {
-                let (dx, dy) = ((here.x - from.x) / zoom, (here.y - from.y) / zoom);
                 if down {
-                    // The ink follows the pointer from where it was taken hold of, so a
-                    // long drag cannot drift away from the hand.
-                    let (x0, y0, x1, y1) = was;
-                    match grab {
-                        Grab::Move => {
-                            let now = pick::bounds(&pad.drawing, &pad.held).unwrap_or(was);
-                            pick::move_by(&mut pad.drawing, &pad.held, x0 + dx - now.0, y0 + dy - now.1);
-                        }
-                        Grab::Corner(right, bottom) => {
-                            let (ox, oy) = (if right { x0 } else { x1 }, if bottom { y0 } else { y1 });
-                            let (w, h) = ((x1 - x0).max(1.0), (y1 - y0).max(1.0));
-                            let want_w = if right { w + dx } else { w - dx };
-                            let want_h = if bottom { h + dy } else { h - dy };
-                            let now = pick::bounds(&pad.drawing, &pad.held).unwrap_or(was);
-                            let have_w = (now.2 - now.0).max(0.001);
-                            let have_h = (now.3 - now.1).max(0.001);
-                            pick::scale_about(&mut pad.drawing, &pad.held, ox, oy, want_w.max(4.0) / have_w, want_h.max(4.0) / have_h);
-                        }
+                    if let Some(here_pos) = here {
+                        // The ink follows the pointer from where it was taken hold of, so a
+                        // long drag cannot drift away from the hand.
+                        let z = zoom.max(0.01);
+                        let (dx, dy) = ((here_pos.x - from.x) / z, (here_pos.y - from.y) / z);
+                        apply_grab_transform(pad, was, grab, dx, dy, false);
+                        ui.ctx().request_repaint();
                     }
-                    ui.ctx().request_repaint();
                 } else {
                     pad.grabbed = None;
                     changed = true;
@@ -1218,6 +1250,9 @@ pub fn show_with_input_and_handles(
     changed |= dropped_grab;
     pad.dirty |= changed;
     pad.touched |= changed;
+    if stylus_lifted || !down {
+        pad.settle();
+    }
     changed
 }
 
@@ -1241,11 +1276,6 @@ fn grab_corner(box_: egui::Rect, at: egui::Pos2, reach: f32) -> Option<Grab> {
         .filter(|(c, _)| (c.x - at.x).abs() <= reach && (c.y - at.y).abs() <= reach)
         .min_by(|(a, _), (b, _)| a.distance_sq(at).total_cmp(&b.distance_sq(at)))
         .map(|(_, grab)| grab)
-}
-
-/// A rectangle on the screen as the ink's own coordinates.
-fn as_tuple(b: egui::Rect, origin: egui::Pos2, zoom: f32) -> (f32, f32, f32, f32) {
-    ((b.min.x - origin.x) / zoom, (b.min.y - origin.y) / zoom, (b.max.x - origin.x) / zoom, (b.max.y - origin.y) / zoom)
 }
 
 fn stroke_screen_bounds(stroke: &Stroke, origin: egui::Pos2, zoom: f32) -> Option<egui::Rect> {
@@ -1949,5 +1979,174 @@ mod tests {
         let xml = svg::write(&pad.drawing, svg::Flavour::Editable);
         let (back, _) = svg::read(&xml).expect("parse svg");
         assert!(back.strokes[0].dabs.iter().all(|d| d.x <= 120.01));
+    }
+
+    #[test]
+    fn pick_grab_does_not_jump_or_stretch_on_initial_press() {
+        use crate::ribbon::Pointer;
+        let body = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(800.0, 600.0));
+        let tokens = crate::theme::Theme::DEFAULT.tokens();
+        for zoom in [0.5_f32, 1.0, 1.5] {
+            // 1. Pressing inside an already-held box must not jump on frame 1, and must move by exact delta.
+            let t = TempDir::new("ink-pick-move-no-jump");
+            let mut pad = Pad::of_page(t.path());
+            let mut s = Stroke::new(Tool::Pen, Rgb::BLACK, 4.0);
+            s.add(Dab::new(100.0, 100.0, 1.0));
+            s.add(Dab::new(200.0, 200.0, 1.0));
+            pad.drawing.add(s);
+            pad.held = vec![0];
+            let before = pick::bounds(&pad.drawing, &pad.held).expect("bounds");
+
+            let ctx = egui::Context::default();
+            let pen = Pen { pointer: Pointer::Pick, ..Pen::default() };
+            let run = |pad: &mut Pad, events: Vec<egui::Event>| {
+                let input = egui::RawInput { events, screen_rect: Some(body), ..Default::default() };
+                let mut out = ctx.run_ui(input, |ui| {
+                    show_with_input_and_handles(ui, body, body, egui::Pos2::ZERO, pad, pen, 1.0, &tokens, zoom, true, false, false);
+                });
+                out.textures_delta.clear();
+            };
+
+            let inside = egui::pos2(150.0 * zoom, 150.0 * zoom);
+            run(&mut pad, vec![]);
+            run(&mut pad, vec![egui::Event::PointerMoved(inside), button(inside.x, inside.y, true)]);
+            assert!(pad.is_grabbed(), "zoom={zoom}: move grab started");
+            assert_eq!(pick::bounds(&pad.drawing, &pad.held), Some(before), "zoom={zoom}: initial move press must not jump");
+
+            let moved_to = egui::pos2(inside.x + 20.0 * zoom, inside.y + 10.0 * zoom);
+            run(&mut pad, vec![egui::Event::PointerMoved(moved_to)]);
+            let after_move = pick::bounds(&pad.drawing, &pad.held).expect("moved");
+            assert!((after_move.0 - (before.0 + 20.0)).abs() < 0.05, "zoom={zoom}: x0 {after_move:?} vs {before:?}");
+            assert!((after_move.1 - (before.1 + 10.0)).abs() < 0.05, "zoom={zoom}: y0 {after_move:?} vs {before:?}");
+            run(&mut pad, vec![button(moved_to.x, moved_to.y, false)]);
+
+            // 2. Pressing a corner handle must not stretch on frame 1, and must stretch by exact delta.
+            let before_resize = pick::bounds(&pad.drawing, &pad.held).expect("before resize");
+            let corner = egui::pos2(before_resize.2 * zoom + 3.0, before_resize.3 * zoom + 3.0);
+            run(&mut pad, vec![egui::Event::PointerMoved(corner), button(corner.x, corner.y, true)]);
+            assert!(pad.is_grabbed(), "zoom={zoom}: corner grab started");
+            assert_eq!(pick::bounds(&pad.drawing, &pad.held), Some(before_resize), "zoom={zoom}: initial corner press must not stretch");
+
+            let drag_corner = egui::pos2(corner.x + 30.0 * zoom, corner.y + 20.0 * zoom);
+            run(&mut pad, vec![egui::Event::PointerMoved(drag_corner)]);
+            let after_resize = pick::bounds(&pad.drawing, &pad.held).expect("after resize");
+            let want_w = (before_resize.2 - before_resize.0) + 30.0;
+            let want_h = (before_resize.3 - before_resize.1) + 20.0;
+            assert!(((after_resize.2 - after_resize.0) - want_w).abs() < 1.0, "zoom={zoom}: width {after_resize:?} want {want_w}");
+            assert!(((after_resize.3 - after_resize.1) - want_h).abs() < 1.0, "zoom={zoom}: height {after_resize:?} want {want_h}");
+            run(&mut pad, vec![button(drag_corner.x, drag_corner.y, false)]);
+        }
+    }
+
+    #[test]
+    fn pick_drag_without_pointer_pos_never_jumps_toward_origin() {
+        use crate::ribbon::Pointer;
+        let t = TempDir::new("ink-pick-no-zero-fallback");
+        let mut pad = Pad::of_page(t.path());
+        let mut s = Stroke::new(Tool::Pen, Rgb::BLACK, 4.0);
+        s.add(Dab::new(220.0, 180.0, 1.0));
+        s.add(Dab::new(320.0, 260.0, 1.0));
+        pad.drawing.add(s);
+        pad.held = vec![0];
+        let before = pick::bounds(&pad.drawing, &pad.held).expect("bounds");
+
+        let ctx = egui::Context::default();
+        let body = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(800.0, 600.0));
+        let tokens = crate::theme::Theme::DEFAULT.tokens();
+        let pen = Pen { pointer: Pointer::Pick, ..Pen::default() };
+        let run = |pad: &mut Pad, events: Vec<egui::Event>| {
+            let input = egui::RawInput { events, screen_rect: Some(body), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                show_with_input_and_handles(ui, body, body, egui::Pos2::ZERO, pad, pen, 1.0, &tokens, 1.0, true, false, false);
+            });
+            out.textures_delta.clear();
+        };
+
+        let start = egui::pos2(270.0, 220.0);
+        run(&mut pad, vec![]);
+        run(&mut pad, vec![egui::Event::PointerMoved(start), button(start.x, start.y, true)]);
+        assert!(pad.is_grabbed());
+
+        // Pointer disappears -> must never jump toward Pos2::ZERO, and cleanly ends the grab.
+        run(&mut pad, vec![egui::Event::PointerGone]);
+        assert_eq!(pick::bounds(&pad.drawing, &pad.held), Some(before), "missing pointer pos must not move stroke toward origin");
+        assert!(!pad.is_grabbed(), "PointerGone releases the active grab cleanly");
+
+        // Re-grabbing and dragging moves cleanly from the new grab anchor.
+        let moved = egui::pos2(290.0, 235.0);
+        run(&mut pad, vec![egui::Event::PointerMoved(start), button(start.x, start.y, true)]);
+        run(&mut pad, vec![egui::Event::PointerMoved(moved)]);
+        let after = pick::bounds(&pad.drawing, &pad.held).expect("after");
+        assert!((after.0 - (before.0 + 20.0)).abs() < 0.05 && (after.1 - (before.1 + 15.0)).abs() < 0.05, "resumes drag cleanly: {after:?}");
+    }
+
+    #[test]
+    fn resting_palm_does_not_block_stylus_strokes_from_settling_undo_steps() {
+        use crate::ribbon::Pointer;
+        use crate::stylus::StylusFrame;
+        let t = TempDir::new("ink-palm-settle");
+        let mut pad = Pad::of_page(t.path());
+        let ctx = egui::Context::default();
+        let body = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(800.0, 600.0));
+        let tokens = crate::theme::Theme::DEFAULT.tokens();
+        let pen = Pen { pointer: Pointer::Draw, ..Pen::default() };
+
+        let run = |pad: &mut Pad, events: Vec<egui::Event>, sf: Option<StylusFrame>, allow_stroke: bool| {
+            ctx.data_mut(|d| match sf {
+                Some(f) => {
+                    d.insert_temp(StylusFrame::id(), f);
+                }
+                None => d.remove::<StylusFrame>(StylusFrame::id()),
+            });
+            let input = egui::RawInput { events, screen_rect: Some(body), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                show_with_input_and_handles(ui, body, body, egui::Pos2::ZERO, pad, pen, 0.7, &tokens, 1.0, allow_stroke, false, true);
+            });
+            out.textures_delta.clear();
+        };
+
+        // Palm rests on the screen (rejected: allow_stroke=false), holding primary pointer down across strokes.
+        let palm = egui::pos2(600.0, 500.0);
+        run(&mut pad, vec![egui::Event::PointerMoved(palm), button(palm.x, palm.y, true)], None, false);
+        assert_eq!(pad.strokes(), 0, "rejected palm must not draw");
+
+        // Stylus stroke 1 lifts via StylusFrame { down: false } while palm stays down.
+        run(
+            &mut pad,
+            vec![],
+            Some(StylusFrame { down: true, landed: true, pos: egui::pos2(100.0, 100.0), moves: vec![(egui::pos2(100.0, 100.0), 0.7)] }),
+            true,
+        );
+        run(
+            &mut pad,
+            vec![],
+            Some(StylusFrame { down: true, landed: false, pos: egui::pos2(160.0, 100.0), moves: vec![(egui::pos2(160.0, 100.0), 0.7)] }),
+            true,
+        );
+        run(&mut pad, vec![], Some(StylusFrame { down: false, landed: false, pos: egui::pos2(160.0, 100.0), moves: Vec::new() }), true);
+        assert_eq!(pad.strokes(), 1);
+        assert!(pad.can_undo(), "stroke 1 must settle immediately on stylus lift even while palm rests");
+
+        // Stylus stroke 2 transitions directly to palm-only (!allow_stroke, no StylusFrame) while palm stays down.
+        run(
+            &mut pad,
+            vec![],
+            Some(StylusFrame { down: true, landed: true, pos: egui::pos2(100.0, 180.0), moves: vec![(egui::pos2(100.0, 180.0), 0.7)] }),
+            true,
+        );
+        run(
+            &mut pad,
+            vec![],
+            Some(StylusFrame { down: true, landed: false, pos: egui::pos2(160.0, 180.0), moves: vec![(egui::pos2(160.0, 180.0), 0.7)] }),
+            true,
+        );
+        run(&mut pad, vec![], None, false);
+        assert_eq!(pad.strokes(), 2);
+
+        // Each stroke is its own undo step.
+        assert!(pad.undo());
+        assert_eq!(pad.strokes(), 1, "first undo removes only stroke 2");
+        assert!(pad.undo());
+        assert_eq!(pad.strokes(), 0, "second undo removes stroke 1");
     }
 }

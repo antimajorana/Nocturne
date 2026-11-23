@@ -33,8 +33,18 @@ pub(crate) fn mark_popup_open(ctx: &egui::Context) {
     ctx.data_mut(|d| d.insert_temp(popup_open_pass_id(), pass));
 }
 
-/// True when any custom `Order::Foreground` ribbon popup is open on the current pass.
+/// True when any custom `Order::Foreground` popup rendered on the current pass or the previous
+/// pass (closing the single-pass lag for popovers rendered after the canvas, such as Tablet
+/// Studio's dock palettes and Tool Settings).
 pub fn any_popup_open(ctx: &egui::Context) -> bool {
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data(|d| d.get_temp::<u64>(popup_open_pass_id())).is_some_and(|p| p >= pass.saturating_sub(1))
+}
+
+/// True only when a custom `Order::Foreground` popup already rendered earlier in this same pass
+/// (for example a ribbon or top-bar menu). Used so overlays drawn after the canvas do not hide
+/// themselves on the next frame.
+pub(crate) fn any_popup_open_this_pass(ctx: &egui::Context) -> bool {
     ctx.data(|d| d.get_temp::<u64>(popup_open_pass_id())) == Some(ctx.cumulative_pass_nr())
 }
 
@@ -636,6 +646,10 @@ pub fn show(ui: &mut Ui, tab: &str, source: bool, view: &View<'_>, format: Optio
                 }
             });
         });
+    let line_w = ui.available_width().max(1.0);
+    let (sep_rect, _) = ui.allocate_exact_size(vec2(line_w, 1.0), Sense::hover());
+    let y = sep_rect.center().y.round() + 0.5;
+    ui.painter().hline(sep_rect.min.x..=sep_rect.max.x, y, egui::Stroke::new(1.0, t.border_subtle));
     acts
 }
 
@@ -665,12 +679,16 @@ pub fn tabs(source: bool, in_table: bool) -> Vec<&'static str> {
 }
 
 /// The tab names, drawn on the coloured band at the top of the window, File first, as in
-/// Office. The chosen tab is a raised tab in the ribbon's own colour that runs down into the
-/// ribbon below it; the others are white writing on the band, lit when the pointer is over
-/// one.
+/// Office. The chosen tab is a raised tab in the ribbon's own colour with a bold label and a
+/// crisp 2.5px bottom accent indicator; the others sit on the band above a subtle hairline.
 pub fn tab_strip(ui: &mut Ui, tab: &str, source: bool, in_table: bool, collapsed: bool, t: &Tokens, acts: &mut Vec<Act>) {
     // Folded, no tab is the raised one: there is no ribbon under it to run into.
     let chosen = if collapsed { "" } else { resolve_tab(tab, source, in_table) };
+    let strip_rect = egui::Rect::from_min_size(ui.cursor().min, vec2(ui.available_width().max(1.0), TAB_STRIP_H));
+    // Subtle bottom hairline separator across the tab strip (the raised active tab paints over it).
+    let hairline_y = (strip_rect.max.y - 0.5).round() + 0.5;
+    ui.painter().hline(strip_rect.min.x..=strip_rect.max.x, hairline_y, egui::Stroke::new(1.0, t.border_subtle));
+
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         ui.add_space(4.0);
@@ -683,14 +701,21 @@ pub fn tab_strip(ui: &mut Ui, tab: &str, source: bool, in_table: bool, collapsed
             let (rect, resp) = ui.allocate_exact_size(vec2(galley.size().x + 26.0, TAB_STRIP_H), Sense::click());
             let painter = ui.painter_at(rect);
             if selected {
-                // Raised: the tab and the ribbon are one surface, so there is no line between.
-                let top = egui::CornerRadius { nw: 4, ne: 4, sw: 0, se: 0 };
+                // Raised: the tab and the ribbon are one surface, accented by a crisp 2.5px bar.
+                let top = egui::CornerRadius { nw: crate::theme::RADIUS_CONTROL, ne: crate::theme::RADIUS_CONTROL, sw: 0, se: 0 };
                 painter.rect_filled(egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.min.y + 3.0), rect.max), top, t.panel);
+                let indicator = egui::Rect::from_min_max(egui::pos2(rect.min.x + 6.0, rect.max.y - 2.5), egui::pos2(rect.max.x - 6.0, rect.max.y));
+                painter.rect_filled(indicator, 1.0, t.accent);
             } else if resp.hovered() {
-                painter.rect_filled(rect.shrink2(vec2(1.0, 3.0)), 3.0, t.band_hover);
+                painter.rect_filled(rect.shrink2(vec2(1.0, 3.0)), crate::theme::RADIUS_CONTROL, t.band_hover);
             }
-            let colour = if selected { t.accent } else { t.band_text };
-            painter.text(rect.center() + vec2(0.0, 1.0), Align2::CENTER_CENTER, display_name, font, colour);
+            let colour = if selected { t.strong } else { t.band_text };
+            let text_pos = rect.center() + vec2(0.0, 0.5);
+            painter.text(text_pos, Align2::CENTER_CENTER, display_name, font.clone(), colour);
+            if selected {
+                // Subtle bold weight reinforcement so the active tab stands out beyond colour alone.
+                painter.text(text_pos + vec2(0.45, 0.0), Align2::CENTER_CENTER, display_name, font, colour);
+            }
             let enabled = ui.is_enabled();
             let label = display_name.to_string();
             resp.widget_info(move || egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, selected, label.clone()));
@@ -714,7 +739,7 @@ pub fn tab_strip(ui: &mut Ui, tab: &str, source: bool, in_table: bool, collapsed
 fn ribbon_fold(ui: &mut Ui, collapsed: bool, t: &Tokens) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(26.0, TAB_STRIP_H - 6.0), Sense::click());
     if resp.hovered() {
-        ui.painter().rect_filled(rect, 3.0, t.band_hover);
+        ui.painter().rect_filled(rect, crate::theme::RADIUS_CONTROL, t.band_hover);
     }
     let c = rect.center();
     let stroke = egui::Stroke::new(1.6, t.band_text);
@@ -765,13 +790,10 @@ fn group(ui: &mut Ui, title: &str, t: &Tokens, add: impl FnOnce(&mut Ui)) {
     let named = ui.interact(inner, ui.id().with(("group", title)), Sense::hover());
     let (enabled, label) = (ui.is_enabled(), display_title.to_owned());
     named.widget_info(move || egui::WidgetInfo::labeled(egui::WidgetType::Label, enabled, &label));
-    // A crisp divider between groups, on a whole pixel so it does not blur, and dark enough
-    // to read on a light or a dark surface, the way Office separates its groups.
+    // A crisp divider between groups, on a whole pixel so it does not blur, and visible on
+    // every light or dark theme surface.
     let x = (inner.max.x + 7.0).round() + 0.5;
-    painter.line_segment(
-        [egui::pos2(x, inner.min.y + 3.0), egui::pos2(x, inner.min.y + GROUP_H - 5.0)],
-        egui::Stroke::new(1.0, crate::theme::mix(t.panel, t.text, 0.16)),
-    );
+    painter.line_segment([egui::pos2(x, inner.min.y + 3.0), egui::pos2(x, inner.min.y + GROUP_H - 5.0)], egui::Stroke::new(1.0, t.border_subtle));
     ui.add_space(9.0);
 }
 
@@ -1335,8 +1357,8 @@ fn leak(kind: &str) -> &'static str {
 fn gallery(ui: &mut Ui, which: &'static str, current: &str, t: &Tokens, acts: &mut Vec<Act>, rows_in_box: impl FnOnce(&mut Ui, &mut Vec<Act>)) {
     let height = GROUP_H - 20.0;
     let box_rect = egui::Frame::NONE
-        .stroke(egui::Stroke::new(1.0, t.faint))
-        .corner_radius(3.0)
+        .stroke(egui::Stroke::new(1.0, t.border))
+        .corner_radius(crate::theme::RADIUS_CONTROL)
         .inner_margin(4.0)
         .show(ui, |ui| {
             ui.set_min_size(vec2(130.0, height));
@@ -1669,7 +1691,7 @@ fn tag_row(ui: &mut Ui, tag: Tag, t: &Tokens) -> egui::Response {
         &painter,
         Rect::from_min_size(egui::pos2(rect.min.x + 2.0, rect.center().y - 9.0), vec2(18.0, 18.0)),
         mark,
-        mark.color(t.text, t.accent),
+        mark.color_for(t),
     );
     let label = tag_label(tag);
     painter.text(egui::pos2(rect.min.x + 26.0, rect.center().y), Align2::LEFT_CENTER, &label, egui::FontId::proportional(12.5), t.text);
@@ -1718,7 +1740,7 @@ fn mark_row_on(ui: &mut Ui, mark: Mark, label: &str, tip: &str, on: bool, t: &To
         painter.rect_filled(rect, 4.0, if on { t.row_selected } else { t.row_hover });
     }
     let left = Rect::from_center_size(egui::pos2(rect.min.x + 11.0, rect.center().y), vec2(15.0, 15.0));
-    ribbon_icons::paint(&painter, left, mark, mark.color(t.text, t.accent));
+    ribbon_icons::paint(&painter, left, mark, mark.color_for(t));
     painter.text(egui::pos2(rect.min.x + 23.0, rect.center().y), Align2::LEFT_CENTER, label, font, t.text);
     let enabled = ui.is_enabled();
     let name = label.to_string();
@@ -1735,7 +1757,7 @@ fn mark_button(ui: &mut Ui, mark: Mark, label: &str, tip: &str, on: bool, t: &To
     if on || resp.hovered() {
         painter.rect_filled(rect, 4.0, if on { t.row_selected } else { t.row_hover });
     }
-    ribbon_icons::paint(&painter, Rect::from_center_size(rect.center(), vec2(16.0, 16.0)), mark, mark.color(t.text, t.accent));
+    ribbon_icons::paint(&painter, Rect::from_center_size(rect.center(), vec2(16.0, 16.0)), mark, mark.color_for(t));
     let enabled = ui.is_enabled();
     let name = label.to_string();
     resp.widget_info(move || egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, on, name.clone()));
@@ -1785,7 +1807,7 @@ fn insert_tab(ui: &mut Ui, view: &View<'_>, t: &Tokens, acts: &mut Vec<Act>) {
         } else {
             // Built, but GridCraft is what makes the spreadsheet: without it the button is
             // unavailable and says why, as Table > Convert to GridCraft does (#306).
-            let dim = Tokens { accent: t.muted, text: t.muted, ..*t };
+            let dim = Tokens { accent: t.disabled, text: t.disabled, ..*t };
             let resp = ui
                 .add_enabled_ui(false, |ui| {
                     big(ui, Icon::Spreadsheet, crate::tl_id!("ui.spreadsheet"), crate::tl_id!("ui.gridcraft_is_not_installed"), &dim)
@@ -1868,9 +1890,9 @@ fn paper_swatch(ui: &mut Ui, r: RuleLines, here: bool, t: &Tokens) -> egui::Resp
     let (edge, width) = if here {
         (t.accent, 2.0)
     } else if resp.hovered() {
-        (t.muted, 1.0)
+        (t.border, 1.0)
     } else {
-        (t.faint, 1.0)
+        (t.border_subtle, 1.0)
     };
     ui.painter().rect_stroke(paper, 2.0, egui::Stroke::new(width, edge), egui::StrokeKind::Inside);
     // The name is kept inside the thumbnail's own width, so a long one cannot run into the
@@ -1896,7 +1918,7 @@ fn colour_swatch(ui: &mut Ui, colour: Option<nocturne_model::NodeColor>, here: b
     };
     let painter = ui.painter();
     painter.rect_filled(rect, 3.0, fill);
-    let (edge, width) = if here { (t.accent, 2.0) } else { (t.faint, 1.0) };
+    let (edge, width) = if here { (t.accent, 2.0) } else { (t.border, 1.0) };
     painter.rect_stroke(rect, 3.0, egui::Stroke::new(width, edge), egui::StrokeKind::Inside);
     if colour.is_none() {
         painter.text(rect.center(), egui::Align2::CENTER_CENTER, "/", egui::FontId::proportional(13.0), t.muted);
@@ -1926,7 +1948,7 @@ fn rule_colour_palette(ui: &mut Ui, view: &View<'_>, t: &Tokens, acts: &mut Vec<
                     let y = rect.min.y + side * k as f32 / 4.0;
                     painter.hline(rect.min.x + 3.0..=rect.max.x - 3.0, y, egui::Stroke::new(1.5, strong));
                 }
-                let (edge, width) = if here { (t.accent, 2.0) } else { (t.faint, 1.0) };
+                let (edge, width) = if here { (t.accent, 2.0) } else { (t.border, 1.0) };
                 painter.rect_stroke(rect, 3.0, egui::Stroke::new(width, edge), egui::StrokeKind::Inside);
                 // Named apart from the page colour swatches beside them: "Blue lines".
                 let name = match colour {
@@ -2019,7 +2041,7 @@ fn shade_swatch(ui: &mut Ui, colour: Option<nocturne_model::NodeColor>, here: bo
     let fill = colour.map_or(t.editor, |c| crate::pageedit::cell_shade(t, c));
     let painter = ui.painter();
     painter.rect_filled(rect, 3.0, fill);
-    let (edge, width) = if here { (t.accent, 2.0) } else { (t.faint, 1.0) };
+    let (edge, width) = if here { (t.accent, 2.0) } else { (t.border, 1.0) };
     painter.rect_stroke(rect, 3.0, egui::Stroke::new(width, edge), egui::StrokeKind::Inside);
     if colour.is_none() {
         painter.text(rect.center(), egui::Align2::CENTER_CENTER, "/", egui::FontId::proportional(13.0), t.muted);
@@ -2380,7 +2402,7 @@ fn add_menu(ui: &mut Ui, t: &Tokens, acts: &mut Vec<Act>) {
                         // The tool itself beside its name, drawn by the code the rack
                         // uses, so a menu cannot show one thing and the rack another.
                         let glyph = Rect::from_min_size(row.min, vec2(26.0, row.height()));
-                        paint_tool(&painter, glyph, tool, rack::new_nib(tool).colour, 0.0);
+                        paint_tool(&painter, glyph, tool, rack::new_nib(tool).colour, 0.0, t);
                         painter.text(
                             egui::pos2(row.min.x + 32.0, row.center().y),
                             Align2::LEFT_CENTER,
@@ -2468,7 +2490,7 @@ fn pen_on_rack(ui: &mut Ui, i: usize, nib: Nib, chosen: bool, rack_len: usize, t
     // The one in use sinks into the rack, the way a pen lifted out of a tray sits lower
     // than its neighbours, and it eases down rather than jumping.
     let drop = ui.ctx().animate_bool_with_time(resp.id.with("picked"), chosen, 0.12) * DROP;
-    paint_tool(&painter, rect, nib.tool, nib.colour, drop);
+    paint_tool(&painter, rect, nib.tool, nib.colour, drop, t);
 
     // The chevron on the tool in hand opens its editor, as OneNote's does; a right click
     // opens the same editor and the rest of the rack's own menu.
@@ -2612,7 +2634,8 @@ fn modify_tool(ui: &mut Ui, id: egui::Id, under: Rect, i: usize, nib: Nib, rack_
                     });
                 }
                 ui.separator();
-                if popup_action_button(ui, crate::tl_id!("ui.more_colours"), true, t.accent, crate::tl_id!("ui.choose_a_custom_ink_colour")).clicked()
+                if popup_action_button(ui, crate::tl_id!("ui.more_colours"), true, t.accent_text, t, crate::tl_id!("ui.choose_a_custom_ink_colour"))
+                    .clicked()
                 {
                     more_colours = !more_colours;
                 }
@@ -2627,9 +2650,16 @@ fn modify_tool(ui: &mut Ui, id: egui::Id, under: Rect, i: usize, nib: Nib, rack_
                         done = true;
                     }
                 }
-                popup_action_button(ui, crate::tl_id!("ui.eyedropper"), false, t.accent, crate::tl_id!("ui.eyedropper_not_built"));
-                if popup_action_button(ui, crate::tl_id!("ui.delete_tool"), rack_len > 1, t.warn, crate::tl_id!("ui.remove_this_tool_from_the_rack"))
-                    .clicked()
+                popup_action_button(ui, crate::tl_id!("ui.eyedropper"), false, t.accent_text, t, crate::tl_id!("ui.eyedropper_not_built"));
+                if popup_action_button(
+                    ui,
+                    crate::tl_id!("ui.delete_tool"),
+                    rack_len > 1,
+                    t.warn,
+                    t,
+                    crate::tl_id!("ui.remove_this_tool_from_the_rack"),
+                )
+                .clicked()
                 {
                     acts.push(Act::InkRack(RackEdit::Remove(i)));
                     done = true;
@@ -2644,7 +2674,7 @@ fn modify_tool(ui: &mut Ui, id: egui::Id, under: Rect, i: usize, nib: Nib, rack_
 }
 
 /// The eraser, racked beside the pens because that is where a hand reaches for it, and
-/// drawn like them: a pale sleeve a hand holds, and the worn rubber below it.
+/// drawn like them: a sleeve a hand holds, and the worn rubber below it.
 fn eraser_on_rack(ui: &mut Ui, chosen: bool, auto_return: bool, t: &Tokens, acts: &mut Vec<Act>) -> bool {
     let (rect, resp) = ui.allocate_exact_size(vec2(27.0, GROUP_H - 20.0), Sense::click());
     let enabled = ui.is_enabled();
@@ -2662,23 +2692,23 @@ fn eraser_on_rack(ui: &mut Ui, chosen: bool, auto_return: bool, t: &Tokens, acts
     let tall = 38.0;
     let top = rect.center().y - tall / 2.0 - 2.0 + drop;
     let foot = top + tall;
-    // A block rubber seen square on: a pale grey body with a flat foot, and the band of
-    // rubber at the bottom in the lilac OneNote gives it. No dome and no wedge; the
-    // shape's whole job is to say "block" where the pens say "nib".
-    let body = egui::Color32::from_rgb(0xdf, 0xe1, 0xe5);
-    let body_edge = egui::Color32::from_rgb(0x8f, 0x94, 0x9d);
-    let rubber = egui::Color32::from_rgb(0xe4, 0xc4, 0xee);
-    let rubber_edge = egui::Color32::from_rgb(0xa9, 0x84, 0xb8);
+    // A block rubber seen square on: a theme-adapted sleeve with a flat foot, and the band
+    // of rubber at the bottom tinted from the active theme's accent.
+    let dark = t.is_dark();
+    let body = crate::theme::mix(t.surface_elevated, t.text, if dark { 0.18 } else { 0.12 });
+    let body_edge = t.border;
+    let rubber_base =
+        if dark { crate::theme::mix(t.accent, t.surface_elevated, 0.30) } else { crate::theme::mix(t.surface_elevated, t.accent, 0.28) };
+    let rubber = crate::theme::readable_on(rubber_base, t.panel, 1.4, dark);
+    let rubber_edge = crate::theme::mix(rubber, t.text, 0.35);
+    let shine = if dark { t.strong.gamma_multiply(0.24) } else { t.editor.gamma_multiply(0.55) };
     let w = 6.4;
     let band = foot - 10.0;
     let whole = egui::Rect::from_min_max(egui::pos2(cx - w, top), egui::pos2(cx + w, foot));
     painter.rect_filled(egui::Rect::from_min_max(whole.min, egui::pos2(whole.max.x, band)), 2.0, body);
     painter.rect_filled(egui::Rect::from_min_max(egui::pos2(whole.min.x, band - 2.0), whole.max), 2.0, rubber);
     painter.line_segment([egui::pos2(whole.min.x, band), egui::pos2(whole.max.x, band)], egui::Stroke::new(1.0, rubber_edge));
-    painter.line_segment(
-        [egui::pos2(cx - w * 0.45, top + 3.0), egui::pos2(cx - w * 0.45, band - 3.0)],
-        egui::Stroke::new(1.2, egui::Color32::from_white_alpha(120)),
-    );
+    painter.line_segment([egui::pos2(cx - w * 0.45, top + 3.0), egui::pos2(cx - w * 0.45, band - 3.0)], egui::Stroke::new(1.2, shine));
     painter.rect_stroke(whole, 2.0, egui::Stroke::new(0.9, body_edge), egui::StrokeKind::Inside);
 
     let mut picked_up = resp.clicked();
@@ -2737,14 +2767,26 @@ fn eraser_on_rack(ui: &mut Ui, chosen: bool, auto_return: bool, t: &Tokens, acts
 /// shows a metal nib and breather hole, the brush has a flexible bristle point, and the pen has
 /// a small ball tip. Keeping these silhouettes distinct prevents the rack from reading as a row
 /// of crayons while preserving the marker treatment users already recognise.
-fn paint_tool(painter: &egui::Painter, rect: Rect, tool: Tool, colour: Rgb, drop: f32) {
+fn paint_tool(painter: &egui::Painter, rect: Rect, tool: Tool, colour: Rgb, drop: f32, t: &Tokens) {
     let ink = egui::Color32::from_rgb(colour.0, colour.1, colour.2);
+    let dark = t.is_dark();
     let mix = crate::theme::mix;
-    let darker = |c: egui::Color32, amount: f32| mix(c, egui::Color32::BLACK, amount);
-    let body = egui::Color32::from_rgb(0xee, 0xf0, 0xf3);
-    let body_edge = egui::Color32::from_rgb(0x6f, 0x76, 0x81);
-    let collar = egui::Color32::from_rgb(0x8d, 0x94, 0x9f);
-    let shine = egui::Color32::from_white_alpha(130);
+    let shade = if dark { t.editor } else { t.strong };
+    let highlight = if dark { t.strong } else { t.editor };
+    let darker = |c: egui::Color32, amount: f32| mix(c, shade, amount);
+    let ink_edge = |amount: f32| {
+        if dark && crate::theme::contrast(ink, t.panel) < 2.2 { t.border } else { darker(ink, amount) }
+    };
+    let body = mix(t.surface_elevated, t.text, if dark { 0.16 } else { 0.08 });
+    let body_edge = t.border;
+    let collar = t.muted;
+    let metal = mix(t.surface_elevated, t.text, if dark { 0.36 } else { 0.24 });
+    let nib_detail = if dark { t.editor } else { t.text };
+    let wood = mix(t.group, t.surface_elevated, if dark { 0.32 } else { 0.50 });
+    let wood_edge = mix(t.group, shade, 0.35);
+    let graphite = mix(t.text, t.panel, if dark { 0.32 } else { 0.22 });
+    let graphite_edge = t.border;
+    let shine = highlight.gamma_multiply(if dark { 0.24 } else { 0.50 });
 
     let cx = rect.center().x;
     // Short and wide rather than long and thin, so the nib is a good third of the whole
@@ -2755,7 +2797,7 @@ fn paint_tool(painter: &egui::Painter, rect: Rect, tool: Tool, colour: Rgb, drop
     let at = |x: f32, y: f32| egui::pos2(cx + x, y);
     let shape = |pts: Vec<egui::Pos2>, fill: egui::Color32, edge: egui::Color32| egui::Shape::convex_polygon(pts, fill, egui::Stroke::new(0.8, edge));
 
-    // The pale part a hand holds, down to `to`, tapering from `w` to `lw`.
+    // The barrel a hand holds, down to `to`, tapering from `w` to `lw`.
     let hold = |painter: &egui::Painter, w: f32, lw: f32, to: f32| {
         let at_to = w + (lw - w) * ((to - top) / (foot - top));
         painter.add(shape(vec![at(-w, top), at(w, top), at(at_to, to), at(-at_to, to)], body, body_edge));
@@ -2774,28 +2816,20 @@ fn paint_tool(painter: &egui::Painter, rect: Rect, tool: Tool, colour: Rgb, drop
             let nib = foot - 13.0;
             let g = hold(painter, w, lw, grip);
             let _ = g;
-            painter.add(shape(vec![at(-lw, grip), at(lw, grip), at(lw, nib), at(-lw, nib)], ink, darker(ink, 0.35)));
-            painter.add(shape(vec![at(-lw, nib), at(lw, nib), at(lw, foot - 6.0), at(-lw, foot)], darker(ink, 0.12), darker(ink, 0.4)));
+            painter.add(shape(vec![at(-lw, grip), at(lw, grip), at(lw, nib), at(-lw, nib)], ink, ink_edge(0.35)));
+            painter.add(shape(vec![at(-lw, nib), at(lw, nib), at(lw, foot - 6.0), at(-lw, foot)], darker(ink, 0.12), ink_edge(0.4)));
         }
         Tool::Pencil => {
             // A compact hexagonal coloured pencil: the writing colour is the lacquered body,
             // but the wood and graphite make it unmistakably different from a marker.
             let (w, lw) = (4.7, 4.1);
-            let wood = foot - 13.0;
-            let lacquer = crate::theme::mix(ink, egui::Color32::WHITE, 0.08);
-            painter.add(shape(vec![at(-w, top), at(w, top), at(lw, wood), at(-lw, wood)], lacquer, darker(ink, 0.42)));
-            painter.line_segment([at(-w * 0.42, top + 3.0), at(-lw * 0.42, wood - 2.0)], egui::Stroke::new(1.0, shine));
+            let wood_y = foot - 13.0;
+            let lacquer = mix(ink, highlight, 0.08);
+            painter.add(shape(vec![at(-w, top), at(w, top), at(lw, wood_y), at(-lw, wood_y)], lacquer, ink_edge(0.42)));
+            painter.line_segment([at(-w * 0.42, top + 3.0), at(-lw * 0.42, wood_y - 2.0)], egui::Stroke::new(1.0, shine));
             painter.line_segment([at(-w, top + 7.0), at(w, top + 7.0)], egui::Stroke::new(1.5, collar));
-            painter.add(shape(
-                vec![at(-lw, wood), at(lw, wood), at(1.35, foot - 3.2), at(-1.35, foot - 3.2)],
-                egui::Color32::from_rgb(0xe8, 0xd0, 0xa6),
-                egui::Color32::from_rgb(0xb2, 0x95, 0x66),
-            ));
-            painter.add(shape(
-                vec![at(-1.35, foot - 3.2), at(1.35, foot - 3.2), at(0.0, foot)],
-                egui::Color32::from_gray(60),
-                egui::Color32::from_gray(40),
-            ));
+            painter.add(shape(vec![at(-lw, wood_y), at(lw, wood_y), at(1.35, foot - 3.2), at(-1.35, foot - 3.2)], wood, wood_edge));
+            painter.add(shape(vec![at(-1.35, foot - 3.2), at(1.35, foot - 3.2), at(0.0, foot)], graphite, graphite_edge));
         }
         Tool::FountainPen => {
             // A fountain pen has a shorter barrel and a broad metal nib, unlike the small
@@ -2804,16 +2838,12 @@ fn paint_tool(painter: &egui::Painter, rect: Rect, tool: Tool, colour: Rgb, drop
             let grip = top + 8.0;
             let nib = foot - 14.0;
             hold(painter, w, lw, grip);
-            painter.add(shape(vec![at(-4.5, grip), at(4.5, grip), at(3.9, nib), at(-3.9, nib)], darker(ink, 0.08), darker(ink, 0.48)));
+            painter.add(shape(vec![at(-4.5, grip), at(4.5, grip), at(3.9, nib), at(-3.9, nib)], darker(ink, 0.08), ink_edge(0.48)));
             painter.line_segment([at(-4.1, grip + 3.0), at(4.1, grip + 3.0)], egui::Stroke::new(1.8, collar));
             // A broad split nib with a visible slit and breather hole.
-            painter.add(shape(
-                vec![at(-3.9, nib), at(3.9, nib), at(1.3, foot), at(-1.3, foot)],
-                egui::Color32::from_rgb(0xc8, 0xcc, 0xd2),
-                body_edge,
-            ));
-            painter.line_segment([at(0.0, nib + 1.0), at(0.0, foot - 1.0)], egui::Stroke::new(0.8, egui::Color32::from_gray(75)));
-            painter.circle_filled(at(0.0, nib + 3.4), 1.15, egui::Color32::from_gray(75));
+            painter.add(shape(vec![at(-3.9, nib), at(3.9, nib), at(1.3, foot), at(-1.3, foot)], metal, body_edge));
+            painter.line_segment([at(0.0, nib + 1.0), at(0.0, foot - 1.0)], egui::Stroke::new(0.8, nib_detail));
+            painter.circle_filled(at(0.0, nib + 3.4), 1.15, nib_detail);
         }
         Tool::BrushPen => {
             // A loaded brush has a soft ferrule and a visibly flexible, tapered bristle bundle.
@@ -2821,12 +2851,12 @@ fn paint_tool(painter: &egui::Painter, rect: Rect, tool: Tool, colour: Rgb, drop
             let grip = top + 8.0;
             let ferrule = foot - 15.0;
             hold(painter, w, lw, grip);
-            painter.add(shape(vec![at(-5.4, grip), at(5.4, grip), at(4.8, ferrule), at(-4.8, ferrule)], darker(ink, 0.12), darker(ink, 0.5)));
+            painter.add(shape(vec![at(-5.4, grip), at(5.4, grip), at(4.8, ferrule), at(-4.8, ferrule)], darker(ink, 0.12), ink_edge(0.5)));
             painter.line_segment([at(-3.7, ferrule), at(3.7, ferrule)], egui::Stroke::new(1.8, collar));
             painter.add(shape(
                 vec![at(-4.8, ferrule), at(4.8, ferrule), at(2.4, ferrule + 7.0), at(0.55, foot), at(-0.55, foot), at(-2.4, ferrule + 7.0)],
                 darker(ink, 0.08),
-                darker(ink, 0.5),
+                ink_edge(0.5),
             ));
             for offset in [-2.0, 0.0, 2.0] {
                 painter.line_segment([at(offset * 0.72, ferrule + 1.5), at(offset * 0.18, foot - 1.0)], egui::Stroke::new(0.55, shine));
@@ -2839,14 +2869,10 @@ fn paint_tool(painter: &egui::Painter, rect: Rect, tool: Tool, colour: Rgb, drop
             let grip = top + 9.0;
             let nib = foot - 12.0;
             hold(painter, w, lw, grip);
-            painter.add(shape(vec![at(-3.9, grip), at(3.9, grip), at(3.5, nib), at(-3.5, nib)], ink, darker(ink, 0.48)));
+            painter.add(shape(vec![at(-3.9, grip), at(3.9, grip), at(3.5, nib), at(-3.5, nib)], ink, ink_edge(0.48)));
             painter.line_segment([at(-3.4, grip + 3.0), at(3.4, grip + 3.0)], egui::Stroke::new(1.0, shine));
-            painter.add(shape(
-                vec![at(-3.5, nib), at(3.5, nib), at(0.65, foot - 2.2), at(-0.65, foot - 2.2)],
-                egui::Color32::from_rgb(0xb9, 0xbd, 0xc5),
-                body_edge,
-            ));
-            painter.circle_filled(at(0.0, foot - 1.0), 0.8, egui::Color32::from_gray(55));
+            painter.add(shape(vec![at(-3.5, nib), at(3.5, nib), at(0.65, foot - 2.2), at(-0.65, foot - 2.2)], metal, body_edge));
+            painter.circle_filled(at(0.0, foot - 1.0), 0.8, nib_detail);
         }
     }
 }
@@ -2872,7 +2898,7 @@ fn swatch_name(colour: Rgb) -> &'static str {
 /// A small button with an icon and a word, greyed when there is nothing for it to do.
 // i18n-ui-text: label,tip
 fn row_button(ui: &mut Ui, icon: Icon, label: &str, tip: &str, live: bool, t: &Tokens) -> egui::Response {
-    let dim = Tokens { accent: t.muted, text: t.muted, ..*t };
+    let dim = Tokens { accent: t.disabled, text: t.disabled, ..*t };
     let resp = ui.add_enabled_ui(live, |ui| small(ui, Some(icon), "", label, tip, false, if live { t } else { &dim })).inner;
     if live {
         resp
@@ -2930,7 +2956,7 @@ fn shape_button(ui: &mut Ui, shape: nocturne_ink::shapes::Shape, here: bool, t: 
 }
 
 fn soon(ui: &mut Ui, icon: Icon, label: &str, t: &Tokens) {
-    let dim = Tokens { accent: t.muted, text: t.muted, ..*t };
+    let dim = Tokens { accent: t.disabled, text: t.disabled, ..*t };
     let resp = ui.add_enabled_ui(false, |ui| big(ui, icon, label, crate::tl_id!("ui.not_built_yet"), &dim)).inner;
     resp.on_hover_text(crate::i18n::format_message_id("ui.label_not_built_yet", &[(crate::tl_id!("ui.label"), crate::tl!(label))]));
 }
@@ -3274,7 +3300,7 @@ fn table_tab(ui: &mut Ui, view: &View<'_>, t: &Tokens, acts: &mut Vec<Act>) {
                 acts.push(Act::FromGridCraft);
             }
         } else {
-            let dim = Tokens { accent: t.muted, text: t.muted, ..*t };
+            let dim = Tokens { accent: t.disabled, text: t.disabled, ..*t };
             let resp = ui
                 .add_enabled_ui(false, |ui| {
                     big(ui, Icon::Spreadsheet, crate::tl_id!("ui.convert_to_gridcraft_2"), crate::tl_id!("ui.gridcraft_is_not_installed"), &dim)
@@ -3481,11 +3507,11 @@ fn view_tab(ui: &mut Ui, source: bool, view: &View<'_>, t: &Tokens, acts: &mut V
 fn not_built(ui: &mut Ui, label: &str, t: &Tokens) {
     let label = crate::tl!(label);
     let font = egui::FontId::proportional(11.5);
-    let width = ui.painter().layout_no_wrap(label.to_string(), font.clone(), t.muted).size().x + 12.0;
+    let width = ui.painter().layout_no_wrap(label.to_string(), font.clone(), t.disabled).size().x + 12.0;
     let (rect, resp) = ui.allocate_exact_size(vec2(width, SMALL_H), Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, crate::theme::mix(t.panel, t.text, 0.14)), egui::StrokeKind::Inside);
-    painter.text(rect.center(), Align2::CENTER_CENTER, label, font, t.muted);
+    painter.rect_stroke(rect, crate::theme::RADIUS_CONTROL, egui::Stroke::new(1.0, t.border_subtle), egui::StrokeKind::Inside);
+    painter.text(rect.center(), Align2::CENTER_CENTER, label, font, t.disabled);
     // Unavailable, and said so to screen readers and automation as well as on screen: a
     // placeholder is never an enabled button, whatever the ui around it is (#257).
     let name = crate::i18n::format_message_id("ui.label_not_built", &[("label", label)]);
@@ -3497,10 +3523,10 @@ fn not_built(ui: &mut Ui, label: &str, t: &Tokens) {
 /// actions and the destructive tool removal, with the accent colour making the state clear
 /// without overpowering the swatches above it.
 // i18n-ui-text: label,tip
-fn popup_action_button(ui: &mut Ui, label: &str, enabled: bool, colour: egui::Color32, tip: &str) -> egui::Response {
-    let fg = if enabled { colour } else { ui.visuals().widgets.noninteractive.fg_stroke.color };
-    let fill = crate::theme::mix(ui.visuals().panel_fill, colour, if enabled { 0.10 } else { 0.04 });
-    let stroke = crate::theme::mix(ui.visuals().panel_fill, colour, if enabled { 0.45 } else { 0.18 });
+fn popup_action_button(ui: &mut Ui, label: &str, enabled: bool, colour: egui::Color32, t: &Tokens, tip: &str) -> egui::Response {
+    let fg = if enabled { colour } else { t.disabled };
+    let fill = if enabled { crate::theme::mix(t.surface_elevated, colour, 0.10) } else { t.faint };
+    let stroke = if enabled { crate::theme::mix(t.surface_elevated, colour, 0.45) } else { t.border_subtle };
     let button = egui::Button::new(egui::RichText::new(label).size(11.0).color(fg))
         .min_size(vec2(196.0, 22.0))
         .fill(fill)
@@ -3534,12 +3560,7 @@ fn big_mark(ui: &mut Ui, mark: Mark, label: &str, tip: &str, t: &Tokens) -> egui
     if resp.hovered() {
         painter.rect_filled(rect, 4.0, t.row_hover);
     }
-    ribbon_icons::paint(
-        &painter,
-        Rect::from_center_size(egui::pos2(rect.center().x, rect.min.y + 18.0), vec2(24.0, 24.0)),
-        mark,
-        mark.color(t.text, t.accent),
-    );
+    ribbon_icons::paint(&painter, Rect::from_center_size(egui::pos2(rect.center().x, rect.min.y + 18.0), vec2(24.0, 24.0)), mark, mark.color_for(t));
     painter.text(egui::pos2(rect.center().x, rect.min.y + 40.0), Align2::CENTER_CENTER, label, egui::FontId::proportional(11.0), t.text);
     let enabled = ui.is_enabled();
     let name = label.to_string();

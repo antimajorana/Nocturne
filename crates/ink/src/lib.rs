@@ -275,12 +275,12 @@ impl Stroke {
         // extrema, but also enclose the same sampled curve that the painter and
         // saved outline use. Dots and two-reading lines need no smoothing.
         if self.dabs.len() >= 3 {
-            for d in shape::centre(self) {
+            shape::for_each_centre(self, |d| {
                 x0 = x0.min(d.x);
                 y0 = y0.min(d.y);
                 x1 = x1.max(d.x);
                 y1 = y1.max(d.y);
-            }
+            });
         }
         let edge = self.width / 2.0;
         Some((x0 - edge, y0 - edge, x1 + edge, y1 + edge))
@@ -316,6 +316,19 @@ impl Drawing {
         }
     }
 
+    /// Expands the SVG view box to enclose `(left, top, right, bottom)` without shrinking it.
+    pub fn include_bounds(&mut self, (left, top, right, bottom): (f32, f32, f32, f32)) {
+        if !left.is_finite() || !top.is_finite() || !right.is_finite() || !bottom.is_finite() {
+            return;
+        }
+        let old_right = self.view_x + self.width;
+        let old_bottom = self.view_y + self.height;
+        self.view_x = self.view_x.min(left);
+        self.view_y = self.view_y.min(top);
+        self.width = (old_right.max(right) - self.view_x).max(1.0);
+        self.height = (old_bottom.max(bottom) - self.view_y).max(1.0);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.strokes.iter().all(Stroke::is_empty)
     }
@@ -326,13 +339,8 @@ impl Drawing {
             return false;
         }
         let stroke = stroke.sane();
-        if let Some((left, top, right, bottom)) = stroke.bounds() {
-            let old_right = self.view_x + self.width;
-            let old_bottom = self.view_y + self.height;
-            self.view_x = self.view_x.min(left);
-            self.view_y = self.view_y.min(top);
-            self.width = (old_right.max(right) - self.view_x).max(1.0);
-            self.height = (old_bottom.max(bottom) - self.view_y).max(1.0);
+        if let Some(bounds) = stroke.bounds() {
+            self.include_bounds(bounds);
         }
         self.strokes.push(stroke);
         true

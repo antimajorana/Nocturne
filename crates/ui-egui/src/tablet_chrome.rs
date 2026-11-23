@@ -3,9 +3,9 @@
 
 use crate::icons::{self, Icon};
 use crate::ribbon::{Act, RuleLines, View};
-use crate::theme::Tokens;
+use crate::theme::{RADIUS_PILL, RADIUS_POPUP, Tokens};
 use egui::os::OperatingSystem;
-use egui::{Align2, Color32, Context, Id, Order, Rect, RichText, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
+use egui::{Align2, Color32, Context, CornerRadius, Id, Order, Rect, RichText, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use nocturne_engine::{LibraryView, ToolbarDock};
 use nocturne_ink::Rgb;
 
@@ -121,21 +121,36 @@ pub struct StudioTopBarOut {
     pub acts: Vec<Act>,
 }
 
+/// Paints hover, active, pressed, and keyboard-focus background/outline chrome for a 40×40
+/// Tablet Studio icon button.
+pub(crate) fn paint_studio_btn_chrome(ui: &Ui, rect: Rect, resp: &egui::Response, active: bool, enabled: bool, t: &Tokens) {
+    let pressed = enabled && resp.is_pointer_button_down_on();
+    let hovered = enabled && resp.hovered();
+    let r = CornerRadius::same(RADIUS_POPUP);
+    if pressed {
+        ui.painter().rect_filled(rect, r, t.row_selected);
+        ui.painter().rect_stroke(rect, r, Stroke::new(1.5, t.accent), StrokeKind::Inside);
+    } else if active {
+        ui.painter().rect_filled(rect, r, t.row_selected);
+        ui.painter().rect_stroke(rect, r, Stroke::new(1.0, t.accent), StrokeKind::Inside);
+    } else if hovered {
+        ui.painter().rect_filled(rect, r, t.row_hover);
+        ui.painter().rect_stroke(rect, r, Stroke::new(1.0, t.border_subtle), StrokeKind::Inside);
+    }
+    if enabled && resp.has_focus() {
+        ui.painter().rect_stroke(rect.expand(1.5), CornerRadius::same(RADIUS_POPUP + 2), Stroke::new(2.0, t.accent), StrokeKind::Outside);
+    }
+}
+
 // i18n-ui-text: tip
 pub(crate) fn studio_icon_btn(ui: &mut Ui, icon: Icon, active: bool, enabled: bool, tip: &str, t: &Tokens) -> egui::Response {
-    let size = vec2(36.0, 34.0);
-    let (rect, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
+    let (rect, resp) = ui.allocate_exact_size(vec2(40.0, 40.0), if enabled { Sense::click() } else { Sense::hover() });
     let tip_owned = tip.to_string();
     resp.widget_info(move || egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &tip_owned));
-    if active {
-        ui.painter().rect_filled(rect, 7.0, t.accent.gamma_multiply(0.18));
-        ui.painter().rect_stroke(rect, 7.0, Stroke::new(1.0, t.accent), StrokeKind::Inside);
-    } else if enabled && resp.hovered() {
-        ui.painter().rect_filled(rect, 7.0, t.row_hover);
-    }
+    paint_studio_btn_chrome(ui, rect, &resp, active, enabled, t);
     let fg = if !enabled {
-        t.faint
-    } else if active {
+        t.disabled
+    } else if active || resp.is_pointer_button_down_on() {
         t.accent
     } else {
         t.text
@@ -145,37 +160,44 @@ pub(crate) fn studio_icon_btn(ui: &mut Ui, icon: Icon, active: bool, enabled: bo
 }
 
 // i18n-ui-text: tip
-fn studio_back_btn(ui: &mut Ui, tip: &str, t: &Tokens) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(36.0, 34.0), Sense::click());
+fn studio_chevron_btn(ui: &mut Ui, right: bool, enabled: bool, tip: &str, t: &Tokens) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(40.0, 40.0), if enabled { Sense::click() } else { Sense::hover() });
     let tip_owned = tip.to_string();
-    resp.widget_info(move || egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &tip_owned));
-    if resp.hovered() {
-        ui.painter().rect_filled(rect, 7.0, t.row_hover);
-    }
+    resp.widget_info(move || egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &tip_owned));
+    paint_studio_btn_chrome(ui, rect, &resp, false, enabled, t);
+    let fg = if !enabled {
+        t.disabled
+    } else if resp.is_pointer_button_down_on() {
+        t.accent
+    } else {
+        t.text
+    };
     let c = rect.center();
-    let stroke = Stroke::new(1.8, t.text);
-    ui.painter().line_segment([pos2(c.x + 3.0, c.y - 6.0), pos2(c.x - 3.0, c.y)], stroke);
-    ui.painter().line_segment([pos2(c.x - 3.0, c.y), pos2(c.x + 3.0, c.y + 6.0)], stroke);
+    let dir = if right { 1.0 } else { -1.0 };
+    let stroke = Stroke::new(2.0, fg);
+    ui.painter().line_segment([pos2(c.x - 3.0 * dir, c.y - 6.0), pos2(c.x + 3.0 * dir, c.y)], stroke);
+    ui.painter().line_segment([pos2(c.x + 3.0 * dir, c.y), pos2(c.x - 3.0 * dir, c.y + 6.0)], stroke);
     resp.on_hover_text(tip)
 }
 
-/// Renders the single ~44pt Tablet Studio top bar (used in ClassicTree mode when no page is open).
+/// Renders the single ~50pt Tablet Studio top bar (used in ClassicTree mode when no page is open).
 pub fn show_top_bar(ui: &mut Ui, input: &StudioTopBarIn<'_>, search: &mut String, focus_search: &mut bool, t: &Tokens) -> StudioTopBarOut {
     let mut out = StudioTopBarOut::default();
     let search_open_id = Id::unique("studio-search-open");
     let mut search_open = ui.ctx().data(|d| d.get_temp::<bool>(search_open_id)).unwrap_or(false) || *focus_search || !search.trim().is_empty();
     let frame = egui::Frame::NONE.fill(t.panel).inner_margin(egui::Margin { left: 10, right: 10, top: 5, bottom: 5 });
     frame.show(ui, |ui| {
-        ui.set_min_height(36.0);
+        ui.set_min_height(40.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
+            ui.spacing_mut().interact_size = vec2(40.0, 40.0);
             if studio_icon_btn(ui, Icon::Bars, input.drawer_open, true, crate::tl_id!("ui.studio_toggle_drawer"), t).clicked() {
                 out.toggle_drawer = true;
             }
-            if studio_icon_btn(ui, Icon::MoveUp, false, input.can_back, crate::tl_id!("ui.back"), t).clicked() {
+            if studio_chevron_btn(ui, false, input.can_back, crate::tl_id!("ui.back"), t).clicked() {
                 out.nav_back = true;
             }
-            if studio_icon_btn(ui, Icon::MoveDown, false, input.can_forward, crate::tl_id!("ui.forward"), t).clicked() {
+            if studio_chevron_btn(ui, true, input.can_forward, crate::tl_id!("ui.forward"), t).clicked() {
                 out.nav_forward = true;
             }
             if studio_icon_btn(ui, Icon::Plus, false, true, crate::tl_id!("ui.add_page"), t).clicked() {
@@ -187,8 +209,9 @@ pub fn show_top_bar(ui: &mut Ui, input: &StudioTopBarIn<'_>, search: &mut String
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
+                ui.spacing_mut().interact_size = vec2(40.0, 40.0);
                 let file_btn = ui
-                    .add(egui::Button::new(RichText::new(crate::tl_id!("ui.file")).color(t.text)).min_size(vec2(46.0, 34.0)))
+                    .add(egui::Button::new(RichText::new(crate::tl_id!("ui.file")).color(t.text)).min_size(vec2(48.0, 40.0)))
                     .on_hover_text(crate::tl_id!("ui.open_file_and_options"));
                 if file_btn.clicked() {
                     out.acts.push(Act::File);
@@ -207,8 +230,8 @@ pub fn show_top_bar(ui: &mut Ui, input: &StudioTopBarIn<'_>, search: &mut String
                 };
                 let sync_btn = ui
                     .add(
-                        egui::Button::new(RichText::new(sync_label).color(if input.sync_busy { t.accent } else { t.text }))
-                            .min_size(vec2(58.0, 34.0)),
+                        egui::Button::new(RichText::new(sync_label).color(if input.sync_busy { t.accent_text } else { t.text }))
+                            .min_size(vec2(60.0, 40.0)),
                     )
                     .on_hover_text(crate::tl_id!("ui.kdrive_sync_tip"));
                 if sync_btn.clicked() {
@@ -242,14 +265,15 @@ pub fn show_top_bar(ui: &mut Ui, input: &StudioTopBarIn<'_>, search: &mut String
     });
     ui.ctx().data_mut(|d| d.insert_temp(search_open_id, search_open));
     let r = ui.min_rect();
-    ui.painter().hline(r.x_range(), r.max.y, Stroke::new(1.0, t.container_border));
+    ui.painter().hline(r.x_range(), r.max.y, Stroke::new(1.0, t.border));
     out
 }
 
 /// The narrowest the failure banner is drawn.
 pub const ERROR_BANNER_MIN_WIDTH: f32 = 240.0;
 
-/// Shows a failure on one line at the top of the view until tapped away or superseded.
+/// Shows a failure on one line at the top of the view, clearing any visible floating header pill,
+/// until tapped away or superseded.
 pub fn show_error_banner(ctx: &Context, view_rect: Rect, message: &str, is_error: bool, tokens: &Tokens) -> bool {
     let message = message.trim();
     if message.is_empty() {
@@ -257,15 +281,23 @@ pub fn show_error_banner(ctx: &Context, view_rect: Rect, message: &str, is_error
     }
     let margin = egui::Margin { left: 12, right: 12, top: 7, bottom: 7 };
     let widest = (view_rect.width() - 32.0).max(ERROR_BANNER_MIN_WIDTH);
-    let pos = pos2(view_rect.center().x, (view_rect.min.y + 12.0).max(52.0));
+    let header_clear = ctx
+        .memory(|m| {
+            let id = Id::unique("studio-header-pill");
+            m.areas().visible_layer_ids().iter().any(|l| l.id == id).then(|| m.area_rect(id)).flatten()
+        })
+        .map_or(view_rect.min.y + 56.0, |h| h.max.y + 8.0);
+    let y = (view_rect.min.y + 12.0).max(header_clear).min((view_rect.max.y - 52.0).max(view_rect.min.y + 12.0));
+    let pos = pos2(view_rect.center().x, y);
     let mut dismissed = false;
     egui::Area::new(Id::unique("studio-error-banner")).order(Order::Foreground).pivot(Align2::CENTER_TOP).fixed_pos(pos).constrain(true).show(
         ctx,
         |ui| {
             let frame = egui::Frame::NONE
-                .fill(tokens.panel.gamma_multiply(0.97))
-                .stroke(Stroke::new(1.0, if is_error { tokens.warn } else { tokens.container_border }))
-                .corner_radius(8.0)
+                .fill(tokens.surface_elevated)
+                .stroke(Stroke::new(1.0, if is_error { tokens.warn } else { tokens.border }))
+                .corner_radius(CornerRadius::same(RADIUS_POPUP))
+                .shadow(tokens.shadow_popup())
                 .inner_margin(margin)
                 .show(ui, |ui| {
                     ui.set_min_width(ERROR_BANNER_MIN_WIDTH - f32::from(margin.left + margin.right));
@@ -275,6 +307,17 @@ pub fn show_error_banner(ctx: &Context, view_rect: Rect, message: &str, is_error
                     );
                 });
             let tap = ui.interact(frame.response.rect, Id::unique("studio-error-banner-tap"), Sense::click());
+            if tap.is_pointer_button_down_on() {
+                ui.painter().rect_stroke(frame.response.rect, CornerRadius::same(RADIUS_POPUP), Stroke::new(1.5, tokens.accent), StrokeKind::Inside);
+            }
+            if tap.has_focus() {
+                ui.painter().rect_stroke(
+                    frame.response.rect.expand(1.5),
+                    CornerRadius::same(RADIUS_POPUP + 2),
+                    Stroke::new(2.0, tokens.accent),
+                    StrokeKind::Outside,
+                );
+            }
             tap.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, message));
             dismissed = tap.clicked();
         },
@@ -286,6 +329,7 @@ pub fn show_error_banner(ctx: &Context, view_rect: Rect, message: &str, is_error
 fn view_menu(ui: &mut Ui, input: &StudioTopBarIn<'_>, out: &mut StudioTopBarOut) {
     crate::ribbon::mark_popup_open(ui.ctx());
     ui.set_min_width(210.0);
+    ui.spacing_mut().interact_size.y = ui.spacing().interact_size.y.max(36.0);
     ui.horizontal(|ui| {
         if ui.button(crate::tl_id!("ui.zoom_out")).clicked() {
             out.acts.push(Act::Zoom(-1));
@@ -361,15 +405,17 @@ pub fn show_header_pill(
         .constrain(true)
         .show(ctx, |ui| {
             let frame = egui::Frame::NONE
-                .fill(t.panel.gamma_multiply(0.97))
-                .stroke(Stroke::new(1.0, t.container_border))
-                .corner_radius(14.0)
-                .inner_margin(egui::Margin { left: 8, right: 8, top: 5, bottom: 5 });
+                .fill(t.surface_elevated)
+                .stroke(Stroke::new(1.0, t.border))
+                .corner_radius(CornerRadius::same(RADIUS_PILL))
+                .shadow(t.shadow_floating())
+                .inner_margin(egui::Margin { left: 10, right: 10, top: 5, bottom: 5 });
             frame.show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.spacing_mut().interact_size = vec2(40.0, 40.0);
                     if input.library_view == LibraryView::StudioGrid {
-                        if studio_back_btn(ui, crate::tl_id!("ui.back_to_library"), t).clicked() {
+                        if studio_chevron_btn(ui, false, true, crate::tl_id!("ui.back_to_library"), t).clicked() {
                             out.back_to_library = true;
                         }
                     } else if studio_icon_btn(ui, Icon::Bars, input.drawer_open, true, crate::tl_id!("ui.studio_toggle_drawer"), t).clicked() {
@@ -385,8 +431,8 @@ pub fn show_header_pill(
                     } else {
                         crate::tl_id!("ui.sync_setup_short")
                     };
-                    let sync = egui::Button::new(RichText::new(sync_label).color(if input.sync_busy { t.accent } else { t.text }))
-                        .min_size(vec2(54.0, 34.0));
+                    let sync = egui::Button::new(RichText::new(sync_label).color(if input.sync_busy { t.accent_text } else { t.text }))
+                        .min_size(vec2(56.0, 40.0));
                     if ui.add(sync).clicked() {
                         out.acts.push(Act::OpenCloudSync);
                     }
@@ -405,6 +451,7 @@ pub fn show_header_pill(
                     ui.menu_button(RichText::new(crate::tl_id!("ui.more")).color(t.text), |ui| {
                         crate::ribbon::mark_popup_open(ui.ctx());
                         ui.set_min_width(210.0);
+                        ui.spacing_mut().interact_size.y = ui.spacing().interact_size.y.max(36.0);
                         if ui.add_enabled(input.can_back, egui::Button::new(crate::tl_id!("ui.back"))).clicked() {
                             out.nav_back = true;
                             ui.close();

@@ -1108,3 +1108,22 @@
 @id	ui.dock_tool_math_ocr	Math OCR
 @id	ui.dock_insert_picture	Insert picture
 @id	ui.dock_math_ocr	Recognise equation
+@id	ui.layout_mode_label	Interface layout
+@id	ui.layout_mode_auto	Auto
+@id	ui.layout_mode_classic_ribbon	Classic Ribbon
+@id	ui.layout_mode_tablet_studio	Tablet Studio
+@id	ui.layout_mode_hint	Auto uses Tablet Studio on iPad and Classic Ribbon on desktop.
+@id	ui.ocr_provider_apple_vision	Apple Vision
+@id	ui.ocr_provider_local_model	Local model
+@id	ui.ocr_apple_vision_desc	Built-in Apple Vision recognition runs free and offline on iPad, iPhone, and Mac. Nothing leaves this device.
+@id	ui.ocr_apple_vision_ready	Available on this device. No API key required.
+@id	ui.ocr_apple_vision_unavailable	Apple Vision is only available on Apple devices (iPad, iPhone, and Mac). Choose the free local model or a cloud service instead.
+@id	ui.ocr_local_model_desc	Pix2Text MFR 1.5 (MIT license, ~114 MiB) runs free and offline on this device after download.
+@id	ui.ocr_local_model_unsupported	The downloadable local model is not available in this build.
+@id	ui.ocr_model_installed	Installed (~114 MiB). Ready for offline recognition.
+@id	ui.ocr_model_not_installed	Not downloaded (~114 MiB).
+@id	ui.ocr_model_downloading	Downloading model... {done} / {total} MiB ({percent}%)
+@id	ui.ocr_model_download	Download free model
+@id	ui.ocr_model_remove	Remove model
+@id	ui.ocr_mathpix_incomplete	Mathpix needs both an App ID and a key.
+@id	ui.ocr_error_model_not_installed	Download the local math model first in Tool Settings → Recognition service.

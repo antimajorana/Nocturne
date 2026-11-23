@@ -4,8 +4,10 @@
 //! built, rather than hidden, so nobody goes looking for it.
 
 use crate::icons::{self, Icon};
-use crate::theme::Tokens;
-use egui::{Align2, Sense, Ui, vec2};
+use crate::modal;
+use crate::theme::{self, RADIUS_CARD, RADIUS_CONTROL, Tokens};
+use egui::{Align2, Color32, CornerRadius, FontId, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
+use nocturne_engine::UiLayoutMode;
 use nocturne_model::NodeColor;
 use nocturne_store::tree::Node;
 
@@ -39,6 +41,8 @@ pub enum Act {
     SetUiLanguage(String),
     /// Draw the whole window at this size, in percent of the system's own scale.
     SetUiScale(u16),
+    /// Choose the top-level interface layout mode (Auto, Classic Ribbon, or Tablet Studio).
+    SetLayoutMode(UiLayoutMode),
     OpenTelemetryFolder(std::path::PathBuf),
     ClearTelemetry(std::path::PathBuf),
     ExportTelemetry(std::path::PathBuf),
@@ -86,9 +90,9 @@ fn version_and_updates(ui: &mut Ui, update: &crate::update::Status, t: &Tokens, 
     ui.label(egui::RichText::new(crate::tl_id!("ui.version_and_updates")).strong().size(14.0).color(t.strong));
     let running = crate::i18n::format_message_id("ui.you_are_running_version", &[("version", VERSION)]);
     ui.label(egui::RichText::new(running).size(12.0).color(t.text));
-    ui.horizontal(|ui| {
-        let button = egui::Button::new(crate::tl_id!("ui.check_for_updates")).stroke(egui::Stroke::new(1.0, t.container_border));
-        if ui.add_enabled(!update.busy(), button).clicked() {
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        if modal::secondary_button_enabled(ui, crate::tl_id!("ui.check_for_updates"), !update.busy(), t).clicked() {
             acts.push(Act::CheckForUpdates);
         }
         if matches!(update, Status::Manual { .. } | Status::Failed(_)) && ui.link(crate::tl_id!("ui.open_the_releases_page")).clicked() {
@@ -131,34 +135,60 @@ pub fn show(
     ui_language: &str,
     languages: &[crate::i18n::LanguageChoice],
     ui_scale: u16,
+    layout_mode: UiLayoutMode,
     update: &crate::update::Status,
     t: &Tokens,
 ) -> Vec<Act> {
     let mut acts = Vec::new();
+    let total_w = ui.available_width();
+    let total_h = ui.available_height().max(1.0);
+    let side_w = if total_w < 520.0 { 136.0 } else { 170.0 };
     egui::Frame::NONE.fill(t.panel).show(ui, |ui| {
         ui.horizontal_top(|ui| {
-            side_bar(ui, page, t, &mut acts);
-            ui.add_space(14.0);
-            ui.vertical(|ui| {
-                ui.add_space(10.0);
-                match page {
-                    "New" => new_page(ui, notebooks_folder, t, &mut acts),
-                    "Open" => open_page(ui, recent, notebooks_folder, show_path, t, &mut acts),
-                    "About" => about_page(ui, telemetry_root, session_id, update, t, &mut acts),
-                    "Options" => {
-                        options_page(ui, telemetry_root, telemetry_level, session_id, ui_language, languages, ui_scale, update, t, &mut acts)
+            ui.allocate_ui_with_layout(vec2(side_w, total_h), egui::Layout::top_down(egui::Align::Min), |ui| {
+                egui::ScrollArea::vertical().id_salt("backstage-sidebar").auto_shrink([false, false]).show(ui, |ui| {
+                    side_bar(ui, side_w, page, t, &mut acts);
+                });
+            });
+            let (sep_rect, _) = ui.allocate_exact_size(vec2(1.0, total_h), Sense::hover());
+            let x = sep_rect.center().x.round() + 0.5;
+            ui.painter().vline(x, sep_rect.min.y..=sep_rect.max.y, Stroke::new(1.0, t.border_subtle));
+            ui.add_space(12.0);
+            let content_w = ui.available_width().max(160.0);
+            ui.allocate_ui_with_layout(vec2(content_w, total_h), egui::Layout::top_down(egui::Align::Min), |ui| {
+                egui::ScrollArea::vertical().id_salt(("backstage-content", page)).auto_shrink([false, false]).show(ui, |ui| {
+                    ui.set_width((content_w - 16.0).max(140.0));
+                    ui.add_space(10.0);
+                    match page {
+                        "New" => new_page(ui, notebooks_folder, t, &mut acts),
+                        "Open" => open_page(ui, recent, notebooks_folder, show_path, t, &mut acts),
+                        "About" => about_page(ui, telemetry_root, session_id, update, t, &mut acts),
+                        "Options" => options_page(
+                            ui,
+                            telemetry_root,
+                            telemetry_level,
+                            session_id,
+                            ui_language,
+                            languages,
+                            ui_scale,
+                            layout_mode,
+                            update,
+                            t,
+                            &mut acts,
+                        ),
+                        _ => info_page(ui, notebooks, notebooks_folder, show_path, t, &mut acts),
                     }
-                    _ => info_page(ui, notebooks, notebooks_folder, show_path, t, &mut acts),
-                }
+                    ui.add_space(16.0);
+                });
             });
         });
     });
     acts
 }
 
-fn side_bar(ui: &mut Ui, page: &str, t: &Tokens, acts: &mut Vec<Act>) {
+fn side_bar(ui: &mut Ui, width: f32, page: &str, t: &Tokens, acts: &mut Vec<Act>) {
     ui.vertical(|ui| {
-        ui.set_width(170.0);
+        ui.set_width(width);
         ui.add_space(8.0);
         // The arrow back to the notebook, as in Office.
         let (rect, back) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
@@ -166,19 +196,13 @@ fn side_bar(ui: &mut Ui, page: &str, t: &Tokens, acts: &mut Vec<Act>) {
         if back.hovered() {
             painter.circle_filled(rect.center(), 15.0, t.row_hover);
         }
-        painter.circle_stroke(rect.center(), 11.0, egui::Stroke::new(1.5, t.accent));
-        painter.line_segment(
-            [egui::pos2(rect.center().x + 5.0, rect.center().y), egui::pos2(rect.center().x - 4.0, rect.center().y)],
-            egui::Stroke::new(1.5, t.accent),
-        );
-        painter.line_segment(
-            [egui::pos2(rect.center().x - 4.0, rect.center().y), egui::pos2(rect.center().x, rect.center().y - 4.0)],
-            egui::Stroke::new(1.5, t.accent),
-        );
-        painter.line_segment(
-            [egui::pos2(rect.center().x - 4.0, rect.center().y), egui::pos2(rect.center().x, rect.center().y + 4.0)],
-            egui::Stroke::new(1.5, t.accent),
-        );
+        painter.circle_stroke(rect.center(), 11.0, Stroke::new(1.5, t.accent));
+        painter
+            .line_segment([pos2(rect.center().x + 5.0, rect.center().y), pos2(rect.center().x - 4.0, rect.center().y)], Stroke::new(1.5, t.accent));
+        painter
+            .line_segment([pos2(rect.center().x - 4.0, rect.center().y), pos2(rect.center().x, rect.center().y - 4.0)], Stroke::new(1.5, t.accent));
+        painter
+            .line_segment([pos2(rect.center().x - 4.0, rect.center().y), pos2(rect.center().x, rect.center().y + 4.0)], Stroke::new(1.5, t.accent));
         let enabled = ui.is_enabled();
         let back_label = crate::tl_id!("ui.back");
         back.widget_info(move || egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, back_label));
@@ -190,26 +214,22 @@ fn side_bar(ui: &mut Ui, page: &str, t: &Tokens, acts: &mut Vec<Act>) {
             let selected = name == page;
             let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
             let painter = ui.painter_at(rect);
+            let radius = CornerRadius::same(RADIUS_CONTROL);
             if selected {
-                painter.rect_filled(rect, 4.0, t.row_selected);
+                painter.rect_filled(rect, radius, t.row_selected);
+                painter.rect_stroke(rect, radius, Stroke::new(1.0, t.border_subtle), StrokeKind::Inside);
             } else if resp.hovered() {
-                painter.rect_filled(rect, 4.0, t.row_hover);
+                painter.rect_filled(rect, radius, t.row_hover);
             }
-            let color = if built { t.text } else { t.muted };
-            painter.text(
-                egui::pos2(rect.min.x + 12.0, rect.center().y),
-                Align2::LEFT_CENTER,
-                crate::tl!(name),
-                egui::FontId::proportional(13.5),
-                color,
-            );
+            let color = if built { t.text } else { t.disabled };
+            painter.text(pos2(rect.min.x + 12.0, rect.center().y), Align2::LEFT_CENTER, crate::tl!(name), FontId::proportional(13.5), color);
             if !built {
                 painter.text(
-                    egui::pos2(rect.max.x - 8.0, rect.center().y),
+                    pos2(rect.max.x - 8.0, rect.center().y),
                     Align2::RIGHT_CENTER,
                     crate::tl_id!("ui.not_built_2"),
-                    egui::FontId::proportional(10.0),
-                    t.muted,
+                    FontId::proportional(10.0),
+                    t.disabled,
                 );
             }
             let enabled = ui.is_enabled();
@@ -233,50 +253,48 @@ fn info_page(ui: &mut Ui, notebooks: &[Node], folder: &str, show_path: &dyn Fn(&
     if notebooks.is_empty() {
         ui.label(egui::RichText::new(crate::tl_id!("ui.there_are_no_notebooks_yet_new_starts_one")).color(t.muted));
     }
-    egui::ScrollArea::vertical().id_salt("backstage-info").show(ui, |ui| {
-        for n in notebooks {
-            ui.horizontal_top(|ui| {
-                // The notebook's cover, in its own colour.
-                let (rect, resp) = ui.allocate_exact_size(vec2(64.0, 64.0), Sense::click());
-                let painter = ui.painter_at(rect);
-                let color = n
-                    .info
-                    .color
-                    .map(|c| {
-                        let (r, g, b) = c.rgb(t.panel.r() < 128);
-                        egui::Color32::from_rgb(r, g, b)
-                    })
-                    .unwrap_or(t.notebook);
-                icons::paint(&painter, rect.shrink(8.0), Icon::Notebook, color);
-                let name = n.info.title.clone();
-                let enabled = ui.is_enabled();
-                let accessible_name = crate::i18n::format_message_id("ui.open_name", &[("name", &name)]);
-                resp.widget_info(move || egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, accessible_name.clone()));
-                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(crate::tl_id!("ui.open_this_notebook")).clicked() {
-                    acts.push(Act::Open(n.path.clone()));
-                }
-                ui.add_space(8.0);
-                ui.vertical(|ui| {
-                    ui.label(egui::RichText::new(&n.info.title).size(17.0).color(t.accent));
-                    ui.label(egui::RichText::new(show_path(&n.path)).size(11.5).monospace().color(t.muted));
-                    ui.horizontal(|ui| {
-                        let open_folder =
-                            egui::Button::new(crate::tl_id!("ui.open_folder")).small().stroke(egui::Stroke::new(1.0, t.container_border));
-                        if ui.add(open_folder).clicked() {
-                            acts.push(Act::OpenFolder(n.path.clone()));
-                        }
-                        let count = n.count().to_string();
-                        let colour = n.info.color.map(NodeColor::label).unwrap_or(crate::tl_id!("ui.no"));
-                        let summary = crate::i18n::format_message_id("ui.count_items_colour_colour", &[("count", &count), ("colour", colour)]);
-                        ui.label(egui::RichText::new(summary).size(11.0).color(t.muted));
-                    });
+    for n in notebooks {
+        ui.horizontal_top(|ui| {
+            // The notebook's cover, in its own colour.
+            let (rect, resp) = ui.allocate_exact_size(vec2(64.0, 64.0), Sense::click());
+            let painter = ui.painter_at(rect);
+            let color = n
+                .info
+                .color
+                .map(|c| {
+                    let (r, g, b) = c.rgb(t.panel.r() < 128);
+                    Color32::from_rgb(r, g, b)
+                })
+                .unwrap_or(t.notebook);
+            icons::paint(&painter, rect.shrink(8.0), Icon::Notebook, color);
+            let name = n.info.title.clone();
+            let enabled = ui.is_enabled();
+            let accessible_name = crate::i18n::format_message_id("ui.open_name", &[("name", &name)]);
+            resp.widget_info(move || egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, accessible_name.clone()));
+            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(crate::tl_id!("ui.open_this_notebook")).clicked() {
+                acts.push(Act::Open(n.path.clone()));
+            }
+            ui.add_space(8.0);
+            ui.vertical(|ui| {
+                ui.label(egui::RichText::new(&n.info.title).size(17.0).color(t.accent_text));
+                ui.label(egui::RichText::new(show_path(&n.path)).size(11.5).monospace().color(t.muted));
+                ui.horizontal_wrapped(|ui| {
+                    #[cfg(not(target_os = "ios"))]
+                    if modal::secondary_button(ui, crate::tl_id!("ui.open_folder"), t).clicked() {
+                        acts.push(Act::OpenFolder(n.path.clone()));
+                    }
+                    let count = n.count().to_string();
+                    let colour = n.info.color.map(NodeColor::label).unwrap_or(crate::tl_id!("ui.no"));
+                    let summary = crate::i18n::format_message_id("ui.count_items_colour_colour", &[("count", &count), ("colour", colour)]);
+                    ui.label(egui::RichText::new(summary).size(11.0).color(t.muted));
                 });
             });
-            ui.add_space(10.0);
-        }
-    });
+        });
+        ui.add_space(10.0);
+    }
     ui.add_space(6.0);
-    ui.separator();
+    modal::hairline(ui, t);
+    ui.add_space(6.0);
     let location = crate::i18n::format_message_id("ui.all_of_them_live_in_folder", &[("folder", folder)]);
     ui.label(egui::RichText::new(location).size(11.5).color(t.muted));
     ui.label(egui::RichText::new(crate::tl_id!("ui.online_notebooks_onedrive_sharepoint_are_not_built_a_860f0281c0")).size(11.5).color(t.muted));
@@ -287,7 +305,7 @@ fn new_page(ui: &mut Ui, folder: &str, t: &Tokens, acts: &mut Vec<Act>) {
     let explanation = crate::i18n::format_message_id("ui.a_new_notebook_is_a_folder_in_folder_with_one_sectio_7208ff46e4", &[("folder", folder)]);
     ui.label(egui::RichText::new(explanation).color(t.text));
     ui.add_space(10.0);
-    if ui.button(crate::tl_id!("ui.new_notebook")).clicked() {
+    if modal::primary_button(ui, crate::tl_id!("ui.new_notebook"), t).clicked() {
         acts.push(Act::NewNotebook);
     }
     ui.add_space(14.0);
@@ -297,113 +315,101 @@ fn new_page(ui: &mut Ui, folder: &str, t: &Tokens, acts: &mut Vec<Act>) {
 
 fn open_page(ui: &mut Ui, recent: &[Node], folder: &str, show_path: &dyn Fn(&std::path::Path) -> String, t: &Tokens, acts: &mut Vec<Act>) {
     heading(ui, crate::tl_id!("ui.open_a_notebook"), t);
-    ui.horizontal(|ui| {
-        if ui.add_sized([230.0, 42.0], egui::Button::new(egui::RichText::new(crate::tl_id!("ui.browse_for_a_notebook")).size(15.0))).clicked() {
-            acts.push(Act::ChooseFolder);
-        }
-        if open_action(ui, crate::tl_id!("ui.show_notebooks_folder"), 210.0, 42.0, t, false).clicked() {
-            acts.push(Act::OpenNotebooksFolder);
-        }
-    });
-    ui.add_space(10.0);
-    ui.horizontal(|ui| {
-        if open_action(ui, crate::tl_id!("ui.import_notebook_folder"), 230.0, 36.0, t, true).clicked() {
-            acts.push(Act::ImportNotebookFolder);
-        }
-        if open_action(ui, crate::tl_id!("ui.import_file"), 230.0, 36.0, t, true).clicked() {
-            acts.push(Act::ImportFile);
-        }
-        let cloud = ui.add_enabled(
-            false,
-            egui::Button::new(egui::RichText::new(crate::tl_id!("ui.import_from_the_cloud")).size(13.0)).min_size(vec2(190.0, 36.0)),
-        );
-        cloud.on_hover_text(crate::tl_id!("ui.cloud_import_is_not_implemented_yet"));
-    });
-    ui.add_space(22.0);
+    #[cfg(target_os = "ios")]
+    let _ = folder;
+    #[cfg(not(target_os = "ios"))]
+    {
+        ui.horizontal_wrapped(|ui| {
+            if modal::primary_button(ui, crate::tl_id!("ui.browse_for_a_notebook"), t).clicked() {
+                acts.push(Act::ChooseFolder);
+            }
+            if modal::secondary_button(ui, crate::tl_id!("ui.show_notebooks_folder"), t).clicked() {
+                acts.push(Act::OpenNotebooksFolder);
+            }
+        });
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            if modal::primary_button(ui, crate::tl_id!("ui.import_notebook_folder"), t).clicked() {
+                acts.push(Act::ImportNotebookFolder);
+            }
+            if modal::primary_button(ui, crate::tl_id!("ui.import_file"), t).clicked() {
+                acts.push(Act::ImportFile);
+            }
+            let cloud = modal::secondary_button_enabled(ui, crate::tl_id!("ui.import_from_the_cloud"), false, t);
+            cloud.on_hover_text(crate::tl_id!("ui.cloud_import_is_not_implemented_yet"));
+        });
+        ui.add_space(20.0);
+    }
     ui.label(egui::RichText::new(crate::tl_id!("ui.recently_opened")).size(16.0).color(t.strong));
     ui.add_space(8.0);
     if recent.is_empty() {
         ui.label(egui::RichText::new(crate::tl_id!("ui.notebooks_you_open_will_appear_here")).size(13.0).color(t.muted));
         return;
     }
-    egui::ScrollArea::vertical().id_salt("backstage-recent-notebooks").show(ui, |ui| {
-        for notebook in recent {
-            let width = ui.available_width().min(680.0);
-            let (rect, response) = ui.allocate_exact_size(vec2(width, 70.0), Sense::click());
-            let background = if response.hovered() { t.row_hover } else { t.panel };
-            let painter = ui.painter_at(rect);
-            painter.rect_filled(rect, 5.0, background);
-            painter.rect_stroke(rect, 5.0, egui::Stroke::new(1.0, t.faint), egui::StrokeKind::Inside);
-            let cover = egui::Rect::from_center_size(egui::pos2(rect.left() + 32.0, rect.center().y), vec2(40.0, 46.0));
-            let color = notebook
-                .info
-                .color
-                .map(|c| {
-                    let (r, g, b) = c.rgb(t.panel.r() < 128);
-                    egui::Color32::from_rgb(r, g, b)
-                })
-                .unwrap_or(t.notebook);
-            icons::paint(&painter, cover, Icon::Notebook, color);
-            painter.text(
-                egui::pos2(rect.left() + 64.0, rect.center().y - 9.0),
-                Align2::LEFT_CENTER,
-                &notebook.info.title,
-                egui::FontId::proportional(16.0),
-                t.text,
-            );
-            painter.text(
-                egui::pos2(rect.left() + 64.0, rect.center().y + 13.0),
-                Align2::LEFT_CENTER,
-                show_path(&notebook.path),
-                egui::FontId::monospace(11.0),
-                t.muted,
-            );
-            painter.text(egui::pos2(rect.right() - 18.0, rect.center().y), Align2::CENTER_CENTER, "›", egui::FontId::proportional(25.0), t.accent);
-            let name = notebook.info.title.clone();
-            let accessible_name = crate::i18n::format_message_id("ui.open_name", &[("name", &name)]);
-            response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, accessible_name.clone()));
-            let path = notebook.path.clone();
-            response.context_menu(|ui| {
-                if ui.button(crate::tl_id!("ui.remove_from_list")).clicked() {
-                    acts.push(Act::RemoveRecent(path.clone()));
-                    ui.close();
-                }
-                if ui.button(crate::tl_id!("ui.delete_notebook_2")).clicked() {
-                    acts.push(Act::DeleteRecent(path.clone(), name.clone()));
-                    ui.close();
-                }
-            });
-            if response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                acts.push(Act::OpenRecent(notebook.path.clone()));
+    for notebook in recent {
+        let width = ui.available_width().clamp(160.0, 680.0);
+        let (rect, response) = ui.allocate_exact_size(vec2(width, 70.0), Sense::click());
+        let background = if response.hovered() { t.row_hover } else { t.surface_elevated };
+        let stroke = if response.hovered() { t.accent } else { t.border_subtle };
+        let painter = ui.painter_at(rect);
+        let radius = CornerRadius::same(RADIUS_CARD);
+        painter.rect_filled(rect, radius, background);
+        painter.rect_stroke(rect, radius, Stroke::new(1.0, stroke), StrokeKind::Inside);
+        let cover = egui::Rect::from_center_size(pos2(rect.left() + 32.0, rect.center().y), vec2(40.0, 46.0));
+        let color = notebook
+            .info
+            .color
+            .map(|c| {
+                let (r, g, b) = c.rgb(t.panel.r() < 128);
+                Color32::from_rgb(r, g, b)
+            })
+            .unwrap_or(t.notebook);
+        icons::paint(&painter, cover, Icon::Notebook, color);
+        let text_clip = egui::Rect::from_min_max(
+            pos2(rect.left() + 60.0, rect.top() + 4.0),
+            pos2((rect.right() - 32.0).max(rect.left() + 64.0), rect.bottom() - 4.0),
+        );
+        let text_painter = painter.with_clip_rect(text_clip);
+        text_painter.text(
+            pos2(rect.left() + 64.0, rect.center().y - 9.0),
+            Align2::LEFT_CENTER,
+            &notebook.info.title,
+            FontId::proportional(16.0),
+            t.text,
+        );
+        text_painter.text(
+            pos2(rect.left() + 64.0, rect.center().y + 13.0),
+            Align2::LEFT_CENTER,
+            show_path(&notebook.path),
+            FontId::monospace(11.0),
+            t.muted,
+        );
+        painter.text(pos2(rect.right() - 18.0, rect.center().y), Align2::CENTER_CENTER, "›", FontId::proportional(25.0), t.accent);
+        let name = notebook.info.title.clone();
+        let accessible_name = crate::i18n::format_message_id("ui.open_name", &[("name", &name)]);
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, accessible_name.clone()));
+        let path = notebook.path.clone();
+        response.context_menu(|ui| {
+            if ui.button(crate::tl_id!("ui.remove_from_list")).clicked() {
+                acts.push(Act::RemoveRecent(path.clone()));
+                ui.close();
             }
-            ui.add_space(6.0);
+            if ui.button(crate::tl_id!("ui.delete_notebook_2")).clicked() {
+                acts.push(Act::DeleteRecent(path.clone(), name.clone()));
+                ui.close();
+            }
+        });
+        if response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            acts.push(Act::OpenRecent(notebook.path.clone()));
         }
-    });
-    ui.add_space(8.0);
-    let hint = crate::i18n::format_message_id("ui.browse_notebooks_in_folder_or_choose_another_folder", &[("folder", folder)]);
-    ui.label(egui::RichText::new(hint).size(11.5).color(t.muted));
-}
-
-// i18n-ui-text: label
-fn open_action(ui: &mut Ui, label: &str, width: f32, height: f32, t: &Tokens, primary: bool) -> egui::Response {
-    let label = crate::tl!(label);
-    let (fill, stroke, text) = if primary { (t.accent, t.accent, t.band_text) } else { (t.panel, t.faint, t.text) };
-    let response = ui
-        .add(
-            egui::Button::new(egui::RichText::new(label).size(if primary { 13.5 } else { 14.0 }).color(text))
-                .min_size(vec2(width, height))
-                .fill(fill)
-                .stroke(egui::Stroke::new(if primary { 1.0 } else { 0.8 }, stroke)),
-        )
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(label);
-    if response.hovered() {
-        ui.painter().rect_stroke(response.rect, 4.0, egui::Stroke::new(2.0, t.band_text), egui::StrokeKind::Inside);
+        ui.add_space(6.0);
     }
-    if response.is_pointer_button_down_on() {
-        ui.painter().rect_stroke(response.rect, 4.0, egui::Stroke::new(3.0, t.strong), egui::StrokeKind::Inside);
+    #[cfg(not(target_os = "ios"))]
+    {
+        ui.add_space(8.0);
+        let hint = crate::i18n::format_message_id("ui.browse_notebooks_in_folder_or_choose_another_folder", &[("folder", folder)]);
+        ui.label(egui::RichText::new(hint).size(11.5).color(t.muted));
     }
-    response
 }
 
 /// About: what this is, which version, and where the code lives.
@@ -420,7 +426,7 @@ fn about_page(
         ui.add(egui::Image::from_bytes("bytes://nocturne-logo", crate::LOGO_PNG).fit_to_exact_size(vec2(64.0, 64.0)));
         ui.add_space(8.0);
         ui.vertical(|ui| {
-            ui.label(egui::RichText::new(crate::tl_id!("ui.nocturne")).size(20.0).color(t.accent));
+            ui.label(egui::RichText::new(crate::tl_id!("ui.nocturne")).size(20.0).color(t.accent_text));
             let version = crate::i18n::format_message_id("ui.version_version_alpha", &[("version", VERSION)]);
             ui.label(egui::RichText::new(version).size(12.0).color(t.muted));
             ui.label(
@@ -473,6 +479,53 @@ fn scale_label(percent: u16) -> String {
     crate::i18n::format_message_id("ui.interface_size_percent", &[("percent", &percent.to_string())])
 }
 
+fn layout_mode_label(mode: UiLayoutMode) -> &'static str {
+    match mode {
+        UiLayoutMode::Auto => crate::tl_id!("ui.layout_mode_auto"),
+        UiLayoutMode::ClassicRibbon => crate::tl_id!("ui.layout_mode_classic_ribbon"),
+        UiLayoutMode::TabletStudio => crate::tl_id!("ui.layout_mode_tablet_studio"),
+    }
+}
+
+fn layout_choice_button(ui: &mut Ui, label: &str, selected: bool, t: &Tokens) -> egui::Response {
+    let font = FontId::proportional(13.5);
+    let text_w = ui.painter().layout_no_wrap(label.to_owned(), font.clone(), t.text).size().x;
+    let width = (text_w + 28.0).max(84.0).min(ui.available_width().max(84.0));
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, modal::BUTTON_HEIGHT), Sense::click());
+    let dark = t.is_dark();
+    let pressed = resp.is_pointer_button_down_on();
+    let hovered = resp.hovered();
+    let (fill, stroke, text_color) = if selected {
+        let bg = if pressed {
+            theme::mix(t.btn_primary_hover, if dark { Color32::WHITE } else { Color32::BLACK }, 0.12)
+        } else if hovered {
+            t.btn_primary_hover
+        } else {
+            t.btn_primary_bg
+        };
+        (bg, Stroke::NONE, t.btn_primary_text)
+    } else if pressed {
+        (t.row_selected, Stroke::new(1.5, t.accent), t.strong)
+    } else if hovered {
+        (t.row_hover, Stroke::new(1.0, t.accent), t.strong)
+    } else {
+        (t.panel, Stroke::new(1.0, t.border), t.text)
+    };
+    let painter = ui.painter();
+    let radius = CornerRadius::same(RADIUS_CONTROL);
+    painter.rect_filled(rect, radius, fill);
+    if stroke.width > 0.0 {
+        painter.rect_stroke(rect, radius, stroke, StrokeKind::Inside);
+    }
+    if resp.has_focus() {
+        painter.rect_stroke(rect.expand(2.0), CornerRadius::same(RADIUS_CONTROL + 2), Stroke::new(2.0, t.accent), StrokeKind::Outside);
+    }
+    painter.with_clip_rect(rect.shrink2(vec2(6.0, 2.0))).text(rect.center(), Align2::CENTER_CENTER, label, font, text_color);
+    let name = label.to_owned();
+    resp.widget_info(move || egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, name.clone()));
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 fn options_page(
     ui: &mut Ui,
     root: &std::path::Path,
@@ -481,6 +534,7 @@ fn options_page(
     ui_language: &str,
     languages: &[crate::i18n::LanguageChoice],
     ui_scale: u16,
+    layout_mode: UiLayoutMode,
     update: &crate::update::Status,
     t: &Tokens,
     acts: &mut Vec<Act>,
@@ -495,10 +549,9 @@ fn options_page(
             .find(|language| language.code == ui_language)
             .map_or_else(|| crate::tl_id!("ui.english").to_string(), |language| language.name.clone())
     };
-    egui::ComboBox::from_label(crate::tl_id!("ui.interface_language"))
-        .selected_text(selected)
-        .popup_style(crate::theme::picker_popup_style(*t))
-        .show_ui(ui, |ui| {
+    egui::ComboBox::from_label(crate::tl_id!("ui.interface_language")).selected_text(selected).popup_style(theme::picker_popup_style(*t)).show_ui(
+        ui,
+        |ui| {
             if ui.selectable_label(ui_language == crate::i18n::AUTO, automatic).clicked() {
                 acts.push(Act::SetUiLanguage(crate::i18n::AUTO.into()));
                 ui.close();
@@ -514,11 +567,12 @@ fn options_page(
                     ui.close();
                 }
             }
-        });
+        },
+    );
     ui.add_space(8.0);
     egui::ComboBox::from_label(crate::tl_id!("ui.interface_size"))
         .selected_text(scale_label(ui_scale))
-        .popup_style(crate::theme::picker_popup_style(*t))
+        .popup_style(theme::picker_popup_style(*t))
         .show_ui(ui, |ui| {
             for percent in UI_SCALES {
                 if ui.selectable_label(ui_scale == percent, scale_label(percent)).clicked() {
@@ -529,13 +583,22 @@ fn options_page(
         });
     ui.label(egui::RichText::new(crate::tl_id!("ui.interface_size_hint")).size(11.5).color(t.muted));
     ui.add_space(12.0);
-    ui.label(egui::RichText::new(crate::tl_id!("ui.tablet_and_cloud_sync_heading")).strong().size(15.0).color(t.strong));
+    ui.label(egui::RichText::new(crate::tl_id!("ui.layout_mode_label")).strong().size(15.0).color(t.strong));
+    ui.add_space(4.0);
     ui.horizontal_wrapped(|ui| {
-        if open_action(ui, crate::tl_id!("ui.kdrive_sync_open_btn"), 210.0, 34.0, t, true).clicked() {
-            acts.push(Act::OpenCloudSync);
+        for mode in [UiLayoutMode::Auto, UiLayoutMode::ClassicRibbon, UiLayoutMode::TabletStudio] {
+            if layout_choice_button(ui, layout_mode_label(mode), layout_mode == mode, t).clicked() && layout_mode != mode {
+                acts.push(Act::SetLayoutMode(mode));
+            }
         }
-        if open_action(ui, crate::tl_id!("ui.toggle_studio_layout_btn"), 220.0, 34.0, t, false).clicked() {
-            acts.push(Act::ToggleStudioLayout);
+    });
+    ui.label(egui::RichText::new(crate::tl_id!("ui.layout_mode_hint")).size(11.5).color(t.muted));
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new(crate::tl_id!("ui.tablet_and_cloud_sync_heading")).strong().size(15.0).color(t.strong));
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        if modal::primary_button(ui, crate::tl_id!("ui.kdrive_sync_open_btn"), t).clicked() {
+            acts.push(Act::OpenCloudSync);
         }
     });
     ui.add_space(12.0);
@@ -547,10 +610,10 @@ fn options_page(
     ui.add_space(12.0);
     ui.label(egui::RichText::new(crate::tl_id!("ui.local_diagnostics_and_usage")).strong().size(15.0).color(t.strong));
     ui.label(egui::RichText::new(crate::tl_id!("ui.choose_what_nocturne_records_locally_nothing_is_upl_fc372d68e8")).size(12.0).color(t.muted));
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(egui::RichText::new(crate::tl_id!("ui.level")).strong());
         let selected_level = crate::tl!(level);
-        egui::ComboBox::from_id_salt("telemetry-level").selected_text(selected_level).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt("telemetry-level").selected_text(selected_level).popup_style(theme::picker_popup_style(*t)).show_ui(ui, |ui| {
             for choice in ["none", "usage", "warning", "error", "debug"] {
                 if ui.selectable_label(level == choice, crate::tl!(choice)).clicked() {
                     acts.push(Act::SetTelemetryLevel(choice.into()));
@@ -566,46 +629,36 @@ fn options_page(
     let folder = root.display().to_string();
     let label = crate::i18n::format_message_id("ui.folder_folder", &[("folder", &folder)]);
     ui.label(egui::RichText::new(label).strong().size(11.0).color(t.text));
-    ui.horizontal(|ui| {
-        if open_action(ui, crate::tl_id!("ui.open_telemetry_folder"), 190.0, 34.0, t, true).clicked() {
-            acts.push(Act::OpenTelemetryFolder(root.to_path_buf()));
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        #[cfg(not(target_os = "ios"))]
+        {
+            if modal::secondary_button(ui, crate::tl_id!("ui.open_telemetry_folder"), t).clicked() {
+                acts.push(Act::OpenTelemetryFolder(root.to_path_buf()));
+            }
+            if modal::primary_button(ui, crate::tl_id!("ui.export_current_session_zip"), t).clicked() {
+                acts.push(Act::ExportTelemetry(root.to_path_buf()));
+            }
         }
-        if open_action(ui, crate::tl_id!("ui.export_current_session_zip"), 220.0, 34.0, t, true).clicked() {
-            acts.push(Act::ExportTelemetry(root.to_path_buf()));
-        }
-        if open_action(ui, crate::tl_id!("ui.clear_telemetry"), 150.0, 34.0, t, true).clicked() {
+        if modal::danger_button(ui, crate::tl_id!("ui.clear_telemetry"), t).clicked() {
             acts.push(Act::ClearTelemetry(root.to_path_buf()));
         }
     });
-    ui.add_space(12.0);
-    ui.label(egui::RichText::new(crate::tl_id!("ui.export_creates_a_user_selected_zip_then_removes_the_66f2bf3400")).size(11.5).color(t.muted));
-    ui.add_space(18.0);
-    ui.separator();
+    #[cfg(not(target_os = "ios"))]
+    {
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new(crate::tl_id!("ui.export_creates_a_user_selected_zip_then_removes_the_66f2bf3400")).size(11.5).color(t.muted));
+    }
+    ui.add_space(16.0);
+    modal::hairline(ui, t);
+    ui.add_space(8.0);
     ui.label(egui::RichText::new(crate::tl_id!("ui.application_preferences")).strong().size(15.0).color(t.strong));
     ui.label(egui::RichText::new(crate::tl_id!("ui.reset_themes_layout_ribbon_choices_and_other_saved_n_61cc3d1cfb")).size(11.5).color(t.muted));
     ui.colored_label(t.warn, crate::tl_id!("ui.this_does_not_delete_notebooks_or_pages_it_cannot_be_undone"));
-    if warning_action(ui, crate::tl_id!("ui.reset_app_preferences_2"), 210.0, 34.0, t).clicked() {
+    ui.add_space(4.0);
+    if modal::danger_button(ui, crate::tl_id!("ui.reset_app_preferences_2"), t).clicked() {
         acts.push(Act::ResetPreferences);
     }
-}
-
-fn warning_action(ui: &mut Ui, label: &str, width: f32, height: f32, t: &Tokens) -> egui::Response {
-    let response = ui
-        .add(
-            egui::Button::new(egui::RichText::new(label).size(14.0).color(t.warn))
-                .min_size(vec2(width, height))
-                .fill(t.panel)
-                .stroke(egui::Stroke::new(1.0, t.warn)),
-        )
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(label);
-    if response.hovered() {
-        ui.painter().rect_stroke(response.rect, 4.0, egui::Stroke::new(2.0, t.warn), egui::StrokeKind::Inside);
-    }
-    if response.is_pointer_button_down_on() {
-        ui.painter().rect_stroke(response.rect, 4.0, egui::Stroke::new(3.0, t.strong), egui::StrokeKind::Inside);
-    }
-    response
 }
 
 #[cfg(test)]
@@ -639,6 +692,7 @@ mod tests {
                 crate::i18n::AUTO,
                 &crate::i18n::available_languages(),
                 100,
+                UiLayoutMode::Auto,
                 &crate::update::Status::Idle,
                 &t,
             );
@@ -647,5 +701,38 @@ mod tests {
         assert_eq!(acts, Vec::new(), "the About page asked for something nobody clicked");
         assert!(REPOSITORY.starts_with("https://github.com/"), "{REPOSITORY}");
         assert!(!VERSION.is_empty());
+    }
+
+    #[test]
+    fn options_page_renders_across_all_themes_and_split_view() {
+        let languages = crate::i18n::available_languages();
+        for theme in crate::theme::Theme::all() {
+            let t = theme.tokens();
+            let ctx = egui::Context::default();
+            ctx.set_visuals(theme.visuals());
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(360.0, 480.0))), ..Default::default() };
+            let mut acts = Vec::new();
+            let mut out = ctx.run_ui(input, |ui| {
+                acts = show(
+                    ui,
+                    &[],
+                    &[],
+                    "/notebooks",
+                    "Options",
+                    &|p| p.to_string_lossy().into_owned(),
+                    std::path::Path::new("/telemetry"),
+                    "none",
+                    Some("sess-1"),
+                    crate::i18n::AUTO,
+                    &languages,
+                    100,
+                    UiLayoutMode::TabletStudio,
+                    &crate::update::Status::Idle,
+                    &t,
+                );
+            });
+            out.textures_delta.clear();
+            assert!(acts.is_empty(), "{}: unexpected acts on idle render", theme.label());
+        }
     }
 }

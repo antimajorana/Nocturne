@@ -186,14 +186,21 @@ fn arrow_points(from: (f32, f32), to: (f32, f32)) -> Vec<(f32, f32)> {
 
 /// A rectangle with its corners cut round, traced corner by corner.
 fn rounded(left: f32, top: f32, right: f32, bottom: f32) -> Vec<(f32, f32)> {
-    let r = ((right - left).abs().min((bottom - top).abs()) * 0.2).clamp(2.0, 40.0);
+    let width = (right - left).abs();
+    let height = (bottom - top).abs();
+    let short = width.min(height);
+    let max_r = (0.5 * short).max(0.0);
+    let r = (short * 0.2).clamp(2.0, 40.0).min(max_r);
+    if r <= f32::EPSILON {
+        return vec![(left, top), (right, top), (right, bottom), (left, bottom), (left, top)];
+    }
     let corner = |cx: f32, cy: f32, from: f32| {
         (0..=6).map(move |i| {
             let a = from + i as f32 / 6.0 * std::f32::consts::FRAC_PI_2;
             (cx + r * a.cos(), cy + r * a.sin())
         })
     };
-    let mut out: Vec<(f32, f32)> = Vec::with_capacity(32);
+    let mut out: Vec<(f32, f32)> = Vec::with_capacity(34);
     out.push((left + r, top));
     out.push((right - r, top));
     out.extend(corner(right - r, top + r, -std::f32::consts::FRAC_PI_2));
@@ -286,5 +293,62 @@ mod tests {
             assert_eq!(Shape::parse(&shape.id().to_uppercase()), Some(shape));
         }
         assert_eq!(Shape::parse("hexagon"), None);
+    }
+
+    #[test]
+    fn thin_rounded_rectangles_clamp_corner_radius_and_never_invert() {
+        let cases: [((f32, f32), (f32, f32)); 10] = [
+            // Thin horizontal bands (including zero height)
+            ((10.0, 20.0), (110.0, 20.0)),
+            ((10.0, 20.0), (110.0, 20.5)),
+            ((10.0, 20.0), (110.0, 21.0)),
+            ((10.0, 20.0), (110.0, 22.0)),
+            ((10.0, 20.0), (110.0, 23.5)),
+            ((10.0, 20.0), (110.0, 24.0)),
+            // Thin vertical bands (including zero width and reversed drag)
+            ((20.0, 10.0), (20.0, 110.0)),
+            ((20.0, 10.0), (20.5, 110.0)),
+            ((22.0, 110.0), (20.0, 10.0)),
+            ((23.5, 10.0), (20.0, 110.0)),
+        ];
+        for (from, to) in cases {
+            let (left, right) = (from.0.min(to.0), from.0.max(to.0));
+            let (top, bottom) = (from.1.min(to.1), from.1.max(to.1));
+            let pts = rounded(left, top, right, bottom);
+            assert!(pts.len() >= 5, "non-empty outline for {from:?}..{to:?}");
+            for &(x, y) in &pts {
+                assert!(
+                    x.is_finite() && y.is_finite() && x >= left - 1e-4 && x <= right + 1e-4 && y >= top - 1e-4 && y <= bottom + 1e-4,
+                    "rounded rect {from:?}..{to:?} escaped bounds at ({x}, {y})"
+                );
+            }
+            // In screen coordinates (+y down), a non-inverted clockwise outline has non-negative
+            // signed area, and a thin non-zero-area rect has strictly positive area.
+            let signed_area2: f32 = pts.windows(2).map(|w| w[0].0 * w[1].1 - w[1].0 * w[0].1).sum();
+            let width = right - left;
+            let height = bottom - top;
+            if width > 0.0 && height > 0.0 {
+                assert!(signed_area2 > 0.0, "inverted/bow-tie rounded rect for {from:?}..{to:?}: 2*area={signed_area2}");
+                // Check straight side endpoints never cross over each other.
+                assert!(pts[0].0 <= pts[1].0 + 1e-4, "top edge reversed for {from:?}..{to:?}: {:?} -> {:?}", pts[0], pts[1]);
+                assert!(pts[8].1 <= pts[9].1 + 1e-4, "right edge reversed for {from:?}..{to:?}: {:?} -> {:?}", pts[8], pts[9]);
+                assert!(pts[16].0 >= pts[17].0 - 1e-4, "bottom edge reversed for {from:?}..{to:?}: {:?} -> {:?}", pts[16], pts[17]);
+                assert!(pts[24].1 >= pts[25].1 - 1e-4, "left edge reversed for {from:?}..{to:?}: {:?} -> {:?}", pts[24], pts[25]);
+            }
+
+            let dabs = trace(Shape::RoundedRectangle, from, to, 0.7);
+            assert!(dabs.len() >= 2);
+            let (dl, dt, dr, db) = box_of(&dabs);
+            assert!(
+                dl >= left - 1e-3 && dr <= right + 1e-3 && dt >= top - 1e-3 && db <= bottom + 1e-3,
+                "traced dabs escaped box for {from:?}..{to:?}: {dl},{dt}..{dr},{db}"
+            );
+        }
+
+        // Normal rounded rectangles keep their 20% radius (clamped to [2, 40]).
+        let normal = rounded(0.0, 0.0, 100.0, 100.0);
+        assert!((normal[0].0 - 20.0).abs() < 1e-4 && (normal[1].0 - 80.0).abs() < 1e-4);
+        let large = rounded(0.0, 0.0, 300.0, 300.0);
+        assert!((large[0].0 - 40.0).abs() < 1e-4 && (large[1].0 - 260.0).abs() < 1e-4);
     }
 }

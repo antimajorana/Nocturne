@@ -410,7 +410,7 @@ Choose the service that reads handwritten equations, and give it its key.
 
 Parameters:
 
-- provider (optional): anthropic, gemini, openai, mathpix, or custom
+- provider (optional): apple_vision, local_model, anthropic, gemini, openai, mathpix, or custom
 - endpoint (optional): the service's address, https only unless it is on this machine; default for the service's own
 - model (optional): the model to ask; default for the service's own
 - key (optional): the service's key, kept outside the settings file and never shown
@@ -426,6 +426,12 @@ Parameters:
 
 - path (required): the page
 - strokes (optional): which strokes, by position, comma separated; default: all of them
+
+## `ink.math_ocr_remove_model`
+
+Remove the downloaded on-device math recognition model files.
+
+No parameters.
 
 ## `ink.configure_tools`
 
@@ -450,6 +456,14 @@ Choose how Tablet Studio shows the notebooks and pages.
 Parameters:
 
 - view (optional): studio_grid, classic_tree, or toggle; without it, reports the current view
+
+## `ui.layout_mode`
+
+Choose whether Nocturne uses Tablet Studio, Classic Ribbon, or automatic layout.
+
+Parameters:
+
+- mode (optional): auto, tablet_studio (or tablet), or classic_ribbon (or classic); without it, reports the current mode
 
 ## `sync.status`
 

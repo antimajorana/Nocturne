@@ -556,7 +556,11 @@ pub fn show(ui: &mut Ui, state: &mut State, entries: &[Entry], dir: &Path, t: &T
         });
         let divider =
             ui.allocate_rect(Rect::from_min_size(ui.cursor().min, vec2(8.0, height)), Sense::drag()).on_hover_cursor(CursorIcon::ResizeHorizontal);
-        ui.painter().rect_filled(divider.rect.shrink2(vec2(3.0, 0.0)), 1.0, if divider.hovered() || divider.dragged() { t.accent } else { t.faint });
+        ui.painter().rect_filled(
+            divider.rect.shrink2(vec2(3.0, 0.0)),
+            1.0,
+            if divider.hovered() || divider.dragged() { t.accent } else { t.border_subtle },
+        );
         if divider.dragged() {
             state.list_width = clamp_list_width(state.list_width + divider.drag_delta().x, available);
         }

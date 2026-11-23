@@ -22,7 +22,7 @@ mod tool_state;
 pub use commands::{CommandSpec, Output, Params, registry};
 pub use error::EngineError;
 pub use json::{commands_json, output_json, params_from_json};
-pub use ocr::base64;
+pub use ocr::{NativeOcrBackend, VisionObservation, base64};
 pub use session::Session;
 pub use sync::{
     DEFAULT_KDRIVE_ENDPOINT, DEFAULT_KDRIVE_REMOTE_PATH, KDRIVE_TOKEN_KEY, SecretStore, StagedSync, SyncConfig, SyncError, SyncHttpClient,
@@ -30,5 +30,5 @@ pub use sync::{
 };
 pub use tool_state::{
     DockRoster, DockTool, ERASER_SIZES, EraserKind, EraserToggleMode, InkActiveMode, InkOptions, InkPenKind, InkToolState, LibraryView,
-    MAX_ERASER_WIDTH, MIN_ERASER_WIDTH, StudioOptions, ToolbarDock,
+    MAX_ERASER_WIDTH, MIN_ERASER_WIDTH, StudioOptions, ToolbarDock, UiLayoutMode,
 };

@@ -10,11 +10,14 @@ use crate::sync::{KDRIVE_TOKEN_KEY, SyncConfig, SyncError, SyncReport};
 use nocturne_store::Settings;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const STAGE_DIR_NAME: &str = ".nocturne-sync-stage";
 const TRASH_DIR_NAME: &str = ".sync-trash";
 const MAX_SAFE_DELETE_COUNT: usize = 10;
+
+static STAGE_RUN_SEQ: AtomicU64 = AtomicU64::new(1);
+static WRITE_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug)]
 struct StagedDownload {
@@ -48,10 +51,23 @@ pub struct StagedSync {
     pub discovered_drive_id: Option<u64>,
 }
 
+impl Drop for StagedSync {
+    fn drop(&mut self) {
+        if self.stage_dir.exists() {
+            let _ = std::fs::remove_dir_all(&self.stage_dir);
+        }
+    }
+}
+
 impl StagedSync {
-    /// Relative paths of local files that will be written or trashed when [`apply_staged_sync`] runs.
+    /// Relative paths of local files that were written or will be written/trashed by this sync pass.
     pub fn touched_local_paths(&self) -> Vec<&str> {
-        self.downloads.iter().map(|d| d.rel_path.as_str()).chain(self.local_trashes.iter().map(|t| t.rel_path.as_str())).collect()
+        self.downloads
+            .iter()
+            .map(|d| d.rel_path.as_str())
+            .chain(self.local_trashes.iter().map(|t| t.rel_path.as_str()))
+            .chain(self.report.conflicts.iter().map(String::as_str))
+            .collect()
     }
 }
 
@@ -91,18 +107,21 @@ pub fn stage_sync(
 
     let now = unix_now_secs();
     let stage_parent = local_root.join(STAGE_DIR_NAME);
+    let pid_tag = format!("-{}-", std::process::id());
     let pid_suffix = format!("-{}", std::process::id());
     if let Ok(entries) = std::fs::read_dir(&stage_parent) {
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str()
                 && name.starts_with("run-")
+                && !name.contains(&pid_tag)
                 && !name.ends_with(&pid_suffix)
             {
                 let _ = std::fs::remove_dir_all(entry.path());
             }
         }
     }
-    let stage_dir = stage_parent.join(format!("run-{now}{pid_suffix}"));
+    let seq = STAGE_RUN_SEQ.fetch_add(1, Ordering::Relaxed);
+    let stage_dir = stage_parent.join(format!("run-{now}{pid_tag}{seq}"));
     let _ = std::fs::remove_dir_all(&stage_dir);
     std::fs::create_dir_all(&stage_dir).map_err(|e| SyncError::Io(format!("create stage dir {}: {e}", stage_dir.display())))?;
 
@@ -295,8 +314,7 @@ fn stage_sync_into_dir(
                             );
                             report.uploaded.push(rel);
                         } else {
-                            let conflict_rel = conflict_rel_path(&rel, now);
-                            let conflict_dest = local_path_for(local_root, &conflict_rel)?;
+                            let (conflict_rel, conflict_dest) = unique_conflict_dest(local_root, &rel, now)?;
                             write_staged_to_dest(&staged.staged_file, &conflict_dest)?;
                             report.conflicts.push(conflict_rel);
                             let (uploaded, sent_sha, sent_size) =
@@ -333,8 +351,7 @@ fn stage_sync_into_dir(
                     );
                     report.unchanged += 1;
                 } else {
-                    let conflict_rel = conflict_rel_path(&rel, now);
-                    let conflict_dest = local_path_for(local_root, &conflict_rel)?;
+                    let (conflict_rel, conflict_dest) = unique_conflict_dest(local_root, &rel, now)?;
                     write_staged_to_dest(&staged.staged_file, &conflict_dest)?;
                     report.conflicts.push(conflict_rel);
                     let (uploaded, sent_sha, sent_size) = upload_local_rel(client, drive_id, sync_root_id, local_root, &rel, l, &mut remote_dirs)?;
@@ -404,6 +421,9 @@ fn stage_sync_into_dir(
     }
 
     for (rel, file_id) in planned_remote_deletes {
+        if cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            return Err(SyncError::Cancelled);
+        }
         client.trash_file(drive_id, file_id)?;
         next_manifest.remove(&rel);
         report.trashed_remote.push(rel);
@@ -475,7 +495,8 @@ fn stage_remote_download(
 /// target so concurrent local edits made during the sync are never overwritten.
 pub fn apply_staged_sync(mut staged: StagedSync, settings: &Settings) -> Result<SyncReport, SyncError> {
     let now = unix_now_secs();
-    for dl in staged.downloads {
+    let downloads = std::mem::take(&mut staged.downloads);
+    for dl in downloads {
         let dest = local_path_for(&staged.local_root, &dl.rel_path)?;
         let current_sha = if dest.is_file() { Some(sha256_file(&dest)?.0) } else { None };
         let concurrent_change = current_sha != dl.expected_local_sha256;
@@ -512,8 +533,7 @@ pub fn apply_staged_sync(mut staged: StagedSync, settings: &Settings) -> Result<
                 );
                 continue;
             }
-            let conflict_rel = conflict_rel_path(&dl.rel_path, now);
-            let conflict_dest = local_path_for(&staged.local_root, &conflict_rel)?;
+            let (conflict_rel, conflict_dest) = unique_conflict_dest(&staged.local_root, &dl.rel_path, now)?;
             write_staged_to_dest(&dl.staged_file, &conflict_dest)?;
             staged.report.conflicts.push(conflict_rel);
             // Record the remote fingerprint we just materialized into `.conflict-<ts>` while keeping
@@ -552,7 +572,8 @@ pub fn apply_staged_sync(mut staged: StagedSync, settings: &Settings) -> Result<
         staged.report.downloaded.push(dl.rel_path);
     }
 
-    for tr in staged.local_trashes {
+    let local_trashes = std::mem::take(&mut staged.local_trashes);
+    for tr in local_trashes {
         let dest = local_path_for(&staged.local_root, &tr.rel_path)?;
         if dest.is_file()
             && let Ok((cur_sha, _)) = sha256_file(&dest)
@@ -575,7 +596,7 @@ pub fn apply_staged_sync(mut staged: StagedSync, settings: &Settings) -> Result<
     staged.report.finished_unix_secs = unix_now_secs();
     save_manifest(&staged.manifest_path, &staged.target_key, &staged.manifest_entries)?;
     SyncConfig::record_last_sync(settings, &staged.report);
-    Ok(staged.report)
+    Ok(std::mem::take(&mut staged.report))
 }
 
 pub fn run_sync_blocking(
@@ -605,19 +626,37 @@ fn local_path_for(local_root: &Path, rel_path: &str) -> Result<PathBuf, SyncErro
     Ok(out)
 }
 
-fn conflict_rel_path(rel_path: &str, ts: u64) -> String {
+fn conflict_rel_path(rel_path: &str, ts: u64, suffix: Option<usize>) -> String {
     let (dir, name) = match rel_path.rsplit_once('/') {
         Some((d, n)) => (Some(d), n),
         None => (None, rel_path),
     };
+    let tag = match suffix {
+        Some(n) => format!("conflict-{ts}-{n}"),
+        None => format!("conflict-{ts}"),
+    };
     let conflict_name = match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => format!("{stem}.conflict-{ts}.{ext}"),
-        _ => format!("{name}.conflict-{ts}"),
+        Some((stem, ext)) if !stem.is_empty() => format!("{stem}.{tag}.{ext}"),
+        _ => format!("{name}.{tag}"),
     };
     match dir {
         Some(d) => format!("{d}/{conflict_name}"),
         None => conflict_name,
     }
+}
+
+/// Allocates a conflict copy path under `local_root` that does not collide with any existing file,
+/// guaranteeing an earlier conflict copy is never overwritten within the same timestamp second.
+fn unique_conflict_dest(local_root: &Path, rel_path: &str, ts: u64) -> Result<(String, PathBuf), SyncError> {
+    for attempt in 0usize..10_000 {
+        let suffix = if attempt == 0 { None } else { Some(attempt + 1) };
+        let rel = conflict_rel_path(rel_path, ts, suffix);
+        let dest = local_path_for(local_root, &rel)?;
+        if !dest.exists() {
+            return Ok((rel, dest));
+        }
+    }
+    Err(SyncError::Io(format!("could not allocate unique conflict filename for {rel_path}")))
 }
 
 fn write_staged_to_dest(staged_file: &Path, dest: &Path) -> Result<(), SyncError> {
@@ -634,7 +673,10 @@ fn write_staged_to_dest(staged_file: &Path, dest: &Path) -> Result<(), SyncError
         let _ = std::fs::remove_file(staged_file);
         return Ok(());
     }
-    let tmp = dest.with_extension("tmp-write");
+    let seq = WRITE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let base = dest.file_name().and_then(|n| n.to_str()).unwrap_or("sync");
+    let tmp_name = format!(".{base}.{}.{seq}.tmp-write", std::process::id());
+    let tmp = dest.parent().map_or_else(|| PathBuf::from(&tmp_name), |p| p.join(&tmp_name));
     std::fs::copy(staged_file, &tmp).map_err(|e| SyncError::Io(format!("copy to {}: {e}", tmp.display())))?;
     let _ = std::fs::remove_file(staged_file);
     std::fs::rename(&tmp, dest).map_err(|e| {

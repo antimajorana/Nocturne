@@ -161,7 +161,8 @@ fn recognition_starts_off_and_while_off_nothing_is_sent() {
     let server = Server::start();
     let mut s = session(&t);
     assert!(!s.ocr_config().enabled, "off until the owner turns it on");
-    assert_eq!(s.ocr_config().provider, OcrProvider::Anthropic);
+    let expected_default = if cfg!(any(target_os = "ios", target_os = "macos")) { OcrProvider::AppleVision } else { OcrProvider::Anthropic };
+    assert_eq!(s.ocr_config().provider, expected_default);
     for id in ["ink.math_ocr_toggle", "ink.math_ocr_configure", "ink.math_ocr_convert"] {
         let spec = registry().iter().find(|c| c.id == id).unwrap_or_else(|| panic!("{id} is a command"));
         assert!(!spec.changes_tree, "{id} does not change the notebooks");
@@ -460,6 +461,11 @@ fn an_answer_is_tidied_to_one_line_of_bare_latex() {
         ("  $$\n\\frac{a}{b}\n$$  ", "\\frac{a}{b}"),
         ("```latex\n\\alpha\n```", "\\alpha"),
         ("```\n\\beta\n```", "\\beta"),
+        ("```latex x^2 ```", "x^2"),
+        ("```tex \\frac{1}{2}```", "\\frac{1}{2}"),
+        ("```x^2```", "x^2"),
+        ("```a + b```", "a + b"),
+        ("```latex $x^2$ ```", "x^2"),
         ("\\[ a \\]", "a"),
         ("\\( a \\)", "a"),
         ("$a$", "a"),
@@ -471,6 +477,8 @@ fn an_answer_is_tidied_to_one_line_of_bare_latex() {
         assert_eq!(ocr::clean_latex(raw), want, "{raw:?}");
     }
     assert_eq!(ocr::clean_latex("```\n```"), "");
+    assert_eq!(ocr::clean_latex("```latex```"), "");
+    assert_eq!(ocr::clean_latex("``````"), "");
 }
 
 #[test]
@@ -525,4 +533,139 @@ fn the_convert_command_reads_a_pages_ink_and_gives_back_latex() {
     s.run("ink.math_ocr_toggle", &p(&[("enabled", "false")])).expect("off");
     assert!(s.run("ink.math_ocr_convert", &p(&[("path", at)])).is_err());
     assert_eq!(server.count(), before, "off means no request");
+}
+
+#[test]
+fn cross_provider_switch_cannot_leak_key_to_new_endpoint_or_corrupt_mathpix_app_id() {
+    let t = TempDir::new("math-ocr-isolation");
+    let first = Server::start();
+    let second = Server::start();
+
+    // Configure OpenAI at `first`, switch to Anthropic, then switch back to OpenAI at `second`
+    // WITHOUT a new key: the old OpenAI key bound to `first` must be forgotten and never sent to `second`.
+    let mut s = ready(&t, &first, "openai", &[]);
+    s.run("ink.math_ocr_configure", &p(&[("provider", "anthropic")])).expect("switch away");
+    let back = json_of(s.run("ink.math_ocr_configure", &p(&[("provider", "openai"), ("endpoint", &second.endpoint)])).expect("switch back"));
+    assert_eq!(back["has_key"], false, "key bound to first endpoint must not survive move via another provider");
+    assert!(matches!(recognise(&s), Err(OcrError::NotConfigured(_))));
+    assert_eq!(first.count() + second.count(), 0);
+
+    // Same when switching back to the provider's default endpoint (not `first`):
+    let mut s = ready(&t, &first, "openai", &[]);
+    s.run("ink.math_ocr_configure", &p(&[("provider", "gemini")])).expect("switch to gemini");
+    let back_default = json_of(s.run("ink.math_ocr_configure", &p(&[("provider", "openai")])).expect("back to default"));
+    assert_eq!(back_default["has_key"], false, "key bound to custom endpoint must not leak to default endpoint");
+
+    // Passing `app_id` while configuring a non-Mathpix provider must NOT overwrite Mathpix's app_id,
+    // and moving Mathpix's endpoint with only a new `key` must forget the old `app_id`.
+    let mut s = ready(&t, &first, "mathpix", &[("app_id", "real-mathpix-app")]);
+    assert!(s.ocr_credentials_complete(OcrProvider::Mathpix));
+    s.run("ink.math_ocr_configure", &p(&[("provider", "openai"), ("app_id", "bogus-app")])).expect("openai with app_id");
+    assert_eq!(s.sync_secrets().get_secret("ocr_app_id_mathpix").expect("secret").as_deref(), Some("real-mathpix-app"));
+
+    let moved = json_of(
+        s.run("ink.math_ocr_configure", &p(&[("provider", "mathpix"), ("endpoint", &second.endpoint), ("key", "new-key")])).expect("move mathpix"),
+    );
+    assert_eq!(moved["has_key"], true);
+    assert_eq!(moved["has_app_id"], false, "old mathpix app_id must be cleared when moving endpoint");
+    assert!(!s.ocr_credentials_complete(OcrProvider::Mathpix));
+}
+
+#[test]
+fn gemini_filters_thought_parts_and_mathpix_handles_empty_styled_and_auth_error() {
+    let t = TempDir::new("math-ocr-gemini-mathpix-fixes");
+    let server = Server::start();
+
+    let s = ready(&t, &server, "gemini", &[]);
+    server.reply(
+        200,
+        json!({
+            "candidates": [{
+                "finishReason": "STOP",
+                "content": {
+                    "parts": [
+                        { "thought": true, "text": "Let me examine the strokes carefully. Looks like x squared." },
+                        { "text": "```latex x^2 ```" }
+                    ]
+                }
+            }]
+        }),
+    );
+    assert_eq!(recognise(&s).expect("gemini non-thought latex"), "x^2");
+
+    // Only thought parts + MAX_TOKENS -> Truncated (not BadReply, not thought leakage).
+    server.reply(
+        200,
+        json!({
+            "candidates": [{
+                "finishReason": "MAX_TOKENS",
+                "content": {
+                    "parts": [{ "thought": true, "text": "still thinking..." }]
+                }
+            }]
+        }),
+    );
+    assert!(matches!(recognise(&s), Err(OcrError::Truncated)));
+
+    // Mathpix: delimiter-only `latex_styled` falls back to `text`; auth error_info returns Auth.
+    let s = ready(&t, &server, "mathpix", &[("app_id", "app-1")]);
+    server.reply(200, json!({ "latex_styled": "$$ $$", "text": "\\( \\alpha + \\beta \\)" }));
+    assert_eq!(recognise(&s).expect("fallback to text"), "\\alpha + \\beta");
+
+    server.reply(200, json!({ "error": "Invalid credentials", "error_info": { "id": "http_unauthorized" } }));
+    assert!(matches!(recognise(&s), Err(OcrError::Auth)));
+}
+
+#[test]
+fn apple_vision_backend_and_local_model_provider_wire_through_session_without_network() {
+    use nocturne_engine::sync::UnsupportedSyncClient;
+    use nocturne_engine::{NativeOcrBackend, VisionObservation};
+
+    struct FixedVisionBackend;
+    impl NativeOcrBackend for FixedVisionBackend {
+        fn recognize_png(&self, png_bytes: &[u8]) -> Result<Vec<VisionObservation>, OcrError> {
+            assert!(png_bytes.starts_with(b"\x89PNG"), "receives real rasterized PNG bytes");
+            Ok(vec![
+                VisionObservation::new("x", 0.10, 0.40, 0.10, 0.20, 0.99),
+                VisionObservation::new("2", 0.21, 0.30, 0.06, 0.11, 0.99),
+                VisionObservation::new("+", 0.32, 0.43, 0.08, 0.14, 0.99),
+                VisionObservation::new("π", 0.44, 0.40, 0.10, 0.20, 0.99),
+            ])
+        }
+    }
+
+    let t = TempDir::new("math-ocr-on-device");
+    let mut s = session(&t);
+    s.set_sync_backends(Arc::new(UnsupportedSyncClient::new("offline")), s.sync_secrets());
+    s.run("ink.math_ocr_toggle", &p(&[("enabled", "true")])).expect("on");
+
+    // AppleVision without backend -> Unsupported.
+    let st = json_of(s.run("ink.math_ocr_configure", &p(&[("provider", "apple_vision")])).expect("apple_vision"));
+    assert_eq!(st["provider"], "apple_vision");
+    assert_eq!(st["ready"], false);
+    assert_eq!(st["native_ocr_available"], false);
+    assert!(matches!(s.math_ocr_job(&plus()), Err(OcrError::Unsupported)));
+
+    // Install NativeOcrBackend -> works completely offline!
+    s.set_native_ocr_backend(Arc::new(FixedVisionBackend));
+    let st = json_of(s.run("ink.math_ocr_configure", &Params::new()).expect("status"));
+    assert_eq!(st["ready"], true);
+    assert_eq!(st["native_ocr_available"], true);
+    let job = s.math_ocr_job(&plus()).expect("apple vision job");
+    assert_eq!(ocr::recognize(&*s.sync_http(), &job).expect("latex"), "x^{2} + \\pi");
+
+    // LocalModel before download -> NotConfigured; remove_model command exists and succeeds cleanly.
+    let st = json_of(s.run("ink.math_ocr_configure", &p(&[("provider", "local_model")])).expect("local_model"));
+    assert_eq!(st["provider"], "local_model");
+    assert_eq!(st["model"], ocr::local_model::MODEL_ID);
+    assert_eq!(st["model_installed"], false);
+    assert_eq!(st["ready"], false);
+    assert!(matches!(s.math_ocr_job(&plus()), Err(OcrError::NotConfigured(_))));
+
+    assert!(registry().iter().any(|c| c.id == "ink.math_ocr_remove_model" && !c.changes_tree));
+    std::fs::create_dir_all(s.ocr_model_dir()).expect("dir");
+    std::fs::write(s.ocr_model_dir().join(ocr::local_model::TOKENIZER_FILE), b"{}").expect("partial file");
+    let removed = json_of(s.run("ink.math_ocr_remove_model", &Params::new()).expect("remove"));
+    assert_eq!(removed, json!({ "removed": true, "model_installed": false }));
+    assert!(!s.ocr_model_dir().join(ocr::local_model::TOKENIZER_FILE).exists());
 }

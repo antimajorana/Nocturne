@@ -92,50 +92,18 @@ fn fit_to_width(ui: &Ui, text: &str, size: f32, room: f32) -> String {
 }
 const INDENT: f32 = 14.0;
 
-/// Shared title treatment for modal dialogs. Keeping this here makes dialogs use the
-/// same opaque, theme-owned title band instead of inheriting egui's platform-gray title bar.
-fn modal_frame(tokens: &Tokens) -> egui::Frame {
-    egui::Frame::NONE.fill(tokens.panel).stroke(egui::Stroke::new(1.5, tokens.accent)).inner_margin(egui::Margin::same(16))
-}
-
-// i18n-ui-text: title
-fn modal_title(ui: &mut Ui, tokens: &Tokens, title: &str) {
-    egui::Frame::NONE.fill(tokens.band).inner_margin(egui::Margin::symmetric(12, 8)).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.label(egui::RichText::new(crate::tl!(title)).strong().size(17.0).color(tokens.band_text));
-    });
-    ui.add_space(10.0);
-}
-
-/// Dims the window behind a modal dialog and takes the clicks that miss the dialog, so they do
-/// not reach the page underneath. Returns the backdrop's layer: the dialog's window keeps itself
-/// above it with [`stay_above`].
-fn modal_backdrop(ctx: &egui::Context, id: &str) -> egui::LayerId {
-    let screen = ctx.viewport_rect();
-    egui::Area::new(egui::Id::new(id))
-        .order(egui::Order::Foreground)
-        .fixed_pos(screen.min)
-        .show(ctx, |ui| {
-            let response = ui.allocate_rect(egui::Rect::from_min_size(egui::Pos2::ZERO, screen.size()), egui::Sense::click());
-            ui.painter().rect_filled(response.rect, 0.0, egui::Color32::from_black_alpha(150));
-        })
-        .response
-        .layer_id
-}
-
-/// Keeps a modal dialog's window directly above its backdrop. Both are foreground areas, and egui
-/// raises an area that is clicked to the top of its order: a click on the dimmed backdrop used to
-/// lift it over the dialog, whose buttons could then never be reached again (issue #98).
-fn stay_above(ui: &Ui, backdrop: egui::LayerId) {
-    ui.ctx().set_sublayer(backdrop, ui.layer_id());
-}
-
 /// The text boxes a platform keyboard types into besides the page: each has a fixed id, so the
 /// window can say which one has the keyboard ([`NocturneApp::focused_text_field`]).
 const RENAME_FIELD: &str = "rename-title-field";
 const ADD_FIELD: &str = "add-title-field";
 const NEW_NOTEBOOK_FIELD: &str = "new-notebook-name-field";
 pub(crate) const SEARCH_FIELD: &str = "search-all-pages-field";
+const LINK_TEXT_FIELD: &str = "link-dialog-text";
+const LINK_ADDRESS_FIELD: &str = "link-dialog-address";
+const TABLE_COLUMNS_FIELD: &str = "insert-table-columns";
+const TABLE_ROWS_FIELD: &str = "insert-table-rows";
+const TEMPLATE_NAME_FIELD: &str = "template-name-field";
+const PAGE_TITLE_FIELD: &str = "page-title-box";
 
 /// The one-line name box of a dialog. It asks for the keyboard when the dialog opens, and again
 /// after a click that left nothing with the keyboard, and at no other time.
@@ -146,7 +114,7 @@ pub(crate) const SEARCH_FIELD: &str = "search-all-pages-field";
 /// gets the keyboard back once such a click is over, and a keyboard put away without a click
 /// (the iPad's own hide key) stays away.
 fn name_field(ui: &mut Ui, text: &mut String, id: &str, opened_now: bool) -> egui::Response {
-    let id = egui::Id::new(id);
+    let id = egui::Id::unique(id);
     // A window's first frame only measures it: its widgets are disabled there, and a text box
     // that is disabled gives the keyboard straight back. So the one request waits for the
     // first frame the box can take it.
@@ -157,33 +125,12 @@ fn name_field(ui: &mut Ui, text: &mut String, id: &str, opened_now: bool) -> egu
     if ui.is_enabled() && !ui.is_sizing_pass() && ui.data_mut(|d| d.remove_temp::<bool>(waiting)).unwrap_or(false) {
         ui.memory_mut(|m| m.request_focus(id));
     }
-    let response = ui.add(egui::TextEdit::singleline(text).id(id));
+    let response = ui.add(egui::TextEdit::singleline(text).id(id).desired_width(f32::INFINITY));
     if ui.input(|i| i.pointer.any_click()) && ui.memory(|m| m.focused().is_none()) {
         ui.data_mut(|d| d.insert_temp(waiting, true));
         ui.ctx().request_repaint();
     }
     response
-}
-
-/// Modal actions use a readable size based on their label instead of egui's compact default.
-// i18n-ui-text: label
-fn modal_button(ui: &mut Ui, tokens: &Tokens, label: &str, primary: bool) -> egui::Response {
-    modal_button_enabled(ui, tokens, label, primary, true)
-}
-
-// i18n-ui-text: label
-fn modal_button_enabled(ui: &mut Ui, tokens: &Tokens, label: &str, primary: bool, enabled: bool) -> egui::Response {
-    let label = crate::tl!(label);
-    let width = (label.chars().count() as f32 * 8.0 + 32.0).max(92.0);
-    let fill = if primary { tokens.accent } else { tokens.panel };
-    let text = if primary { tokens.band_text } else { tokens.text };
-    ui.add_enabled(
-        enabled,
-        egui::Button::new(egui::RichText::new(label).size(14.0).color(text))
-            .min_size(vec2(width, 32.0))
-            .fill(fill)
-            .stroke(egui::Stroke::new(1.0, tokens.accent)),
-    )
 }
 
 fn params(pairs: &[(&str, &str)]) -> Params {
@@ -1176,10 +1123,11 @@ pub struct NocturneApp {
     pending_scroll_offset_y: Option<f32>,
     /// Page-space bounding box awaiting second-frame origin measurement after Fit All Content zoom.
     pending_fit_bounds: Option<egui::Rect>,
-    /// UI layout mode (`auto` -> Tablet Studio on iPadOS, Classic Ribbon on desktop).
-    ui_layout_mode: crate::tablet_chrome::UiLayoutMode,
-    /// Whether the infinite-canvas minimap is enabled.
-    show_minimap: bool,
+    /// Cached result of `is_tablet_studio` from the most recent frame (for non-ctx helpers).
+    last_tablet_studio: bool,
+    /// Explicit user override for the infinite-canvas minimap (`None` defaults ON in Tablet Studio,
+    /// OFF in Classic Desktop Ribbon).
+    minimap_override: Option<bool>,
     /// Whether the infinite-canvas minimap body is folded to its compact header chip.
     minimap_collapsed: bool,
     /// Whether lifting the eraser after rubbing out ink returns to the last writing pen.
@@ -1264,6 +1212,7 @@ pub struct NocturneApp {
     pencil_pill_rect: Option<egui::Rect>,
     math_ocr: Option<crate::math_ocr::Conversion>,
     pending_math_ocr_start: bool,
+    ocr_model_download: Option<crate::math_ocr::ModelDownloadWorker>,
     library_grid: crate::library_grid::LibraryGrid,
     /// The sync now running was started by hand, so its result is shown when it ends.
     sync_by_hand: bool,
@@ -1335,9 +1284,21 @@ impl NocturneApp {
             .filter(|percent| backstage::UI_SCALES.contains(percent))
             .unwrap_or(100);
         let wizard_level = session.settings.get("telemetry_level").unwrap_or_else(|| "debug".to_string());
-        let ui_layout_mode =
-            session.settings.get(crate::tablet_chrome::UI_LAYOUT_KEY).map(|v| crate::tablet_chrome::UiLayoutMode::parse(&v)).unwrap_or_default();
-        let show_minimap = session.settings.get("show_minimap").map(|v| !v.trim().eq_ignore_ascii_case("false")).unwrap_or(true);
+        let last_tablet_studio = match session.layout_mode() {
+            nocturne_engine::UiLayoutMode::TabletStudio => true,
+            nocturne_engine::UiLayoutMode::ClassicRibbon => false,
+            nocturne_engine::UiLayoutMode::Auto => cfg!(target_os = "ios"),
+        };
+        let minimap_override = session.settings.get("show_minimap").and_then(|v| {
+            let trimmed = v.trim();
+            if trimmed.eq_ignore_ascii_case("true") {
+                Some(true)
+            } else if trimmed.eq_ignore_ascii_case("false") {
+                Some(false)
+            } else {
+                None
+            }
+        });
         let minimap_collapsed = session.settings.get("minimap_collapsed").map(|v| !v.trim().eq_ignore_ascii_case("false")).unwrap_or(true);
         let eraser_auto_return = session.settings.get("eraser_auto_return").is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
         let library_grid = crate::library_grid::LibraryGrid::load(&session.settings);
@@ -1415,8 +1376,8 @@ impl NocturneApp {
             pending_external_scroll_y: 0.0,
             pending_scroll_offset_y: None,
             pending_fit_bounds: None,
-            ui_layout_mode,
-            show_minimap,
+            last_tablet_studio,
+            minimap_override,
             minimap_collapsed,
             eraser_auto_return,
             sync_has_token: None,
@@ -1459,6 +1420,7 @@ impl NocturneApp {
             pencil_pill_rect: None,
             math_ocr: None,
             pending_math_ocr_start: false,
+            ocr_model_download: None,
             library_grid,
             sync_by_hand: false,
             studio_notice: None,
@@ -1703,15 +1665,6 @@ impl NocturneApp {
         }
         self.effective_mode = if ctx.theme() == egui::Theme::Dark { Mode::Dark } else { Mode::Light };
         self.tokens = self.theme().tokens();
-        // Keep every modal surface opaque and on the same themed panel as the rest of the app.
-        // Individual dialogs may opt out of the native title bar, but they all inherit this
-        // surface and border treatment.
-        for theme in [egui::Theme::Light, egui::Theme::Dark] {
-            ctx.style_mut_of(theme, |style| {
-                style.visuals.window_fill = self.tokens.panel;
-                style.visuals.window_stroke = egui::Stroke::new(1.0, self.tokens.faint);
-            });
-        }
     }
 
     /// Shows paths as `<notebooks>/...` instead of real local paths. Used by tests and
@@ -1781,10 +1734,14 @@ impl NocturneApp {
         self.editor.as_ref().is_some_and(|e| e.writable && e.history.can_redo()) || self.pad.as_ref().is_some_and(crate::inkpad::Pad::can_redo)
     }
 
-    /// Undo for the Quick Access Toolbar: the page's words and boxes (the page history in
-    /// `history.rs`), or the last stroke when the pen was used after anything else on the page,
-    /// or when the page has nothing left to take back but the drawing has.
-    fn undo(&mut self) {
+    /// Undo for the Quick Access Toolbar, Tablet Studio dock, keyboard shortcuts, and platform
+    /// multi-finger tap gestures: undoes the page's words/boxes, the last ink stroke, or both.
+    pub fn undo(&mut self) {
+        let ink_can = self.pad.as_ref().is_some_and(crate::inkpad::Pad::can_undo);
+        let page_can = self.editor.as_ref().is_some_and(|e| e.writable && e.history.can_undo());
+        if !ink_can && !page_can {
+            return;
+        }
         let edited = self.editor.as_ref().and_then(|e| e.history.when());
         // The ink's own last change if it keeps one, else when ink last changed at all.
         let inked = self.pad.as_ref().and_then(crate::inkpad::Pad::newest_change).or(self.last_ink_change);
@@ -1795,8 +1752,6 @@ impl NocturneApp {
         };
         // One press that changed both (Delete on boxes and ink picked up together) is one step.
         let together = matches!((inked, edited), (Some(i), Some(e)) if i.max(e).duration_since(i.min(e)) < Duration::from_millis(300));
-        let ink_can = self.pad.as_ref().is_some_and(crate::inkpad::Pad::can_undo);
-        let page_can = self.editor.as_ref().is_some_and(|e| e.writable && e.history.can_undo());
         let what = if ink_can && page_can && together {
             self.ink_undo();
             self.step_back(true);
@@ -1814,9 +1769,13 @@ impl NocturneApp {
     /// Puts back what Undo last took back, from the ink, the page or both, the way it was taken
     /// (issue #155). When the record of which no longer fits what either can put back, the page
     /// goes first, then the ink.
-    fn redo(&mut self) {
+    pub fn redo(&mut self) {
         let ink_can = self.pad.as_ref().is_some_and(crate::inkpad::Pad::can_redo);
         let page_can = self.editor.as_ref().is_some_and(|e| e.writable && e.history.can_redo());
+        if !ink_can && !page_can {
+            self.undone.clear();
+            return;
+        }
         match self.undone.pop() {
             Some(Undone::Both) if ink_can && page_can => {
                 self.ink_redo();
@@ -1838,8 +1797,12 @@ impl NocturneApp {
     fn canvas_pointer_unoccluded(&self, ctx: &Context, at: egui::Pos2) -> bool {
         self.dialog.is_none()
             && self.backstage.is_none()
+            && !self.theme_window
+            && self.import_job.is_none()
+            && !self.tool_settings_open
             && !self.ribbon_peek
             && !egui::Popup::is_any_open(ctx)
+            && !crate::ribbon::any_popup_open(ctx)
             && self.page_rect.is_some_and(|r| r.contains(at))
             && !self.page_scroll_strip.is_some_and(|s| s.contains(at))
             && ctx.layer_id_at(at).is_none_or(|l| l.order < egui::Order::Foreground)
@@ -2066,7 +2029,8 @@ impl NocturneApp {
 
     /// Whether the notebooks list fills a phone-width window this frame, with no page beside it.
     fn compact_list_fills(&self) -> bool {
-        self.compact && !(self.full_page && self.editor.is_some())
+        let studio_grid = self.last_tablet_studio && self.session.library_view() == nocturne_engine::LibraryView::StudioGrid;
+        self.compact && !studio_grid && !(self.full_page && self.editor.is_some())
     }
 
     /// Whether the Tags Summary or the page templates fill a phone-width window this frame,
@@ -2099,14 +2063,38 @@ impl NocturneApp {
     }
 
     /// Returns `true` when the window renders the simplified Tablet Studio chrome instead of the
-    /// multi-row Classic Ribbon.
+    /// multi-row Classic Ribbon. Explicit `UiLayoutMode::TabletStudio` stays in Tablet Studio even
+    /// on narrow iPad Split View / Slide Over widths (`< 600pt`).
     pub fn is_tablet_studio(&self, ctx: &Context) -> bool {
-        self.ui_layout_mode.is_tablet_studio(ctx.os(), self.compact)
+        match self.session.layout_mode() {
+            nocturne_engine::UiLayoutMode::TabletStudio => true,
+            nocturne_engine::UiLayoutMode::ClassicRibbon => false,
+            nocturne_engine::UiLayoutMode::Auto => !self.compact && ctx.os() == egui::os::OperatingSystem::IOS,
+        }
+    }
+
+    /// Whether the infinite-canvas minimap is shown for the current layout: defaults ON in Tablet
+    /// Studio and OFF in Classic Desktop Ribbon unless explicitly toggled.
+    fn minimap_visible(&self, ctx: &Context) -> bool {
+        self.minimap_override.unwrap_or_else(|| self.is_tablet_studio(ctx))
+    }
+
+    fn minimap_visible_now(&self) -> bool {
+        self.minimap_override.unwrap_or(self.last_tablet_studio)
     }
 
     pub fn set_ui_layout_mode(&mut self, mode: crate::tablet_chrome::UiLayoutMode) {
-        self.ui_layout_mode = mode;
-        let _ = self.session.settings.set(crate::tablet_chrome::UI_LAYOUT_KEY, mode.id());
+        let engine_mode = match mode {
+            crate::tablet_chrome::UiLayoutMode::Auto => nocturne_engine::UiLayoutMode::Auto,
+            crate::tablet_chrome::UiLayoutMode::TabletStudio => nocturne_engine::UiLayoutMode::TabletStudio,
+            crate::tablet_chrome::UiLayoutMode::ClassicRibbon => nocturne_engine::UiLayoutMode::ClassicRibbon,
+        };
+        self.session.set_layout_mode(engine_mode);
+        self.last_tablet_studio = match engine_mode {
+            nocturne_engine::UiLayoutMode::TabletStudio => true,
+            nocturne_engine::UiLayoutMode::ClassicRibbon => false,
+            nocturne_engine::UiLayoutMode::Auto => !self.compact && self.last_ctx_is_ios,
+        };
     }
 
     /// Android's Back button: closes the topmost thing over the page and says whether it did.
@@ -2653,12 +2641,12 @@ impl NocturneApp {
         }
         let tokens = self.tokens;
         let is_across = self.editor.as_ref().and_then(|ed| ed.across).is_some_and(|a| !a.inside_one_block());
-        let (in_cell, list_depth, can_bold, can_todo, todo_active) = self
+        let (in_cell, list_depth, can_format, can_block, bullets_active, todo_active) = self
             .editor
             .as_ref()
             .and_then(|ed| {
                 if is_across {
-                    return Some((false, None, true, false, false));
+                    return Some((false, None, true, false, false, false));
                 }
                 let caret = ed.caret.as_ref()?;
                 let block = ed.blocks.get(caret.block)?;
@@ -2668,104 +2656,33 @@ impl NocturneApp {
                     _ => None,
                 };
                 let is_code_or_math = matches!(block, nocturne_formats::Block::Code { .. } | nocturne_formats::Block::MathBlock(_));
-                let can_bold = !is_code_or_math;
-                let can_todo = !in_cell && pageedit::is_one_line_of_words(block) && !is_code_or_math;
+                let can_format = !is_code_or_math;
+                let can_block = !in_cell && pageedit::is_one_line_of_words(block) && !is_code_or_math;
+                let bullets_active = !in_cell && matches!(block, nocturne_formats::Block::Item { ordered: false, task: None, .. });
                 let todo_active = !in_cell && matches!(block, nocturne_formats::Block::Item { task: Some(_), .. });
-                Some((in_cell, list_depth, can_bold, can_todo, todo_active))
+                Some((in_cell, list_depth, can_format, can_block, bullets_active, todo_active))
             })
-            .unwrap_or((false, None, false, false, false));
-        let can_outdent = !in_cell && list_depth.is_some_and(|d| d > 0);
-        let can_indent = !in_cell && list_depth.is_some_and(|d| d < 8);
-        let can_undo = self.can_undo();
-        let can_redo = self.can_redo();
-        let bold_active = !is_across && self.font_selection(ui.ctx()).marks.bold;
-
-        let mut act: Option<ribbon::Act> = None;
-        egui::Panel::bottom("mobile-formatting-bar")
-            .frame(egui::Frame::new().fill(tokens.panel).inner_margin(egui::Margin::symmetric(8, 4)).stroke(egui::Stroke::new(1.0, tokens.faint)))
-            .show_separator_line(false)
-            .show(ui, |ui| {
-                egui::ScrollArea::horizontal()
-                    .id_salt("mobile-formatting-scroll")
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            let items: [(&str, crate::floating::Glyph, bool, bool, ribbon::Act); 6] = [
-                                (
-                                    crate::tl_id!("ui.decrease_indentation"),
-                                    crate::floating::Glyph::Mark(crate::ribbon_icons::Mark::IndentLess),
-                                    can_outdent,
-                                    false,
-                                    ribbon::Act::Indent(false),
-                                ),
-                                (
-                                    crate::tl_id!("ui.increase_indentation"),
-                                    crate::floating::Glyph::Mark(crate::ribbon_icons::Mark::IndentMore),
-                                    can_indent,
-                                    false,
-                                    ribbon::Act::Indent(true),
-                                ),
-                                (
-                                    crate::tl_id!("ui.undo"),
-                                    crate::floating::Glyph::Icon(crate::icons::Icon::Undo),
-                                    can_undo,
-                                    false,
-                                    ribbon::Act::Undo,
-                                ),
-                                (
-                                    crate::tl_id!("ui.redo"),
-                                    crate::floating::Glyph::Icon(crate::icons::Icon::Redo),
-                                    can_redo,
-                                    false,
-                                    ribbon::Act::Redo,
-                                ),
-                                (
-                                    crate::tl_id!("ui.bold"),
-                                    crate::floating::Glyph::Mark(crate::ribbon_icons::Mark::Bold),
-                                    can_bold,
-                                    bold_active,
-                                    ribbon::Act::Mark("bold"),
-                                ),
-                                (
-                                    crate::tl_id!("ui.to_do_2"),
-                                    crate::floating::Glyph::Mark(crate::ribbon_icons::Mark::ToDo),
-                                    can_todo,
-                                    todo_active,
-                                    ribbon::Act::Block("todo"),
-                                ),
-                            ];
-                            for (label, glyph, enabled, active, item_act) in items {
-                                let resp = ui
-                                    .add_enabled_ui(enabled, |ui| {
-                                        let size = vec2(46.0, crate::touch_ux::TABLET_MIN_INTERACT_HEIGHT);
-                                        let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-                                        let painter = ui.painter_at(rect);
-                                        if active {
-                                            painter.rect_filled(rect, 6.0, crate::theme::mix(tokens.panel, tokens.accent, 0.16));
-                                            painter.rect_stroke(rect, 6.0, egui::Stroke::new(1.0, tokens.accent), egui::StrokeKind::Inside);
-                                        } else if resp.hovered() && enabled {
-                                            painter.rect_filled(rect, 6.0, tokens.row_hover);
-                                        }
-                                        let icon_tokens =
-                                            if enabled { tokens } else { Tokens { text: tokens.muted, accent: tokens.muted, ..tokens } };
-                                        let icon_rect = egui::Rect::from_center_size(rect.center(), vec2(20.0, 20.0));
-                                        glyph.paint(&painter, icon_rect, &icon_tokens);
-                                        let name = label.to_string();
-                                        resp.widget_info(move || egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, active, name.clone()));
-                                        resp.on_hover_text(label)
-                                    })
-                                    .inner;
-                                if enabled && resp.clicked() {
-                                    act = Some(item_act);
-                                }
-                            }
-                        });
-                    });
-            });
-        if let Some(a) = act {
-            self.ribbon_act(a);
-            if let Some(ed) = self.editor.as_mut()
+            .unwrap_or((false, None, false, false, false, false));
+        let marks = if is_across { pageedit::Marks::default() } else { self.font_selection(ui.ctx()).marks };
+        let state = crate::touch_ux::MobileFormattingBarState {
+            can_outdent: !in_cell && list_depth.is_some_and(|d| d > 0),
+            can_indent: !in_cell && list_depth.is_some_and(|d| d < 8),
+            can_undo: self.can_undo(),
+            can_redo: self.can_redo(),
+            can_format,
+            bold_active: marks.bold,
+            italic_active: marks.italic,
+            underline_active: marks.underline,
+            can_block,
+            bullets_active,
+            todo_active,
+            can_quick_pen: self.editor.as_ref().is_some_and(|ed| ed.writable),
+            pen_active: self.pointer == ribbon::Pointer::Draw,
+        };
+        if let Some(action) = crate::touch_ux::mobile_formatting_bar(ui, state, &tokens) {
+            self.ribbon_act(action.into_ribbon_act(self.nib));
+            if action.restores_text_caret()
+                && let Some(ed) = self.editor.as_mut()
                 && ed.across.is_none()
                 && let Some(c) = ed.caret.as_mut()
             {
@@ -4115,7 +4032,7 @@ impl NocturneApp {
             eraser_auto_return: self.eraser_auto_return,
             eraser_pixel: self.session.ink_options().eraser_kind == nocturne_engine::EraserKind::Pixel,
             eraser_width: self.session.ink_options().eraser_width,
-            show_minimap: self.show_minimap,
+            show_minimap: self.minimap_visible(ctx),
             table_borders: self.caret_table_has_borders(),
             table_align: self.caret_cells_align(),
             table_shade: self.caret_cells_shade(),
@@ -4360,11 +4277,14 @@ impl NocturneApp {
                     Ok(report) => {
                         self.session.refresh();
                         self.library_grid.invalidate_all();
-                        if reload_open
-                            && let Some(dir) = self.editor.as_ref().map(|e| e.dir.clone())
-                            && dir.is_dir()
-                        {
-                            self.open_page(&dir);
+                        if let Some(dir) = self.editor.as_ref().map(|e| e.dir.clone()) {
+                            if !dir.is_dir() {
+                                self.editor = None;
+                                self.pad = None;
+                                self.selected = None;
+                            } else if reload_open {
+                                self.open_page(&dir);
+                            }
                         }
                         let msg = crate::sync_ui::format_sync_report_summary(&report);
                         if let Some(Dialog::CloudSync(ref mut form)) = self.dialog {
@@ -4497,7 +4417,7 @@ impl NocturneApp {
         let search_width = (right.available_width() - left_used - 8.0).clamp(60.0, 200.0);
         let resp = right.add(
             egui::TextEdit::singleline(&mut self.search)
-                .id(egui::Id::new(SEARCH_FIELD))
+                .id(egui::Id::unique(SEARCH_FIELD))
                 .hint_text(crate::tl_id!("ui.search_all_pages"))
                 .desired_width(search_width),
         );
@@ -4505,14 +4425,26 @@ impl NocturneApp {
             resp.request_focus();
             self.focus_search = false;
         }
-        if resp.changed() && self.search != self.searched {
-            self.searched = self.search.clone();
-            self.hits = match self.session.run("search.query", &params(&[("q", &self.search), ("limit", "20")])) {
-                Ok(Output::Hits(h)) => h,
-                _ => Vec::new(),
-            };
+        if resp.changed() {
+            self.refresh_search();
         }
         ui.advance_cursor_after_rect(row);
+    }
+
+    /// Runs `search.query` whenever `self.search` changes (works identically in Classic Ribbon
+    /// and Tablet Studio).
+    fn refresh_search(&mut self) {
+        if self.search != self.searched {
+            self.searched = self.search.clone();
+            if self.search.trim().is_empty() {
+                self.hits.clear();
+            } else {
+                self.hits = match self.session.run("search.query", &params(&[("q", &self.search), ("limit", "20")])) {
+                    Ok(Output::Hits(h)) => h,
+                    _ => Vec::new(),
+                };
+            }
+        }
     }
 
     /// Minimise, maximise or restore, and close: the buttons the system would have drawn.
@@ -4566,7 +4498,7 @@ impl NocturneApp {
         }
         let r = ctx.content_rect();
         // A line round the window, so its edge shows against whatever is behind it.
-        ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("window-edge"))).rect_stroke(
+        ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("window-edge"))).rect_stroke(
             r,
             0.0,
             egui::Stroke::new(1.0, self.tokens.band),
@@ -4603,6 +4535,7 @@ impl NocturneApp {
         let show_path = move |p: &Path| shown_in(&root, p, redact);
         let ui_language = self.ui_language.clone();
         let languages = crate::i18n::available_languages();
+        let layout_mode = self.session.layout_mode();
         let mut acts = Vec::new();
         egui::CentralPanel::default().show(ui, |ui| {
             let telemetry_root = self.session.settings.path().parent().unwrap_or(std::path::Path::new(".")).join("telemetry");
@@ -4622,6 +4555,7 @@ impl NocturneApp {
                 &ui_language,
                 &languages,
                 self.ui_scale,
+                layout_mode,
                 &update,
                 &tokens,
             );
@@ -4661,6 +4595,10 @@ impl NocturneApp {
                     self.set_ui_language(language);
                 }
                 backstage::Act::SetUiScale(percent) => self.set_ui_scale(percent),
+                backstage::Act::SetLayoutMode(mode) => {
+                    let _ = self.run("ui.layout_mode", &params(&[("mode", mode.id())]));
+                    self.last_tablet_studio = self.is_tablet_studio(ui.ctx());
+                }
                 backstage::Act::OpenTelemetryFolder(path) => {
                     // The folder is made on first use: it does not exist until a session has
                     // written to it, and Explorer opens Documents for a folder it cannot find.
@@ -4682,11 +4620,12 @@ impl NocturneApp {
                 }
                 backstage::Act::ToggleStudioLayout => {
                     let next = if self.is_tablet_studio(ui.ctx()) {
-                        crate::tablet_chrome::UiLayoutMode::ClassicRibbon
+                        nocturne_engine::UiLayoutMode::ClassicRibbon
                     } else {
-                        crate::tablet_chrome::UiLayoutMode::TabletStudio
+                        nocturne_engine::UiLayoutMode::TabletStudio
                     };
-                    self.set_ui_layout_mode(next);
+                    let _ = self.run("ui.layout_mode", &params(&[("mode", next.id())]));
+                    self.last_tablet_studio = self.is_tablet_studio(ui.ctx());
                     self.backstage = None;
                 }
                 backstage::Act::ResetPreferences => self.dialog = Some(Dialog::ResetPreferences),
@@ -4935,37 +4874,38 @@ impl NocturneApp {
 
     fn import_progress(&mut self, ctx: &Context) {
         let Some(job) = self.import_job.as_mut() else { return };
+        let tokens = self.tokens;
         let mut cancel = false;
-        egui::Window::new(crate::tl_id!("ui.importing_onenote"))
-            .collapsible(false)
-            .resizable(false)
-            .title_bar(false)
-            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-            .frame(modal_frame(&self.tokens))
-            .show(ctx, |ui| {
-                ui.set_min_width(420.0);
-                modal_title(ui, &self.tokens, crate::tl_id!("ui.importing_onenote"));
-                ui.label(egui::RichText::new(crate::tl_id!("ui.you_can_continue_working_while_the_import_runs")).color(self.tokens.muted));
-                ui.add_space(12.0);
-                ui.label(egui::RichText::new(crate::i18n::pseudo_dynamic(&job.current)).strong());
-                let fraction = if job.total == 0 { 0.0 } else { job.index as f32 / job.total as f32 };
-                ui.add(egui::ProgressBar::new(fraction).fill(self.tokens.accent).show_percentage());
-                if job.total > 0 {
-                    let index = job.index.to_string();
-                    let total = job.total.to_string();
-                    ui.label(crate::i18n::format_message_id("ui.index_of_total_sections", &[("index", &index), ("total", &total)]));
-                } else {
-                    ui.label(crate::tl_id!("ui.discovering_sections"));
-                }
-                ui.add_space(14.0);
-                ui.separator();
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if modal_button(ui, &self.tokens, crate::tl_id!("ui.cancel_import"), true).clicked() {
-                        cancel = true;
+        crate::modal::Modal::new("import-progress-modal", crate::tl_id!("ui.importing_onenote"))
+            .backdrop_id("import-progress-modal-backdrop")
+            .width(440.0)
+            .closable(false)
+            .close_on_escape(false)
+            .show_with_footer(
+                ctx,
+                &tokens,
+                |ui| {
+                    ui.label(egui::RichText::new(crate::tl_id!("ui.you_can_continue_working_while_the_import_runs")).color(tokens.muted));
+                    ui.add_space(12.0);
+                    ui.label(egui::RichText::new(crate::i18n::pseudo_dynamic(&job.current)).strong().color(tokens.strong));
+                    let fraction = if job.total == 0 { 0.0 } else { job.index as f32 / job.total as f32 };
+                    ui.add(egui::ProgressBar::new(fraction).fill(tokens.accent).show_percentage());
+                    if job.total > 0 {
+                        let index = job.index.to_string();
+                        let total = job.total.to_string();
+                        ui.label(crate::i18n::format_message_id("ui.index_of_total_sections", &[("index", &index), ("total", &total)]));
+                    } else {
+                        ui.label(crate::tl_id!("ui.discovering_sections"));
                     }
-                });
-            });
+                },
+                |ui| {
+                    ui.horizontal(|ui| {
+                        if crate::modal::danger_button(ui, crate::tl_id!("ui.cancel_import"), &tokens).clicked() {
+                            cancel = true;
+                        }
+                    });
+                },
+            );
         if cancel {
             job.cancel.store(true, Ordering::Relaxed);
             job.current = "Cancelling…".into();
@@ -5120,7 +5060,7 @@ impl NocturneApp {
             eraser_auto_return: self.eraser_auto_return,
             eraser_pixel: self.session.ink_options().eraser_kind == nocturne_engine::EraserKind::Pixel,
             eraser_width: self.session.ink_options().eraser_width,
-            show_minimap: self.show_minimap,
+            show_minimap: self.minimap_visible(ui.ctx()),
             table_borders: self.caret_table_has_borders(),
             table_align: self.caret_cells_align(),
             table_shade: self.caret_cells_shade(),
@@ -5572,8 +5512,9 @@ impl NocturneApp {
                 }
             }
             ribbon::Act::ToggleMinimap => {
-                self.show_minimap = !self.show_minimap;
-                let _ = self.session.settings.set("show_minimap", if self.show_minimap { "true" } else { "false" });
+                let next = !self.minimap_visible_now();
+                self.minimap_override = Some(next);
+                let _ = self.session.settings.set("show_minimap", if next { "true" } else { "false" });
             }
             ribbon::Act::ToolbarDock(dock) => self.session.set_toolbar_dock(dock),
             ribbon::Act::DockRoster(roster) => self.session.set_dock_roster(roster),
@@ -5618,18 +5559,19 @@ impl NocturneApp {
                 self.open_cloud_sync_dialog();
             }
             ribbon::Act::ToggleStudioLayout => {
-                let next = match self.ui_layout_mode {
-                    crate::tablet_chrome::UiLayoutMode::TabletStudio => crate::tablet_chrome::UiLayoutMode::ClassicRibbon,
-                    crate::tablet_chrome::UiLayoutMode::ClassicRibbon => crate::tablet_chrome::UiLayoutMode::TabletStudio,
-                    crate::tablet_chrome::UiLayoutMode::Auto => {
+                let next = match self.session.layout_mode() {
+                    nocturne_engine::UiLayoutMode::TabletStudio => nocturne_engine::UiLayoutMode::ClassicRibbon,
+                    nocturne_engine::UiLayoutMode::ClassicRibbon => nocturne_engine::UiLayoutMode::TabletStudio,
+                    nocturne_engine::UiLayoutMode::Auto => {
                         if self.last_ctx_is_ios && !self.compact {
-                            crate::tablet_chrome::UiLayoutMode::ClassicRibbon
+                            nocturne_engine::UiLayoutMode::ClassicRibbon
                         } else {
-                            crate::tablet_chrome::UiLayoutMode::TabletStudio
+                            nocturne_engine::UiLayoutMode::TabletStudio
                         }
                     }
                 };
-                self.set_ui_layout_mode(next);
+                self.session.set_layout_mode(next);
+                self.last_tablet_studio = matches!(next, nocturne_engine::UiLayoutMode::TabletStudio);
             }
             ribbon::Act::FormatPainter(sticky) => self.pick_up_formatting(sticky),
             ribbon::Act::PageTemplates => {
@@ -6797,9 +6739,10 @@ impl NocturneApp {
         self.status_banner_drawn
     }
 
-    /// The one-line field that has the keyboard, with all of its text and its selection: the
-    /// name box of Rename, Add or New notebook, the page title, or search. `None` when the
-    /// keyboard is in the page's words or nowhere.
+    /// The one-line or dialog field that has the keyboard, with all of its text and its selection:
+    /// Rename, Add, New notebook, Link, Insert Table, Math OCR setup/preview, Cloud Sync, CodeView,
+    /// Template name, the page title, or search. `None` when the keyboard is in the page's words or
+    /// nowhere.
     ///
     /// A platform keyboard needs the whole field. Given an empty one it believes there is
     /// nothing to delete, and it has no words to find boundaries in for its suggestions.
@@ -6810,6 +6753,15 @@ impl NocturneApp {
             Some(Dialog::Rename { title, .. }) if is(RENAME_FIELD) => (title.as_str(), None),
             Some(Dialog::Add { title, .. }) if is(ADD_FIELD) => (title.as_str(), None),
             Some(Dialog::NewNotebook { name, .. }) if is(NEW_NOTEBOOK_FIELD) => (name.as_str(), None),
+            Some(Dialog::Link { text, .. }) if is(LINK_TEXT_FIELD) => (text.as_str(), None),
+            Some(Dialog::Link { address, .. }) if is(LINK_ADDRESS_FIELD) => (address.as_str(), None),
+            Some(Dialog::InsertTable { columns, .. }) if is(TABLE_COLUMNS_FIELD) => (columns.as_str(), None),
+            Some(Dialog::InsertTable { rows, .. }) if is(TABLE_ROWS_FIELD) => (rows.as_str(), None),
+            Some(Dialog::MathOcrSetup(form)) if is("math-ocr-endpoint") => (form.endpoint.as_str(), None),
+            Some(Dialog::MathOcrSetup(form)) if is("math-ocr-model") => (form.model.as_str(), None),
+            Some(Dialog::MathOcrSetup(form)) if is("math-ocr-app-id") => (form.app_id.as_str(), None),
+            Some(Dialog::MathOcrSetup(form)) if is("math-ocr-key") => (form.key.as_str(), None),
+            Some(Dialog::CloudSync(_)) if egui::TextEdit::load_state(ctx, focused).is_some() => ("", None),
             Some(_) => return None,
             None => {
                 if let Some(crate::math_ocr::Conversion { stage: crate::math_ocr::Stage::Preview { tex, .. }, .. }) = &self.math_ocr
@@ -6820,8 +6772,16 @@ impl NocturneApp {
                     (self.search.as_str(), None)
                 } else if is(crate::library_grid::LIBRARY_SEARCH_FIELD) {
                     (self.library_grid.search_query(), None)
+                } else if let Some(pane) = self.templates_pane.as_ref()
+                    && is(TEMPLATE_NAME_FIELD)
+                {
+                    (pane.name.as_str(), None)
+                } else if self.show_source && is("code-find-query") {
+                    (self.code.find.query.as_str(), None)
+                } else if self.show_source && self.code.picked.as_deref().is_some_and(|name| focused == egui::Id::unique(("code-text-edit", name))) {
+                    (self.code.text.as_str(), None)
                 } else {
-                    let ed = self.editor.as_ref().filter(|ed| ed.title_focused)?;
+                    let ed = self.editor.as_ref().filter(|ed| ed.title_focused || is(PAGE_TITLE_FIELD))?;
                     (ed.title_buf.as_str(), ed.title_selection)
                 }
             }
@@ -6835,6 +6795,43 @@ impl NocturneApp {
             .unwrap_or((len, len));
         let (a, b) = (a.min(len), b.min(len));
         Some(PlatformTextField { text: text.to_string(), selection: (a.min(b), a.max(b)) })
+    }
+
+    /// True ONLY when a desktop/hardware `Ctrl+V` / `Cmd+V` belongs to the open page body rather
+    /// than Backstage, a modal dialog, the theme chooser, CodeView, the library grid, or any
+    /// non-body `TextEdit` (Search, Page Title, Rename, Link, Cloud Sync, Math OCR, ribbon combo
+    /// boxes, template name, etc.).
+    pub fn should_intercept_page_paste(&self, ctx: &Context) -> bool {
+        if self.backstage.is_some()
+            || self.dialog.is_some()
+            || self.theme_window
+            || self.import_job.is_some()
+            || self.show_source
+            || self.tool_settings_open
+            || matches!(self.math_ocr.as_ref().map(|c| &c.stage), Some(crate::math_ocr::Stage::Preview { .. }))
+            || self.editor.is_none()
+            || self.compact_list_fills()
+            || self.compact_pane_fills()
+        {
+            return false;
+        }
+        if self.editor.as_ref().is_some_and(|ed| ed.title_focused) {
+            return false;
+        }
+        if self.focused_text_field(ctx).is_some() {
+            return false;
+        }
+        if let Some(focused) = ctx.memory(|m| m.focused())
+            && egui::TextEdit::load_state(ctx, focused).is_some()
+        {
+            // Ribbon font-family / font-size combo boxes store their draft String under `focused`.
+            let combo_edit = ctx.data(|d| d.get_temp::<String>(focused)).is_some();
+            let body_caret_present = self.editor.as_ref().is_some_and(|ed| ed.caret.is_some());
+            if combo_edit || !body_caret_present {
+                return false;
+            }
+        }
+        true
     }
 
     /// Asks for a new title for the notebook, section or page at `path`.
@@ -7633,16 +7630,16 @@ impl NocturneApp {
         }
     }
 
-    /// The keys Windows users expect for paragraph direction. Alt+Shift remains available
+    /// The keys Windows/macOS users expect for paragraph direction. Alt+Shift remains available
     /// to Windows for switching the active input language.
     fn direction_keys(&mut self, ctx: &Context) {
         use nocturne_model::Dir;
-        let ctrl_shift = Modifiers { ctrl: true, shift: true, command: true, ..Modifiers::NONE };
+        let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
         let pressed = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
-        if pressed(ctrl_shift, Key::R) {
+        if pressed(cmd_shift, Key::R) {
             self.apply_direction(Some(Dir::Rtl));
         }
-        if pressed(ctrl_shift, Key::L) {
+        if pressed(cmd_shift, Key::L) {
             self.apply_direction(Some(Dir::Ltr));
         }
     }
@@ -7841,6 +7838,15 @@ impl NocturneApp {
     /// buttons use, so there is one path and not two. Nothing is done when egui's text box
     /// is holding the keyboard, or both would act and the words would be pasted twice.
     fn clipboard_keys(&mut self, ctx: &egui::Context) {
+        if self.backstage.is_some()
+            || self.dialog.is_some()
+            || self.theme_window
+            || self.import_job.is_some()
+            || self.show_source
+            || matches!(self.math_ocr.as_ref().map(|c| &c.stage), Some(crate::math_ocr::Stage::Preview { .. }))
+        {
+            return;
+        }
         let (copy, cut, paste, all) = ctx.input(|i| {
             let hit = |want: egui::Key| {
                 // `key_pressed` is the platform-normalized view.  Some native
@@ -7873,7 +7879,7 @@ impl NocturneApp {
         // through the same paste path; it reads the image clipboard exactly once. Probing
         // with has_picture() first was racy with VirtualBox clipboard synchronisation and
         // could make the actual image read miss the clipboard handoff.
-        if paste {
+        if paste && self.should_intercept_page_paste(ctx) {
             // Consume the shortcut before the text widgets draw. Otherwise an LTR TextEdit
             // handles Ctrl+V itself while the page menu goes through `paste_here`, giving the
             // two entry points different behavior.
@@ -8189,24 +8195,9 @@ impl NocturneApp {
         let theme_label = current.label();
         let tip = crate::i18n::format_message_id("ui.theme_theme_click_to_change_it", &[("theme", &theme_label)]);
         let resp = resp.on_hover_text(tip);
-        egui::Popup::menu(&resp).show(|ui| {
+        egui::Popup::menu(&resp).style(crate::theme::picker_popup_style(self.tokens)).show(|ui| {
             theme_grid(ui, current, &mut pick, &mut follow);
         });
-        // The same chooser, as a window, for the ribbon's Theme button.
-        if self.theme_window {
-            let mut open = true;
-            egui::Window::new(crate::tl_id!("ui.theme"))
-                .collapsible(false)
-                .resizable(false)
-                .open(&mut open)
-                .anchor(Align2::RIGHT_TOP, vec2(-12.0, 120.0))
-                .show(ui.ctx(), |ui| {
-                    theme_grid(ui, current, &mut pick, &mut follow);
-                });
-            if !open || pick.is_some() {
-                self.theme_window = false;
-            }
-        }
         if let Some((mode, accent)) = pick {
             // A swatch names a mode, so clicking one means that mode, even while the app was
             // following the system. Otherwise picking "Dark Default" on a light desktop did
@@ -8218,6 +8209,48 @@ impl NocturneApp {
             } else {
                 self.set_theme(current);
             }
+        }
+    }
+
+    /// Top-level Theme chooser modal (works in both Classic Ribbon and Tablet Studio).
+    fn theme_window_ui(&mut self, ctx: &Context) {
+        if !self.theme_window {
+            return;
+        }
+        let tokens = self.tokens;
+        let current = self.theme();
+        let mut pick: Option<(Mode, Accent)> = None;
+        let mut follow = self.mode_pref == ModePref::System;
+        let follow_before = follow;
+        let mut close_clicked = false;
+        let res = crate::modal::Modal::new("theme-chooser-modal", crate::tl_id!("ui.theme"))
+            .backdrop_id("theme-chooser-modal-backdrop")
+            .width(340.0)
+            .show_with_footer(
+                ctx,
+                &tokens,
+                |ui| {
+                    theme_grid(ui, current, &mut pick, &mut follow);
+                },
+                |ui| {
+                    ui.horizontal(|ui| {
+                        if crate::modal::secondary_button(ui, crate::tl_id!("ui.close"), &tokens).clicked() {
+                            close_clicked = true;
+                        }
+                    });
+                },
+            );
+        if let Some((mode, accent)) = pick {
+            self.set_theme(Theme { mode, accent });
+            self.theme_window = false;
+        } else if follow != follow_before {
+            if follow {
+                self.follow_system_theme(current.accent);
+            } else {
+                self.set_theme(current);
+            }
+        } else if res.closed || close_clicked {
+            self.theme_window = false;
         }
     }
 
@@ -8247,7 +8280,7 @@ impl NocturneApp {
         let tip = crate::i18n::format_message_id("ui.language_click_to_change_it", &[("language", &active_name)]);
         let resp = resp.on_hover_text(tip);
         let mut picked = None;
-        egui::Popup::menu(&resp).style(crate::theme::picker_popup_style(tokens)).show(|ui| {
+        egui::Popup::menu(&resp).style(crate::theme::picker_popup_style(self.tokens)).show(|ui| {
             let automatic = crate::tl_id!("ui.automatic_system_language");
             if ui.selectable_label(self.ui_language == crate::i18n::AUTO, automatic).clicked() {
                 picked = Some(crate::i18n::AUTO.to_string());
@@ -8270,27 +8303,55 @@ impl NocturneApp {
     }
 
     fn search_popup(&mut self, ctx: &Context) {
+        self.refresh_search();
         if self.search.trim().is_empty() {
             return;
         }
+        let tokens = self.tokens;
+        let screen = ctx.content_rect();
+        let popup_w = (screen.width() - 24.0).clamp(220.0, 420.0);
+        let max_h = (screen.height() * 0.55).clamp(140.0, 380.0);
         let mut chosen: Option<PathBuf> = None;
-        egui::Area::new(Id::new("search-results")).order(egui::Order::Foreground).anchor(Align2::RIGHT_TOP, vec2(-8.0, 44.0)).show(ctx, |ui| {
-            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                ui.set_width(420.0);
-                if self.hits.is_empty() {
-                    ui.weak(crate::tl_id!("ui.no_pages_match"));
-                }
-                for h in &self.hits {
-                    let r = ui.vertical(|ui| {
-                        ui.strong(&h.title);
-                        ui.label(egui::RichText::new(&h.snippet).small().color(self.tokens.muted));
+        let area = if self.is_tablet_studio(ctx)
+            && let Some(header) = self.header_pill_rect
+        {
+            // Below the top-left Tablet Studio header pill so results never collide with the
+            // top-right minimap.
+            egui::Area::new(Id::unique("search-results"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(header.min.x, header.max.y + 6.0))
+                .constrain(true)
+        } else {
+            let top = (self.band_bottom + 4.0).max(44.0);
+            egui::Area::new(Id::unique("search-results")).order(egui::Order::Foreground).anchor(Align2::RIGHT_TOP, vec2(-8.0, top)).constrain(true)
+        };
+        area.show(ctx, |ui| {
+            crate::ribbon::mark_popup_open(ctx);
+            egui::Frame::NONE
+                .fill(tokens.surface_elevated)
+                .stroke(egui::Stroke::new(1.0, tokens.border))
+                .corner_radius(egui::CornerRadius::same(crate::theme::RADIUS_POPUP))
+                .shadow(tokens.shadow_popup())
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    ui.set_width(popup_w);
+                    ui.visuals_mut().override_text_color = Some(tokens.text);
+                    egui::ScrollArea::vertical().id_salt("search-results-scroll").max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
+                        if self.hits.is_empty() {
+                            ui.label(egui::RichText::new(crate::tl_id!("ui.no_pages_match")).color(tokens.muted));
+                        }
+                        for h in &self.hits {
+                            let r = ui.vertical(|ui| {
+                                ui.label(egui::RichText::new(&h.title).strong().color(tokens.strong));
+                                ui.label(egui::RichText::new(&h.snippet).small().color(tokens.muted));
+                            });
+                            if ui.interact(r.response.rect, Id::unique(("hit", &h.path)), Sense::click()).clicked() {
+                                chosen = Some(h.path.clone());
+                            }
+                            ui.separator();
+                        }
                     });
-                    if ui.interact(r.response.rect, Id::new(("hit", &h.path)), Sense::click()).clicked() {
-                        chosen = Some(h.path.clone());
-                    }
-                    ui.separator();
-                }
-            });
+                });
         });
         if let Some(p) = chosen {
             let mut parent = p.parent();
@@ -8454,7 +8515,10 @@ impl NocturneApp {
             ui.separator();
             ui.label(crate::tl_id!("ui.save_current_page_as_a_template"));
             ui.add_enabled_ui(has_page, |ui| {
-                let field = egui::TextEdit::singleline(&mut pane.name).hint_text(crate::tl_id!("ui.template_name")).desired_width(f32::INFINITY);
+                let field = egui::TextEdit::singleline(&mut pane.name)
+                    .id(egui::Id::unique(TEMPLATE_NAME_FIELD))
+                    .hint_text(crate::tl_id!("ui.template_name"))
+                    .desired_width(f32::INFINITY);
                 let field = ui.add(field);
                 // Named for a screen reader: the grey hint inside the box is not a name.
                 field.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextInput, has_page, crate::tl_id!("ui.template_name")));
@@ -8915,6 +8979,10 @@ impl NocturneApp {
             .sync_has_token
             .get_or_insert_with(|| self.session.sync_secrets().get_secret(nocturne_engine::KDRIVE_TOKEN_KEY).ok().flatten().is_some());
         let out = self.library_grid.show(ui, &mut self.session, &tokens, sync_busy, sync_configured);
+        if let Some(note) = out.notice {
+            self.say(&note);
+            self.studio_notice = Some((note, Instant::now()));
+        }
         if let Some(page_dir) = out.open_page {
             self.expand_to(&page_dir);
             self.open_page(&page_dir);
@@ -8933,7 +9001,7 @@ impl NocturneApp {
                             ed.caret = None;
                             ed.across = None;
                         }
-                        ui.ctx().memory_mut(|m| m.request_focus(egui::Id::unique("page-title-box")));
+                        ui.ctx().memory_mut(|m| m.request_focus(egui::Id::unique(PAGE_TITLE_FIELD)));
                     }
                 }
             } else {
@@ -8941,15 +9009,16 @@ impl NocturneApp {
             }
         }
         if let Some((target_section, kind)) = out.import {
-            if self.editor.is_none()
-                && let Some(section) = target_section
-            {
-                self.create_page_in(&section);
-            }
-            if self.editor.is_some() {
-                match kind {
-                    crate::library_grid::ImportKind::Document => self.ribbon_act(ribbon::Act::AddPrintout),
-                    crate::library_grid::ImportKind::Picture => self.ribbon_act(ribbon::Act::AddPicture),
+            if let Some(section) = target_section {
+                if let Some(file) = crate::library_grid::pick_import_file(kind) {
+                    self.create_page_in(&section);
+                    if let Some(dir) = self.editor.as_ref().map(|e| e.dir.clone()) {
+                        let choice = match kind {
+                            crate::library_grid::ImportKind::Document => FileChoice::Printout,
+                            crate::library_grid::ImportKind::Picture => FileChoice::Copy,
+                        };
+                        self.add_file(&dir, &file, choice);
+                    }
                 }
             } else {
                 self.open_new_notebook_dialog();
@@ -8960,6 +9029,32 @@ impl NocturneApp {
         }
         if let Some((parent, parent_kind)) = out.new_section_in {
             self.open_add_dialog(parent, parent_kind, NodeKind::Section);
+        }
+        for action in out.actions {
+            match action {
+                crate::library_grid::LibraryAction::Rename { path, title } => {
+                    self.open_rename_dialog(path, title);
+                }
+                crate::library_grid::LibraryAction::Delete { path, title, count } => {
+                    self.dialog = Some(Dialog::Delete { path, title, count });
+                }
+                crate::library_grid::LibraryAction::NewPage { section } => {
+                    self.create_page_in(&section);
+                }
+                crate::library_grid::LibraryAction::NewSection { parent, parent_kind } => {
+                    self.open_add_dialog(parent, parent_kind, NodeKind::Section);
+                }
+                crate::library_grid::LibraryAction::ImportFile { section, kind, file } => {
+                    self.create_page_in(&section);
+                    if let Some(dir) = self.editor.as_ref().map(|e| e.dir.clone()) {
+                        let choice = match kind {
+                            crate::library_grid::ImportKind::Document => FileChoice::Printout,
+                            crate::library_grid::ImportKind::Picture => FileChoice::Copy,
+                        };
+                        self.add_file(&dir, &file, choice);
+                    }
+                }
+            }
         }
         if out.sync_now {
             let ctx = ui.ctx().clone();
@@ -9286,15 +9381,19 @@ impl NocturneApp {
         let mut space_over = false;
         let current_zoom_pct = self.zoom_percent;
         let tablet_studio = self.is_tablet_studio(ui.ctx());
+        let show_minimap = self.minimap_visible(ui.ctx());
         if !tablet_studio {
             self.pencil_pill_rect = None;
         }
-        let canvas_overlay_open = self.dialog.is_some()
+        let hide_canvas_chrome = self.dialog.is_some()
             || math_preview_open
+            || self.theme_window
+            || self.import_job.is_some()
             || self.ribbon_peek
             || self.backstage.is_some()
             || !self.search.trim().is_empty()
-            || crate::ribbon::any_popup_open(ui.ctx());
+            || crate::ribbon::any_popup_open_this_pass(ui.ctx());
+        let canvas_overlay_open = hide_canvas_chrome || self.tool_settings_open || crate::ribbon::any_popup_open(ui.ctx());
         let mut multitouch_step: Option<crate::touch_ux::MultiTouchStep> = None;
         let mut pill_acts: Vec<ribbon::Act> = Vec::new();
         let mut start_ocr = false;
@@ -9307,7 +9406,7 @@ impl NocturneApp {
                 ui.label(egui::RichText::new(message).color(tokens.muted));
             }
             // One id for the title, whether it is drawn as words or as a text box.
-            let title_id = egui::Id::new("page-title-box");
+            let title_id = egui::Id::unique(PAGE_TITLE_FIELD);
             if !tablet_studio {
                 ui.horizontal_wrapped(|ui| {
                     // File details live in the status bar. Keep only compact page controls
@@ -9434,6 +9533,12 @@ impl NocturneApp {
                                     .filter(|bar| bar.min.x > ink_area.min.x)
                                     .map_or(ink_area, |bar| ink_area.with_max_x(ink_area.max.x.min(bar.min.x)));
                                 let mut ink_ui = ui.new_child(egui::UiBuilder::new().layer_id(layer).max_rect(ink_area));
+                                let ink_blocked_by_modal = self.dialog.is_some()
+                                    || math_preview_open
+                                    || self.theme_window
+                                    || self.import_job.is_some()
+                                    || self.backstage.is_some()
+                                    || self.tool_settings_open;
                                 ink_changed |= crate::inkpad::show_with_input_and_handles(
                                     &mut ink_ui,
                                     ink_area,
@@ -9444,7 +9549,7 @@ impl NocturneApp {
                                     pressure,
                                     &tokens,
                                     zoom_scale,
-                                    allow_stroke && !math_preview_open,
+                                    allow_stroke && !ink_blocked_by_modal,
                                     cancel_uncommitted,
                                     touch_sized,
                                 );
@@ -9484,13 +9589,7 @@ impl NocturneApp {
                                     zoom_scale,
                                 )
                             } else {
-                                let overlay_open = self.dialog.is_some()
-                                    || math_preview_open
-                                    || self.ribbon_peek
-                                    || self.backstage.is_some()
-                                    || !self.search.trim().is_empty()
-                                    || self.space_tool
-                                    || crate::ribbon::any_popup_open(ui.ctx());
+                                let overlay_open = canvas_overlay_open || self.space_tool;
                                 crate::containers::show_with_touch_and_handles(
                                     ui,
                                     &mut ed.blocks,
@@ -9793,49 +9892,58 @@ impl NocturneApp {
                     self.pending_scroll_offset_y = Some(new_scroll_y);
                     ui.ctx().request_repaint();
                 }
-                if !canvas_overlay_open {
+                if !hide_canvas_chrome {
                     let hbar_clearance = if hbar.track.is_some() { 18.0 } else { 0.0 };
                     // The minimap sits top right, clear of a tool bar docked along the top or the right.
                     let studio = self.session.studio_options();
                     let (mut map_top_clearance, mut map_right_clearance) = (0.0_f32, reserve);
                     if tablet_studio {
-                        let pill_view = ribbon::View {
-                            rules,
-                            zoom_percent: current_zoom_pct,
-                            pointer: pen.pointer,
-                            rack: &self.rack,
-                            nib: self.nib,
-                            finger_drawing: self.session.finger_drawing(),
-                            eraser_auto_return: self.eraser_auto_return,
-                            eraser_pixel: self.session.ink_options().eraser_kind == nocturne_engine::EraserKind::Pixel,
-                            eraser_width: self.session.ink_options().eraser_width,
-                            show_minimap: self.show_minimap,
-                            can_undo: ed.history.can_undo() || pad.as_ref().is_some_and(crate::inkpad::Pad::can_undo),
-                            can_redo: !self.undone.is_empty(),
-                            can_ink_redo: pad.as_ref().is_some_and(crate::inkpad::Pad::can_redo),
-                            math_ocr_enabled: self.session.ocr_config().enabled,
-                            holding_ink: pad.as_ref().is_some_and(|p| p.holding() > 0),
-                            ..ribbon::View::default()
+                        let hide_bottom_pill_for_keyboard = self.soft_keyboard_visible
+                            && self.pointer == ribbon::Pointer::Write
+                            && studio.toolbar_dock == nocturne_engine::ToolbarDock::Bottom;
+                        let pill_rect = if hide_bottom_pill_for_keyboard {
+                            self.pencil_pill_rect = None;
+                            None
+                        } else {
+                            let pill_view = ribbon::View {
+                                rules,
+                                zoom_percent: current_zoom_pct,
+                                pointer: pen.pointer,
+                                rack: &self.rack,
+                                nib: self.nib,
+                                finger_drawing: self.session.finger_drawing(),
+                                eraser_auto_return: self.eraser_auto_return,
+                                eraser_pixel: self.session.ink_options().eraser_kind == nocturne_engine::EraserKind::Pixel,
+                                eraser_width: self.session.ink_options().eraser_width,
+                                show_minimap,
+                                can_undo: (ed.writable && ed.history.can_undo()) || pad.as_ref().is_some_and(crate::inkpad::Pad::can_undo),
+                                can_redo: (ed.writable && ed.history.can_redo()) || pad.as_ref().is_some_and(crate::inkpad::Pad::can_redo),
+                                can_ink_redo: pad.as_ref().is_some_and(crate::inkpad::Pad::can_redo),
+                                math_ocr_enabled: self.session.ocr_config().enabled,
+                                holding_ink: pad.as_ref().is_some_and(|p| p.holding() > 0),
+                                ..ribbon::View::default()
+                            };
+                            let edge_clearance = match studio.toolbar_dock {
+                                nocturne_engine::ToolbarDock::Bottom => hbar_clearance,
+                                nocturne_engine::ToolbarDock::Right => reserve,
+                                // Under the floating header, which is at the top left.
+                                nocturne_engine::ToolbarDock::Top | nocturne_engine::ToolbarDock::Left => {
+                                    self.header_pill_rect.map_or(0.0, |r| r.height() + 6.0)
+                                }
+                            };
+                            let (acts, pill_rect) = crate::tablet_chrome::show_pencil_pill(
+                                ui.ctx(),
+                                view,
+                                edge_clearance,
+                                studio,
+                                self.tool_settings_open,
+                                &pill_view,
+                                &tokens,
+                            );
+                            self.pencil_pill_rect = pill_rect;
+                            pill_acts = acts;
+                            pill_rect
                         };
-                        let edge_clearance = match studio.toolbar_dock {
-                            nocturne_engine::ToolbarDock::Bottom => hbar_clearance,
-                            nocturne_engine::ToolbarDock::Right => reserve,
-                            // Under the floating header, which is at the top left.
-                            nocturne_engine::ToolbarDock::Top | nocturne_engine::ToolbarDock::Left => {
-                                self.header_pill_rect.map_or(0.0, |r| r.height() + 6.0)
-                            }
-                        };
-                        let (acts, pill_rect) = crate::tablet_chrome::show_pencil_pill(
-                            ui.ctx(),
-                            view,
-                            edge_clearance,
-                            studio,
-                            self.tool_settings_open,
-                            &pill_view,
-                            &tokens,
-                        );
-                        self.pencil_pill_rect = pill_rect;
-                        pill_acts = acts;
                         if self.tool_settings_open && self.dialog.is_none() {
                             let options = self.session.ink_options();
                             let input = crate::tool_settings::ToolSettingsIn {
@@ -9867,7 +9975,7 @@ impl NocturneApp {
                     {
                         start_ocr = crate::math_ocr::convert_button(ui.ctx(), held_rect, view, &tokens);
                     }
-                    if self.show_minimap {
+                    if show_minimap {
                         let stroke_bounds = pad.as_ref().map(crate::inkpad::Pad::stroke_bounds).unwrap_or_default();
                         minimap_out = crate::minimap::show(
                             ui.ctx(),
@@ -10040,10 +10148,10 @@ impl NocturneApp {
             self.sync_dirty_since_last = true;
             self.last_local_edit_at = Some(now);
         }
-        // A change to the ink is finished once no button is down: what it was before becomes a
-        // step undo can go back to.
+        // A change to the ink is finished once no ink gesture is active (a resting palm may still
+        // hold the window's primary pointer down after the stylus lifts).
         if let Some(pad) = self.pad.as_mut()
-            && !ui.input(|i| i.pointer.any_down())
+            && !pad.gesture_active()
         {
             pad.settle();
         }
@@ -10188,49 +10296,49 @@ impl NocturneApp {
             log::debug!("discarding stale missing-icon warning: page={page:?} attachment={name:?}");
             return;
         }
+        let tokens = self.tokens;
         let mut keep = true;
         let mut next = dialog;
         match &mut next {
             Dialog::ClearTelemetry { path } => {
                 let mut clear = false;
                 let mut cancel = false;
-                egui::Window::new(crate::tl_id!("ui.clear_telemetry"))
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .frame(modal_frame(&self.tokens))
-                    .show(ctx, |ui| {
-                        ui.set_min_width(440.0);
-                        modal_title(ui, &self.tokens, crate::tl_id!("ui.clear_telemetry"));
-                        ui.label(crate::tl_id!("ui.clear_all_local_telemetry_sessions_and_exported_tele_e4f5e2340d"));
-                        ui.add_space(5.0);
-                        ui.colored_label(self.tokens.warn, crate::tl_id!("ui.this_cannot_be_undone"));
-                        ui.add_space(14.0);
-                        ui.horizontal(|ui| {
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.cancel"), false).clicked() {
-                                cancel = true;
-                            }
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.clear_telemetry"), true).clicked() {
-                                clear = true;
-                            }
-                        });
-                    });
+                let res = crate::modal::Modal::new("clear-telemetry-modal", crate::tl_id!("ui.clear_telemetry"))
+                    .backdrop_id("clear-telemetry-modal-backdrop")
+                    .width(440.0)
+                    .show_with_footer(
+                        ctx,
+                        &tokens,
+                        |ui| {
+                            ui.label(crate::tl_id!("ui.clear_all_local_telemetry_sessions_and_exported_tele_e4f5e2340d"));
+                            ui.add_space(6.0);
+                            ui.colored_label(tokens.warn, crate::tl_id!("ui.this_cannot_be_undone"));
+                        },
+                        |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if crate::modal::secondary_button(ui, crate::tl_id!("ui.cancel"), &tokens).clicked() {
+                                    cancel = true;
+                                }
+                                if crate::modal::danger_button(ui, crate::tl_id!("ui.clear_telemetry"), &tokens).clicked() {
+                                    clear = true;
+                                }
+                            });
+                        },
+                    );
                 if clear {
                     let _ = std::fs::remove_dir_all(path);
                     keep = false;
-                } else if cancel {
+                } else if cancel || res.closed {
                     keep = false;
                 }
             }
             Dialog::FirstUseWizard { step, level, format, add_demo, error } => {
                 let mut back = false;
-                let mut next = false;
+                let mut next_step = false;
                 let mut finish = false;
                 let last_step: u8 = 4;
                 let escape = ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape));
-                let backdrop = modal_backdrop(ctx, "first-use-wizard-modal-backdrop");
-                let panel = self.tokens.panel;
-                let dark = (u32::from(panel.r()) + u32::from(panel.g()) + u32::from(panel.b())) < 384;
+                let dark = tokens.is_dark();
                 let (banner_uri, banner_bytes) = if dark {
                     ("bytes://nocturne-wizard-banner-dark", crate::BANNER_DARK_PNG)
                 } else {
@@ -10244,82 +10352,84 @@ impl NocturneApp {
                     _ => crate::tl_id!("ui.welcome_wizard_done_title"),
                 }
                 .to_string();
-                egui::Window::new(title.as_str())
-                    .title_bar(false)
-                    .collapsible(false)
-                    .resizable(false)
-                    .order(egui::Order::Foreground)
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .frame(modal_frame(&self.tokens))
-                    .show(ctx, |ui| {
-                        stay_above(ui, backdrop);
-                        ui.set_min_width(520.0);
-                        if *step == 0 {
-                            ui.add(egui::Image::from_bytes(banner_uri, banner_bytes).fit_to_exact_size(vec2(480.0, 240.0)));
-                            ui.add_space(8.0);
-                        }
-                        modal_title(ui, &self.tokens, title.as_str());
-                        match *step {
-                            0 => {}
-                            1 => {
-                                ui.label(crate::tl_id!("ui.privacy_is_our_top_priority_all_logs_and_telemetry_s_d87cae4eac"));
-                                ui.add_space(6.0);
-                                ui.label(crate::tl_id!("ui.choose_a_local_collection_level_logging_is_off_by_de_5dfbe386e0"));
-                                egui::ComboBox::from_label(crate::tl_id!("ui.local_collection_level"))
-                                    .selected_text(crate::tl!(level.as_str()))
-                                    .show_ui(ui, |ui| {
-                                        for choice in ["none", "usage", "warning", "error", "debug"] {
-                                            ui.selectable_value(level, choice.into(), crate::tl!(choice));
-                                        }
-                                    });
-                            }
-                            2 => {
-                                ui.label(crate::tl_id!("ui.welcome_format_body"));
+                let _ = crate::modal::Modal::new("first-use-wizard-modal", title.as_str())
+                    .backdrop_id("first-use-wizard-modal-backdrop")
+                    .width(540.0)
+                    .closable(false)
+                    .close_on_escape(false)
+                    .show_with_footer(
+                        ctx,
+                        &tokens,
+                        |ui| {
+                            if *step == 0 {
+                                let bw = ui.available_width().clamp(160.0, 480.0);
+                                ui.add(egui::Image::from_bytes(banner_uri, banner_bytes).fit_to_exact_size(vec2(bw, bw * 0.5)));
                                 ui.add_space(8.0);
-                                for choice in PageFormat::ALL {
-                                    ui.radio_value(&mut *format, choice, choice.label());
+                            }
+                            match *step {
+                                0 => {}
+                                1 => {
+                                    ui.label(crate::tl_id!("ui.privacy_is_our_top_priority_all_logs_and_telemetry_s_d87cae4eac"));
+                                    ui.add_space(6.0);
+                                    ui.label(crate::tl_id!("ui.choose_a_local_collection_level_logging_is_off_by_de_5dfbe386e0"));
+                                    egui::ComboBox::from_label(crate::tl_id!("ui.local_collection_level"))
+                                        .selected_text(crate::tl!(level.as_str()))
+                                        .popup_style(crate::theme::picker_popup_style(tokens))
+                                        .show_ui(ui, |ui| {
+                                            for choice in ["none", "usage", "warning", "error", "debug"] {
+                                                ui.selectable_value(level, choice.into(), crate::tl!(choice));
+                                            }
+                                        });
                                 }
-                            }
-                            3 => {
-                                ui.label(crate::tl_id!("ui.welcome_notebook_prompt_body"));
-                                ui.label(crate::i18n::format_message_id("ui.welcome_notebook_prompt_format", &[("format", format.label())]));
-                                ui.add_space(6.0);
-                                ui.colored_label(self.tokens.warn, crate::tl_id!("ui.welcome_notebook_replace_warning"));
-                                ui.add_space(8.0);
-                                ui.radio_value(&mut *add_demo, true, crate::tl_id!("ui.welcome_notebook_add_yes"));
-                                ui.radio_value(&mut *add_demo, false, crate::tl_id!("ui.welcome_notebook_add_no"));
-                            }
-                            _ => {
-                                ui.label(crate::tl_id!("ui.welcome_wizard_done_body"));
-                            }
-                        }
-                        if let Some(message) = error {
-                            ui.add_space(8.0);
-                            ui.colored_label(
-                                self.tokens.warn,
-                                crate::i18n::format_message_id("ui.welcome_notebook_action_failed", &[("error", message)]),
-                            );
-                        }
-                        ui.add_space(14.0);
-                        ui.horizontal(|ui| {
-                            if *step > 0 && modal_button(ui, &self.tokens, crate::tl_id!("ui.welcome_wizard_back"), false).clicked() {
-                                back = true;
-                            }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if *step < last_step {
-                                    if modal_button(ui, &self.tokens, crate::tl_id!("ui.welcome_format_next"), true).clicked() {
-                                        next = true;
+                                2 => {
+                                    ui.label(crate::tl_id!("ui.welcome_format_body"));
+                                    ui.add_space(8.0);
+                                    for choice in PageFormat::ALL {
+                                        ui.radio_value(&mut *format, choice, choice.label());
                                     }
-                                } else if modal_button(ui, &self.tokens, crate::tl_id!("ui.welcome_wizard_finish"), true).clicked() {
-                                    finish = true;
                                 }
+                                3 => {
+                                    ui.label(crate::tl_id!("ui.welcome_notebook_prompt_body"));
+                                    ui.label(crate::i18n::format_message_id("ui.welcome_notebook_prompt_format", &[("format", format.label())]));
+                                    ui.add_space(6.0);
+                                    ui.colored_label(tokens.warn, crate::tl_id!("ui.welcome_notebook_replace_warning"));
+                                    ui.add_space(8.0);
+                                    ui.radio_value(&mut *add_demo, true, crate::tl_id!("ui.welcome_notebook_add_yes"));
+                                    ui.radio_value(&mut *add_demo, false, crate::tl_id!("ui.welcome_notebook_add_no"));
+                                }
+                                _ => {
+                                    ui.label(crate::tl_id!("ui.welcome_wizard_done_body"));
+                                }
+                            }
+                            if let Some(message) = error {
+                                ui.add_space(8.0);
+                                ui.colored_label(
+                                    tokens.warn,
+                                    crate::i18n::format_message_id("ui.welcome_notebook_action_failed", &[("error", message)]),
+                                );
+                            }
+                        },
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                if *step > 0 && crate::modal::secondary_button(ui, crate::tl_id!("ui.welcome_wizard_back"), &tokens).clicked() {
+                                    back = true;
+                                }
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if *step < last_step {
+                                        if crate::modal::primary_button(ui, crate::tl_id!("ui.welcome_format_next"), &tokens).clicked() {
+                                            next_step = true;
+                                        }
+                                    } else if crate::modal::primary_button(ui, crate::tl_id!("ui.welcome_wizard_finish"), &tokens).clicked() {
+                                        finish = true;
+                                    }
+                                });
                             });
-                        });
-                    });
+                        },
+                    );
                 if back {
                     *step = step.saturating_sub(1);
                 }
-                if next {
+                if next_step {
                     *step = (*step + 1).min(last_step);
                 }
                 if escape && !finish && *step > 0 {
@@ -10335,25 +10445,23 @@ impl NocturneApp {
             }
             Dialog::Alert { key, title, message, suppress, suppress_forever } => {
                 let mut ok = false;
-                egui::Window::new(title.as_str())
-                    .title_bar(false)
-                    .collapsible(false)
-                    .resizable(false)
-                    .order(egui::Order::Foreground)
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .frame(modal_frame(&self.tokens))
-                    .show(ctx, |ui| {
-                        modal_title(ui, &self.tokens, title.as_str());
-                        ui.set_min_width(420.0);
+                let res = crate::modal::Modal::new("alert-modal", title.as_str()).backdrop_id("alert-modal-backdrop").width(440.0).show_with_footer(
+                    ctx,
+                    &tokens,
+                    |ui| {
                         ui.label(crate::i18n::pseudo_dynamic(message));
                         ui.add_space(8.0);
                         ui.checkbox(suppress, crate::tl_id!("ui.don_t_show_this_again_in_this_session"));
                         ui.checkbox(suppress_forever, crate::tl_id!("ui.don_t_show_this_ever"));
-                        ui.add_space(12.0);
-                        if modal_button(ui, &self.tokens, crate::tl_id!("ui.ok"), true).clicked() {
-                            ok = true;
-                        }
-                    });
+                    },
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            if crate::modal::primary_button(ui, crate::tl_id!("ui.ok"), &tokens).clicked() {
+                                ok = true;
+                            }
+                        });
+                    },
+                );
                 if ok {
                     if *suppress {
                         self.muted_alerts.insert(key.clone());
@@ -10362,39 +10470,74 @@ impl NocturneApp {
                         let _ = self.session.settings.set(&format!("{key}_never"), "true");
                     }
                     keep = false;
+                } else if res.closed {
+                    keep = false;
                 }
             }
             Dialog::ResetPreferences => {
                 let mut reset = false;
                 let mut cancel = false;
-                egui::Window::new(crate::tl_id!("ui.reset_app_preferences"))
-                    .title_bar(false)
-                    .collapsible(false)
-                    .resizable(false)
-                    .order(egui::Order::Foreground)
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .frame(modal_frame(&self.tokens))
-                    .show(ctx, |ui| {
-                        modal_title(ui, &self.tokens, crate::tl_id!("ui.reset_app_preferences"));
-                        ui.set_min_width(460.0);
-                        ui.label(crate::tl_id!("ui.reset_nocturne_s_saved_preferences_to_their_built_in_defaults"));
-                        ui.add_space(6.0);
-                        ui.colored_label(self.tokens.warn, crate::tl_id!("ui.this_does_not_delete_notebooks_or_pages_it_cannot_be_undone"));
-                        ui.add_space(14.0);
-                        ui.horizontal(|ui| {
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.reset_preferences"), true).clicked() {
-                                reset = true;
-                            }
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.cancel"), false).clicked() {
-                                cancel = true;
-                            }
-                        });
-                    });
+                let res = crate::modal::Modal::new("reset-preferences-modal", crate::tl_id!("ui.reset_app_preferences"))
+                    .backdrop_id("reset-preferences-modal-backdrop")
+                    .width(460.0)
+                    .show_with_footer(
+                        ctx,
+                        &tokens,
+                        |ui| {
+                            ui.label(crate::tl_id!("ui.reset_nocturne_s_saved_preferences_to_their_built_in_defaults"));
+                            ui.add_space(6.0);
+                            ui.colored_label(tokens.warn, crate::tl_id!("ui.this_does_not_delete_notebooks_or_pages_it_cannot_be_undone"));
+                        },
+                        |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if crate::modal::danger_button(ui, crate::tl_id!("ui.reset_preferences"), &tokens).clicked() {
+                                    reset = true;
+                                }
+                                if crate::modal::secondary_button(ui, crate::tl_id!("ui.cancel"), &tokens).clicked() {
+                                    cancel = true;
+                                }
+                            });
+                        },
+                    );
                 if reset {
                     match self.session.settings.reset() {
                         Ok(()) => {
+                            let ink_defaults = nocturne_engine::InkOptions::default();
+                            let studio_defaults = nocturne_engine::StudioOptions::default();
+                            self.session.set_finger_drawing(false);
+                            self.session.set_eraser_kind(ink_defaults.eraser_kind);
+                            self.session.set_eraser_width(ink_defaults.eraser_width);
+                            self.session.set_hold_to_straighten(ink_defaults.hold_to_straighten);
+                            self.session.set_toolbar_dock(studio_defaults.toolbar_dock);
+                            self.session.set_dock_roster(studio_defaults.roster);
+                            self.session.set_library_view(studio_defaults.library_view);
+                            self.session.set_layout_mode(studio_defaults.layout_mode);
+                            let _ = self.session.settings.reset();
+                            self.mode_pref = ModePref::System;
+                            self.accent = Accent::Default;
+                            self.applied_theme = None;
+                            self.ui_language = crate::i18n::AUTO.into();
+                            crate::i18n::set_current(&self.ui_language);
                             self.ui_scale = 100;
                             self.ui_scale_pending = true;
+                            self.last_tablet_studio = self.is_tablet_studio(ctx);
+                            self.minimap_override = None;
+                            self.minimap_collapsed = true;
+                            self.qat = quickaccess::Config::default();
+                            self.rack = nocturne_ink::rack::parse("");
+                            self.nib = 0;
+                            self.sensitivity = DEFAULT_SENSITIVITY;
+                            self.pressure_curve = nocturne_ink::PressureCurve::default();
+                            self.rules = ribbon::RuleLines::default();
+                            self.hide_title = false;
+                            self.snap_to_grid = false;
+                            self.ribbon_collapsed = false;
+                            self.split_panes = true;
+                            self.eraser_auto_return = false;
+                            self.open_attachment_warning_suppressed = false;
+                            self.muted_alerts.clear();
+                            self.cached_sync_config = None;
+                            self.sync_tool_state_to_session();
                             self.dialog = Some(self.first_use_wizard());
                         }
                         Err(e) => {
@@ -10402,7 +10545,7 @@ impl NocturneApp {
                         }
                     }
                     keep = false;
-                } else if cancel {
+                } else if cancel || res.closed {
                     keep = false;
                 }
             }
@@ -10410,35 +10553,32 @@ impl NocturneApp {
                 let mut repair = false;
                 let mut leave = false;
                 let mut suppress = self.icon_recovery_suppressed;
-                let backdrop = modal_backdrop(ctx, "missing-attachment-icon-backdrop");
-                egui::Window::new(crate::tl_id!("ui.attachment_recovery"))
-                    .title_bar(false)
-                    .collapsible(false)
-                    .resizable(false)
-                    .order(egui::Order::Foreground)
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .frame(modal_frame(&self.tokens))
-                    .show(ctx, |ui| {
-                        stay_above(ui, backdrop);
-                        modal_title(ui, &self.tokens, crate::tl_id!("ui.attachment_icon_missing"));
-                        ui.set_min_width(520.0);
-                        let message =
-                            crate::i18n::format_message_id("ui.nocturne_found_an_attachment_without_its_generated_icon_name", &[("name", name)]);
-                        ui.label(egui::RichText::new(message).strong());
-                        ui.add_space(6.0);
-                        ui.label(crate::tl_id!("ui.the_original_file_is_still_safe_nocturne_can_regene_f10ded524a"));
-                        ui.add_space(8.0);
-                        ui.checkbox(&mut suppress, crate::tl_id!("ui.do_not_warn_about_similar_missing_icons_again_this_session"));
-                        ui.add_space(12.0);
-                        ui.horizontal(|ui| {
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.repair_icon"), true).clicked() {
-                                repair = true;
-                            }
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.leave_it"), false).clicked() {
-                                leave = true;
-                            }
-                        });
-                    });
+                let res = crate::modal::Modal::new("missing-attachment-icon-modal", crate::tl_id!("ui.attachment_icon_missing"))
+                    .backdrop_id("missing-attachment-icon-backdrop")
+                    .width(520.0)
+                    .show_with_footer(
+                        ctx,
+                        &tokens,
+                        |ui| {
+                            let message =
+                                crate::i18n::format_message_id("ui.nocturne_found_an_attachment_without_its_generated_icon_name", &[("name", name)]);
+                            ui.label(egui::RichText::new(message).strong().color(tokens.strong));
+                            ui.add_space(6.0);
+                            ui.label(crate::tl_id!("ui.the_original_file_is_still_safe_nocturne_can_regene_f10ded524a"));
+                            ui.add_space(8.0);
+                            ui.checkbox(&mut suppress, crate::tl_id!("ui.do_not_warn_about_similar_missing_icons_again_this_session"));
+                        },
+                        |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if crate::modal::primary_button(ui, crate::tl_id!("ui.repair_icon"), &tokens).clicked() {
+                                    repair = true;
+                                }
+                                if crate::modal::secondary_button(ui, crate::tl_id!("ui.leave_it"), &tokens).clicked() {
+                                    leave = true;
+                                }
+                            });
+                        },
+                    );
                 if repair {
                     self.icon_recovery_suppressed = suppress;
                     match nocturne_store::assets::ensure_icon(page, name).and_then(|()| {
@@ -10461,7 +10601,7 @@ impl NocturneApp {
                         }
                     }
                     keep = false;
-                } else if leave {
+                } else if leave || res.closed {
                     self.icon_recovery_suppressed = suppress;
                     log::error!("user declined missing attachment icon repair: page={:?} attachment={name:?}", page);
                     keep = false;
@@ -10473,35 +10613,34 @@ impl NocturneApp {
                 let mut restore = false;
                 let mut leave = false;
                 let mut suppress = self.icon_recovery_suppressed;
-                let backdrop = modal_backdrop(ctx, "unreferenced-attachment-backdrop");
-                egui::Window::new(crate::tl_id!("ui.attachment_recovery"))
-                    .title_bar(false)
-                    .collapsible(false)
-                    .resizable(false)
-                    .order(egui::Order::Foreground)
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .frame(modal_frame(&self.tokens))
-                    .show(ctx, |ui| {
-                        stay_above(ui, backdrop);
-                        modal_title(ui, &self.tokens, crate::tl_id!("ui.attachment_not_linked"));
-                        ui.set_min_width(520.0);
-                        let message =
-                            crate::i18n::format_message_id("ui.nocturne_found_an_attachment_that_is_not_referenced_8c0eb51257", &[("name", name)]);
-                        ui.label(egui::RichText::new(message).strong());
-                        ui.add_space(6.0);
-                        ui.label(crate::tl_id!("ui.the_file_is_safe_nocturne_can_append_a_link_to_it_a_c31b3d9716"));
-                        ui.add_space(8.0);
-                        ui.checkbox(&mut suppress, crate::tl_id!("ui.do_not_warn_about_similar_attachment_issues_again_this_session"));
-                        ui.add_space(12.0);
-                        ui.horizontal(|ui| {
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.append_link"), true).clicked() {
-                                restore = true;
-                            }
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.leave_it"), false).clicked() {
-                                leave = true;
-                            }
-                        });
-                    });
+                let res = crate::modal::Modal::new("unreferenced-attachment-modal", crate::tl_id!("ui.attachment_not_linked"))
+                    .backdrop_id("unreferenced-attachment-backdrop")
+                    .width(520.0)
+                    .show_with_footer(
+                        ctx,
+                        &tokens,
+                        |ui| {
+                            let message = crate::i18n::format_message_id(
+                                "ui.nocturne_found_an_attachment_that_is_not_referenced_8c0eb51257",
+                                &[("name", name)],
+                            );
+                            ui.label(egui::RichText::new(message).strong().color(tokens.strong));
+                            ui.add_space(6.0);
+                            ui.label(crate::tl_id!("ui.the_file_is_safe_nocturne_can_append_a_link_to_it_a_c31b3d9716"));
+                            ui.add_space(8.0);
+                            ui.checkbox(&mut suppress, crate::tl_id!("ui.do_not_warn_about_similar_attachment_issues_again_this_session"));
+                        },
+                        |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if crate::modal::primary_button(ui, crate::tl_id!("ui.append_link"), &tokens).clicked() {
+                                    restore = true;
+                                }
+                                if crate::modal::secondary_button(ui, crate::tl_id!("ui.leave_it"), &tokens).clicked() {
+                                    leave = true;
+                                }
+                            });
+                        },
+                    );
                 if restore {
                     self.icon_recovery_suppressed = suppress;
                     match self.repair_attachment_reference(page, name) {
@@ -10519,7 +10658,7 @@ impl NocturneApp {
                         }
                     }
                     keep = false;
-                } else if leave {
+                } else if leave || res.closed {
                     self.icon_recovery_suppressed = suppress;
                     log::error!("user declined unreferenced attachment recovery: page={:?} attachment={name:?}", page);
                     keep = false;
@@ -10531,35 +10670,37 @@ impl NocturneApp {
                 let mut open = false;
                 let mut cancel = false;
                 let mut suppress = self.open_attachment_warning_suppressed;
-                let backdrop = modal_backdrop(ctx, "open-attachment-warning-backdrop");
-                egui::Window::new(crate::tl_id!("ui.open_attachment"))
-                    .title_bar(false)
-                    .collapsible(false)
-                    .resizable(false)
-                    .order(egui::Order::Foreground)
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .frame(modal_frame(&self.tokens))
-                    .show(ctx, |ui| {
-                        stay_above(ui, backdrop);
-                        modal_title(ui, &self.tokens, crate::tl_id!("ui.open_attachment"));
-                        ui.set_min_width(520.0);
-                        ui.label(egui::RichText::new(crate::tl_id!("ui.this_file_will_be_opened_by_its_associated_application")).strong());
-                        ui.add_space(6.0);
-                        ui.label(self.shown(path).to_string());
-                        ui.add_space(6.0);
-                        ui.label(crate::tl_id!("ui.only_open_it_if_you_trust_the_file_and_the_person_who_created_it"));
-                        ui.add_space(8.0);
-                        ui.checkbox(&mut suppress, crate::tl_id!("ui.do_not_warn_again_for_this_file_type_this_session"));
-                        ui.add_space(12.0);
-                        ui.horizontal(|ui| {
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.open"), true).clicked() {
-                                open = true;
-                            }
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.cancel"), false).clicked() {
-                                cancel = true;
-                            }
-                        });
-                    });
+                let shown_path = self.shown(path);
+                let res = crate::modal::Modal::new("open-attachment-warning-modal", crate::tl_id!("ui.open_attachment"))
+                    .backdrop_id("open-attachment-warning-backdrop")
+                    .width(520.0)
+                    .show_with_footer(
+                        ctx,
+                        &tokens,
+                        |ui| {
+                            ui.label(
+                                egui::RichText::new(crate::tl_id!("ui.this_file_will_be_opened_by_its_associated_application"))
+                                    .strong()
+                                    .color(tokens.strong),
+                            );
+                            ui.add_space(6.0);
+                            ui.label(shown_path);
+                            ui.add_space(6.0);
+                            ui.label(crate::tl_id!("ui.only_open_it_if_you_trust_the_file_and_the_person_who_created_it"));
+                            ui.add_space(8.0);
+                            ui.checkbox(&mut suppress, crate::tl_id!("ui.do_not_warn_again_for_this_file_type_this_session"));
+                        },
+                        |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if crate::modal::primary_button(ui, crate::tl_id!("ui.open"), &tokens).clicked() {
+                                    open = true;
+                                }
+                                if crate::modal::secondary_button(ui, crate::tl_id!("ui.cancel"), &tokens).clicked() {
+                                    cancel = true;
+                                }
+                            });
+                        },
+                    );
                 if open {
                     self.open_attachment_warning_suppressed = suppress;
                     match open_file_for_viewer(path) {
@@ -10567,7 +10708,7 @@ impl NocturneApp {
                         Err(e) => self.complain(&crate::i18n::format_message_id("ui.could_not_open_the_file_error", &[("error", &e.to_string())])),
                     }
                     keep = false;
-                } else if cancel {
+                } else if cancel || res.closed {
                     self.open_attachment_warning_suppressed = suppress;
                     log::info!("user cancelled opening attachment: file={:?}", path);
                     keep = false;
@@ -10586,67 +10727,67 @@ impl NocturneApp {
                 } else {
                     crate::i18n::format_message_id("ui.add_name", &[("name", &name)])
                 };
-                egui::Window::new(crate::tl_id!("ui.file_options"))
-                    .collapsible(false)
-                    .resizable(false)
-                    .title_bar(false)
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .frame(modal_frame(&self.tokens))
-                    .show(ctx, |ui| {
-                        ui.set_min_width(380.0);
-                        modal_title(ui, &self.tokens, &title);
-                        ui.label(
-                            egui::RichText::new(crate::tl_id!("ui.what_should_happen_to_this_file")).strong().size(16.0).color(self.tokens.text),
-                        );
-                        ui.add_space(6.0);
-                        let copy_label = match kind {
-                            nocturne_store::assets::MediaKind::Image => crate::tl_id!("ui.insert_the_picture"),
-                            nocturne_store::assets::MediaKind::Video => crate::tl_id!("ui.insert_the_video"),
-                            nocturne_store::assets::MediaKind::Audio => crate::tl_id!("ui.insert_the_recording"),
-                            nocturne_store::assets::MediaKind::Other => crate::tl_id!("ui.attach_the_file"),
-                        };
-                        if modal_button(ui, &self.tokens, copy_label, true).clicked() {
-                            log::debug!("file attach choice clicked: choice=copy name={name:?}");
-                            chosen = Some(FileChoice::Copy);
-                        }
-                        ui.label(
-                            egui::RichText::new(crate::tl_id!("ui.a_copy_goes_into_this_page_s_folder_so_the_notebook_5f331e4138"))
-                                .small()
-                                .color(self.tokens.muted),
-                        );
-                        ui.add_space(6.0);
-                        let can_printout = printout::supports(&file);
-                        if modal_button_enabled(ui, &self.tokens, crate::tl_id!("ui.insert_printout"), false, can_printout).clicked() {
-                            log::debug!("file attach choice clicked: choice=printout name={name:?}");
-                            chosen = Some(FileChoice::Printout);
-                        }
-                        ui.label(
-                            egui::RichText::new(if can_printout {
-                                crate::tl_id!("ui.copies_the_file_and_inserts_one_picture_for_each_printed_page")
-                            } else {
-                                crate::tl_id!("ui.printout_is_available_for_pdf_and_office_documents")
-                            })
-                            .small()
-                            .color(self.tokens.muted),
-                        );
-                        ui.add_space(6.0);
-                        if modal_button(ui, &self.tokens, crate::tl_id!("ui.link_to_the_file_where_it_is"), false).clicked() {
-                            log::debug!("file attach choice clicked: choice=link name={name:?}");
-                            chosen = Some(FileChoice::Link);
-                        }
-                        ui.label(
-                            egui::RichText::new(crate::tl_id!("ui.nothing_is_copied_the_link_breaks_if_the_file_moves"))
-                                .small()
-                                .color(self.tokens.muted),
-                        );
-                        ui.add_space(6.0);
-                        ui.add_space(2.0);
-                        ui.horizontal(|ui| {
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.cancel"), false).clicked() {
-                                keep = false;
+                let res =
+                    crate::modal::Modal::new("file-options-modal", &title).backdrop_id("file-options-modal-backdrop").width(420.0).show_with_footer(
+                        ctx,
+                        &tokens,
+                        |ui| {
+                            ui.label(
+                                egui::RichText::new(crate::tl_id!("ui.what_should_happen_to_this_file")).strong().size(15.0).color(tokens.strong),
+                            );
+                            ui.add_space(8.0);
+                            let copy_label = match kind {
+                                nocturne_store::assets::MediaKind::Image => crate::tl_id!("ui.insert_the_picture"),
+                                nocturne_store::assets::MediaKind::Video => crate::tl_id!("ui.insert_the_video"),
+                                nocturne_store::assets::MediaKind::Audio => crate::tl_id!("ui.insert_the_recording"),
+                                nocturne_store::assets::MediaKind::Other => crate::tl_id!("ui.attach_the_file"),
+                            };
+                            if crate::modal::primary_button(ui, copy_label, &tokens).clicked() {
+                                log::debug!("file attach choice clicked: choice=copy name={name:?}");
+                                chosen = Some(FileChoice::Copy);
                             }
-                        });
-                    });
+                            ui.label(
+                                egui::RichText::new(crate::tl_id!("ui.a_copy_goes_into_this_page_s_folder_so_the_notebook_5f331e4138"))
+                                    .small()
+                                    .color(tokens.muted),
+                            );
+                            ui.add_space(8.0);
+                            let can_printout = printout::supports(&file);
+                            if crate::modal::secondary_button_enabled(ui, crate::tl_id!("ui.insert_printout"), can_printout, &tokens).clicked() {
+                                log::debug!("file attach choice clicked: choice=printout name={name:?}");
+                                chosen = Some(FileChoice::Printout);
+                            }
+                            ui.label(
+                                egui::RichText::new(if can_printout {
+                                    crate::tl_id!("ui.copies_the_file_and_inserts_one_picture_for_each_printed_page")
+                                } else {
+                                    crate::tl_id!("ui.printout_is_available_for_pdf_and_office_documents")
+                                })
+                                .small()
+                                .color(tokens.muted),
+                            );
+                            ui.add_space(8.0);
+                            if crate::modal::secondary_button(ui, crate::tl_id!("ui.link_to_the_file_where_it_is"), &tokens).clicked() {
+                                log::debug!("file attach choice clicked: choice=link name={name:?}");
+                                chosen = Some(FileChoice::Link);
+                            }
+                            ui.label(
+                                egui::RichText::new(crate::tl_id!("ui.nothing_is_copied_the_link_breaks_if_the_file_moves"))
+                                    .small()
+                                    .color(tokens.muted),
+                            );
+                        },
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                if crate::modal::secondary_button(ui, crate::tl_id!("ui.cancel"), &tokens).clicked() {
+                                    keep = false;
+                                }
+                            });
+                        },
+                    );
+                if res.closed {
+                    keep = false;
+                }
                 if let Some(how) = chosen {
                     self.add_file(&dir, &file, how);
                     if let Dialog::FileOptions { files, .. } = &mut next {
@@ -10656,37 +10797,37 @@ impl NocturneApp {
                 }
             }
             Dialog::NewNotebook { name, format } => {
-                let mut go = false;
-                let backdrop = modal_backdrop(ctx, "new-notebook-modal-backdrop");
-                egui::Window::new(crate::tl_id!("ui.new_notebook"))
-                    .title_bar(false)
-                    .collapsible(false)
-                    .resizable(false)
-                    .order(egui::Order::Foreground)
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .frame(modal_frame(&self.tokens))
-                    .show(ctx, |ui| {
-                        stay_above(ui, backdrop);
-                        modal_title(ui, &self.tokens, crate::tl_id!("ui.new_notebook"));
-                        ui.set_min_width(420.0);
-                        ui.label(crate::tl_id!("ui.name_2"));
-                        let r = name_field(ui, name, NEW_NOTEBOOK_FIELD, opened_now);
-                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                        format_picker(ui, format);
-                        ui.add_space(12.0);
-                        ui.horizontal(|ui| {
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.cancel"), false).clicked() {
-                                keep = false;
-                            }
-                            let ready = !name.trim().is_empty();
-                            let create =
-                                ui.add_enabled_ui(ready, |ui| modal_button(ui, &self.tokens, crate::tl_id!("ui.create"), true).clicked()).inner;
-                            if (create || enter) && ready {
-                                go = true;
-                            }
-                        });
-                    });
-                if go {
+                let ready = !name.trim().is_empty();
+                let mut create_clicked = false;
+                let mut enter = false;
+                let res = crate::modal::Modal::new("new-notebook-modal", crate::tl_id!("ui.new_notebook"))
+                    .backdrop_id("new-notebook-modal-backdrop")
+                    .width(440.0)
+                    .show_with_footer(
+                        ctx,
+                        &tokens,
+                        |ui| {
+                            ui.label(crate::tl_id!("ui.name_2"));
+                            let r = name_field(ui, name, NEW_NOTEBOOK_FIELD, opened_now);
+                            enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                            ui.add_space(6.0);
+                            format_picker(ui, format);
+                        },
+                        |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if crate::modal::secondary_button(ui, crate::tl_id!("ui.cancel"), &tokens).clicked() {
+                                    keep = false;
+                                }
+                                if crate::modal::primary_button_enabled(ui, crate::tl_id!("ui.create"), ready, &tokens).clicked() {
+                                    create_clicked = true;
+                                }
+                            });
+                        },
+                    );
+                if res.closed {
+                    keep = false;
+                }
+                if (create_clicked || enter) && !name.trim().is_empty() {
                     let mut p = params(&[("name", name.trim())]);
                     if let Some(f) = format {
                         p.insert("format".into(), f.id().into());
@@ -10699,57 +10840,55 @@ impl NocturneApp {
                 }
             }
             Dialog::Add { parent, parent_kind, title, kind, format } => {
-                let mut go = false;
+                let ready = !title.trim().is_empty();
+                let mut create_clicked = false;
+                let mut enter = false;
                 let heading = if *parent_kind == NodeKind::Page {
                     crate::tl_id!("ui.add_a_sub_page").to_string()
                 } else {
                     let kind = crate::tl!(parent_kind.label());
                     crate::i18n::format_message_id("ui.add_inside_this_kind", &[("kind", &kind.to_lowercase())])
                 };
-                let backdrop = modal_backdrop(ctx, "add-modal-backdrop");
-                egui::Window::new(heading.clone())
-                    .title_bar(false)
-                    .collapsible(false)
-                    .resizable(false)
-                    .order(egui::Order::Foreground)
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .frame(modal_frame(&self.tokens))
-                    .show(ctx, |ui| {
-                        stay_above(ui, backdrop);
-                        modal_title(ui, &self.tokens, &heading);
-                        ui.set_min_width(420.0);
+                let res = crate::modal::Modal::new("add-modal", &heading).backdrop_id("add-modal-backdrop").width(440.0).show_with_footer(
+                    ctx,
+                    &tokens,
+                    |ui| {
                         let kinds = parent_kind.may_contain();
                         if kinds.len() > 1 {
                             ui.label(crate::tl_id!("ui.what_to_add"));
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 for k in kinds {
                                     ui.selectable_value(kind, *k, crate::tl!(k.label()));
                                 }
                             });
+                            ui.add_space(6.0);
                         }
                         ui.label(crate::tl_id!("ui.title_2"));
                         let r = name_field(ui, title, ADD_FIELD, opened_now);
-                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        ui.add_space(6.0);
                         ui.label(if *kind == NodeKind::Page {
                             crate::tl_id!("ui.format_for_this_page")
                         } else {
                             crate::tl_id!("ui.default_format_for_pages_below")
                         });
                         format_picker(ui, format);
-                        ui.add_space(12.0);
-                        ui.horizontal(|ui| {
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.cancel"), false).clicked() {
+                    },
+                    |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            if crate::modal::secondary_button(ui, crate::tl_id!("ui.cancel"), &tokens).clicked() {
                                 keep = false;
                             }
-                            let ready = !title.trim().is_empty();
-                            let create =
-                                ui.add_enabled_ui(ready, |ui| modal_button(ui, &self.tokens, crate::tl_id!("ui.create"), true).clicked()).inner;
-                            if (create || enter) && ready {
-                                go = true;
+                            if crate::modal::primary_button_enabled(ui, crate::tl_id!("ui.create"), ready, &tokens).clicked() {
+                                create_clicked = true;
                             }
                         });
-                    });
-                if go {
+                    },
+                );
+                if res.closed {
+                    keep = false;
+                }
+                if (create_clicked || enter) && !title.trim().is_empty() {
                     let mut p = params(&[("parent", &path_str(parent)), ("kind", kind.id()), ("title", title.trim())]);
                     if let Some(f) = format {
                         p.insert("format".into(), f.id().into());
@@ -10776,26 +10915,29 @@ impl NocturneApp {
                 let places = self.move_destinations(path, *kind);
                 let here = path.parent().map(Path::to_path_buf);
                 let fits = |p: &Path| nocturne_store::tree::read_node(p).is_some_and(|n| n.kind.may_contain().contains(kind));
+                let can = dest.is_some();
+                let moves = can && dest.as_deref() != here.as_deref();
                 let mut chosen: Option<bool> = None;
-                egui::Window::new(crate::tl_id!("ui.move_or_copy"))
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .show(ctx, |ui| {
-                        ui.label(crate::i18n::format_message_id("ui.move_or_copy_title_to", &[("title", title.as_str())]));
-                        let now = places
-                            .iter()
-                            .find(|(p, _, _)| here.as_deref() == Some(p.as_path()))
-                            .map(|(_, name, _)| name.clone())
-                            .or_else(|| here.as_deref().and_then(nocturne_store::tree::read_node).map(|n| n.title))
-                            .unwrap_or_default();
-                        ui.label(
-                            egui::RichText::new(crate::i18n::format_message_id("ui.it_is_in_place_now", &[("place", now.as_str())]))
-                                .small()
-                                .color(self.tokens.muted),
-                        );
-                        egui::ScrollArea::vertical().max_height(300.0).min_scrolled_height(160.0).show(ui, |ui| {
-                            ui.set_min_width(320.0);
+                let now = places
+                    .iter()
+                    .find(|(p, _, _)| here.as_deref() == Some(p.as_path()))
+                    .map(|(_, name, _)| name.clone())
+                    .or_else(|| here.as_deref().and_then(nocturne_store::tree::read_node).map(|n| n.title))
+                    .unwrap_or_default();
+                let res = crate::modal::Modal::new("move-or-copy-modal", crate::tl_id!("ui.move_or_copy"))
+                    .backdrop_id("move-or-copy-modal-backdrop")
+                    .width(420.0)
+                    .show_with_footer(
+                        ctx,
+                        &tokens,
+                        |ui| {
+                            ui.label(crate::i18n::format_message_id("ui.move_or_copy_title_to", &[("title", title.as_str())]));
+                            ui.label(
+                                egui::RichText::new(crate::i18n::format_message_id("ui.it_is_in_place_now", &[("place", now.as_str())]))
+                                    .small()
+                                    .color(tokens.muted),
+                            );
+                            ui.add_space(8.0);
                             for (place, name, depth) in &places {
                                 ui.horizontal(|ui| {
                                     ui.add_space(*depth as f32 * 16.0);
@@ -10806,27 +10948,28 @@ impl NocturneApp {
                                             *dest = Some(place.clone());
                                         }
                                     } else {
-                                        ui.label(egui::RichText::new(name).color(self.tokens.muted));
+                                        ui.label(egui::RichText::new(name).color(tokens.muted));
                                     }
                                 });
                             }
-                        });
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.cancel"), false).clicked() || ui.input(|i| i.key_pressed(Key::Escape))
-                            {
-                                keep = false;
-                            }
-                            let can = dest.is_some();
-                            let moves = can && dest.as_deref() != here.as_deref();
-                            if modal_button_enabled(ui, &self.tokens, crate::tl_id!("ui.copy"), false, can).clicked() {
-                                chosen = Some(true);
-                            }
-                            if modal_button_enabled(ui, &self.tokens, crate::tl_id!("ui.move"), true, moves).clicked() {
-                                chosen = Some(false);
-                            }
-                        });
-                    });
+                        },
+                        |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if crate::modal::secondary_button(ui, crate::tl_id!("ui.cancel"), &tokens).clicked() {
+                                    keep = false;
+                                }
+                                if crate::modal::secondary_button_enabled(ui, crate::tl_id!("ui.copy"), can, &tokens).clicked() {
+                                    chosen = Some(true);
+                                }
+                                if crate::modal::primary_button_enabled(ui, crate::tl_id!("ui.move"), moves, &tokens).clicked() {
+                                    chosen = Some(false);
+                                }
+                            });
+                        },
+                    );
+                if res.closed {
+                    keep = false;
+                }
                 if let (Some(copy), Some(to)) = (chosen, dest.clone()) {
                     let from = path.clone();
                     self.move_or_copy(&from, &to, copy);
@@ -10834,48 +10977,64 @@ impl NocturneApp {
                 }
             }
             Dialog::Link { block, cell, range, text, address, editing, first } => {
-                let (mut go, mut remove) = (false, false);
+                let (mut enter, mut ok_clicked, mut remove) = (false, false, false);
                 let usable = pageedit::linkable_address(address);
-                egui::Window::new(crate::tl_id!("ui.link")).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(
-                    ctx,
-                    |ui| {
-                        egui::Grid::new("link-dialog").num_columns(2).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
-                            ui.label(crate::tl_id!("ui.text_to_display"));
-                            let words = ui.add(egui::TextEdit::singleline(text).desired_width(320.0));
-                            ui.end_row();
-                            ui.label(crate::tl_id!("ui.address"));
-                            let to = ui.add(egui::TextEdit::singleline(address).desired_width(320.0).hint_text("https://"));
-                            ui.end_row();
-                            // The address is what is missing first, unless the words are.
-                            if *first {
-                                if text.is_empty() && !*editing {
-                                    words.request_focus()
-                                } else {
-                                    to.request_focus()
+                let res = crate::modal::Modal::new("link-modal", crate::tl_id!("ui.link"))
+                    .backdrop_id("link-modal-backdrop")
+                    .width(460.0)
+                    .show_with_footer(
+                        ctx,
+                        &tokens,
+                        |ui| {
+                            let w = (ui.available_width() - 120.0).max(140.0);
+                            egui::Grid::new("link-dialog").num_columns(2).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
+                                ui.label(crate::tl_id!("ui.text_to_display"));
+                                let words = ui.add(egui::TextEdit::singleline(text).id(egui::Id::unique(LINK_TEXT_FIELD)).desired_width(w));
+                                ui.end_row();
+                                ui.label(crate::tl_id!("ui.address"));
+                                let to = ui.add(
+                                    egui::TextEdit::singleline(address)
+                                        .id(egui::Id::unique(LINK_ADDRESS_FIELD))
+                                        .desired_width(w)
+                                        .hint_text("https://"),
+                                );
+                                ui.end_row();
+                                // The address is what is missing first, unless the words are.
+                                if *first && ui.is_enabled() && !ui.is_sizing_pass() {
+                                    if text.is_empty() && !*editing {
+                                        words.request_focus();
+                                    } else {
+                                        to.request_focus();
+                                    }
+                                    *first = false;
                                 }
-                                *first = false;
+                                if (words.lost_focus() || to.lost_focus()) && ui.input(|i| i.key_pressed(Key::Enter)) {
+                                    enter = true;
+                                }
+                            });
+                            if !address.trim().is_empty() && !pageedit::linkable_address(address) {
+                                ui.add_space(6.0);
+                                ui.colored_label(tokens.warn, crate::tl_id!("ui.that_address_cannot_be_used_for_a_link"));
                             }
-                            if (words.lost_focus() || to.lost_focus()) && ui.input(|i| i.key_pressed(Key::Enter)) && usable {
-                                go = true;
-                            }
-                        });
-                        if !address.trim().is_empty() && !usable {
-                            ui.colored_label(self.tokens.warn, crate::tl_id!("ui.that_address_cannot_be_used_for_a_link"));
-                        }
-                        ui.horizontal(|ui| {
-                            if *editing && modal_button(ui, &self.tokens, crate::tl_id!("ui.remove_link"), false).clicked() {
-                                remove = true;
-                            }
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.cancel"), false).clicked() || ui.input(|i| i.key_pressed(Key::Escape))
-                            {
-                                keep = false;
-                            }
-                            if modal_button_enabled(ui, &self.tokens, crate::tl_id!("ui.ok"), true, usable).clicked() {
-                                go = true;
-                            }
-                        });
-                    },
-                );
+                        },
+                        |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if *editing && crate::modal::danger_button(ui, crate::tl_id!("ui.remove_link"), &tokens).clicked() {
+                                    remove = true;
+                                }
+                                if crate::modal::secondary_button(ui, crate::tl_id!("ui.cancel"), &tokens).clicked() {
+                                    keep = false;
+                                }
+                                if crate::modal::primary_button_enabled(ui, crate::tl_id!("ui.ok"), usable, &tokens).clicked() {
+                                    ok_clicked = true;
+                                }
+                            });
+                        },
+                    );
+                if res.closed {
+                    keep = false;
+                }
+                let go = (ok_clicked || enter) && pageedit::linkable_address(address);
                 if go || remove {
                     let (block, cell, range) = (*block, *cell, *range);
                     // Removing keeps the words and lets go of the address.
@@ -10885,34 +11044,35 @@ impl NocturneApp {
                 }
             }
             Dialog::Rename { path, title } => {
-                let mut go = false;
-                let backdrop = modal_backdrop(ctx, "rename-modal-backdrop");
-                egui::Window::new(crate::tl_id!("ui.rename"))
-                    .title_bar(false)
-                    .collapsible(false)
-                    .resizable(false)
-                    .order(egui::Order::Foreground)
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .frame(modal_frame(&self.tokens))
-                    .show(ctx, |ui| {
-                        stay_above(ui, backdrop);
-                        modal_title(ui, &self.tokens, crate::tl_id!("ui.rename"));
-                        ui.set_min_width(420.0);
-                        ui.label(crate::tl_id!("ui.title_the_folder_name_does_not_change"));
-                        let r = name_field(ui, title, RENAME_FIELD, opened_now);
-                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                        ui.add_space(12.0);
-                        ui.horizontal(|ui| {
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.cancel"), false).clicked() || ui.input(|i| i.key_pressed(Key::Escape))
-                            {
-                                keep = false;
-                            }
-                            if (modal_button(ui, &self.tokens, crate::tl_id!("ui.rename"), true).clicked() || enter) && !title.trim().is_empty() {
-                                go = true;
-                            }
-                        });
-                    });
-                if go {
+                let ready = !title.trim().is_empty();
+                let mut rename_clicked = false;
+                let mut enter = false;
+                let res = crate::modal::Modal::new("rename-modal", crate::tl_id!("ui.rename"))
+                    .backdrop_id("rename-modal-backdrop")
+                    .width(440.0)
+                    .show_with_footer(
+                        ctx,
+                        &tokens,
+                        |ui| {
+                            ui.label(crate::tl_id!("ui.title_the_folder_name_does_not_change"));
+                            let r = name_field(ui, title, RENAME_FIELD, opened_now);
+                            enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        },
+                        |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if crate::modal::secondary_button(ui, crate::tl_id!("ui.cancel"), &tokens).clicked() {
+                                    keep = false;
+                                }
+                                if crate::modal::primary_button_enabled(ui, crate::tl_id!("ui.rename"), ready, &tokens).clicked() {
+                                    rename_clicked = true;
+                                }
+                            });
+                        },
+                    );
+                if res.closed {
+                    keep = false;
+                }
+                if (rename_clicked || enter) && !title.trim().is_empty() {
                     if self.run("node.title", &params(&[("path", &path_str(path)), ("title", title.trim())])).is_some() {
                         self.library_grid.invalidate_page(path);
                         if self.editor.as_ref().map(|e| e.dir == *path).unwrap_or(false) {
@@ -10926,47 +11086,46 @@ impl NocturneApp {
             Dialog::InsertTable { rows, columns, first } => {
                 let size = table_size(rows, columns);
                 let mut go = false;
-                let backdrop = modal_backdrop(ctx, "insert-table-backdrop");
-                egui::Window::new(crate::tl_id!("ui.insert_table"))
-                    .title_bar(false)
-                    .collapsible(false)
-                    .resizable(false)
-                    .order(egui::Order::Foreground)
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .frame(modal_frame(&self.tokens))
-                    .show(ctx, |ui| {
-                        stay_above(ui, backdrop);
-                        modal_title(ui, &self.tokens, crate::tl_id!("ui.insert_table"));
-                        egui::Grid::new("insert-table-dialog").num_columns(2).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
-                            ui.label(crate::tl_id!("ui.number_of_columns"));
-                            let c = ui.add(egui::TextEdit::singleline(columns).desired_width(80.0));
-                            ui.end_row();
-                            ui.label(crate::tl_id!("ui.number_of_rows"));
-                            ui.add(egui::TextEdit::singleline(rows).desired_width(80.0));
-                            ui.end_row();
-                            if *first {
-                                c.request_focus();
-                                *first = false;
+                let res = crate::modal::Modal::new("insert-table-modal", crate::tl_id!("ui.insert_table"))
+                    .backdrop_id("insert-table-backdrop")
+                    .width(380.0)
+                    .show_with_footer(
+                        ctx,
+                        &tokens,
+                        |ui| {
+                            egui::Grid::new("insert-table-dialog").num_columns(2).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
+                                ui.label(crate::tl_id!("ui.number_of_columns"));
+                                let c = ui.add(egui::TextEdit::singleline(columns).id(egui::Id::unique(TABLE_COLUMNS_FIELD)).desired_width(80.0));
+                                ui.end_row();
+                                ui.label(crate::tl_id!("ui.number_of_rows"));
+                                ui.add(egui::TextEdit::singleline(rows).id(egui::Id::unique(TABLE_ROWS_FIELD)).desired_width(80.0));
+                                ui.end_row();
+                                if *first && ui.is_enabled() && !ui.is_sizing_pass() {
+                                    c.request_focus();
+                                    *first = false;
+                                }
+                            });
+                            if size.is_none() {
+                                ui.add_space(6.0);
+                                let limits = crate::i18n::format_message_id(
+                                    "ui.table_size_limits",
+                                    &[("columns", &TABLE_MAX_COLUMNS.to_string()), ("rows", &TABLE_MAX_ROWS.to_string())],
+                                );
+                                ui.colored_label(tokens.warn, limits);
                             }
-                        });
-                        if size.is_none() {
-                            let limits = crate::i18n::format_message_id(
-                                "ui.table_size_limits",
-                                &[("columns", &TABLE_MAX_COLUMNS.to_string()), ("rows", &TABLE_MAX_ROWS.to_string())],
-                            );
-                            ui.colored_label(self.tokens.warn, limits);
-                        }
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.cancel"), false).clicked() {
-                                keep = false;
-                            }
-                            if modal_button_enabled(ui, &self.tokens, crate::tl_id!("ui.ok"), true, size.is_some()).clicked() {
-                                go = true;
-                            }
-                        });
-                    });
-                if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)) {
+                        },
+                        |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if crate::modal::secondary_button(ui, crate::tl_id!("ui.cancel"), &tokens).clicked() {
+                                    keep = false;
+                                }
+                                if crate::modal::primary_button_enabled(ui, crate::tl_id!("ui.ok"), size.is_some(), &tokens).clicked() {
+                                    go = true;
+                                }
+                            });
+                        },
+                    );
+                if res.closed {
                     keep = false;
                 } else if ctx.input(|input| input.key_pressed(Key::Enter)) && size.is_some() {
                     go = true;
@@ -10978,39 +11137,32 @@ impl NocturneApp {
             }
             Dialog::DeleteFile { page, name } => {
                 let mut go = false;
-                let mut cancel = false;
-                let backdrop = modal_backdrop(ctx, "delete-file-modal-backdrop");
-                egui::Window::new(crate::tl_id!("ui.delete_file"))
-                    .title_bar(false)
-                    .collapsible(false)
-                    .resizable(false)
-                    .order(egui::Order::Foreground)
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .frame(modal_frame(&self.tokens))
-                    .show(ctx, |ui| {
-                        stay_above(ui, backdrop);
-                        modal_title(ui, &self.tokens, crate::tl_id!("ui.delete_file"));
-                        ui.set_min_width(420.0);
-                        ui.label(crate::i18n::format_message_id("ui.delete_assets_name_from_this_page_s_folder", &[("name", name)]));
-                        ui.add_space(6.0);
-                        ui.colored_label(self.tokens.warn, crate::tl_id!("ui.the_file_is_removed_from_disk_undo_does_not_bring_a_file_back"));
-                        ui.add_space(12.0);
-                        ui.horizontal(|ui| {
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.cancel"), false).clicked() {
-                                keep = false;
-                            }
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.delete"), true).clicked() {
-                                go = true;
-                            }
-                        });
-                    });
-                if ctx.input(|input| input.key_pressed(Key::Escape)) {
-                    cancel = true;
+                let res = crate::modal::Modal::new("delete-file-modal", crate::tl_id!("ui.delete_file"))
+                    .backdrop_id("delete-file-modal-backdrop")
+                    .width(440.0)
+                    .show_with_footer(
+                        ctx,
+                        &tokens,
+                        |ui| {
+                            ui.label(crate::i18n::format_message_id("ui.delete_assets_name_from_this_page_s_folder", &[("name", name)]));
+                            ui.add_space(6.0);
+                            ui.colored_label(tokens.warn, crate::tl_id!("ui.the_file_is_removed_from_disk_undo_does_not_bring_a_file_back"));
+                        },
+                        |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if crate::modal::secondary_button(ui, crate::tl_id!("ui.cancel"), &tokens).clicked() {
+                                    keep = false;
+                                }
+                                if crate::modal::danger_button(ui, crate::tl_id!("ui.delete"), &tokens).clicked() {
+                                    go = true;
+                                }
+                            });
+                        },
+                    );
+                if res.closed {
+                    keep = false;
                 } else if ctx.input(|input| input.key_pressed(Key::Enter)) {
                     go = true;
-                }
-                if cancel {
-                    keep = false;
                 }
                 if go {
                     let page = page.clone();
@@ -11027,30 +11179,31 @@ impl NocturneApp {
             }
             Dialog::DeleteNotebook { path, title } => {
                 let mut go = false;
-                egui::Window::new(crate::tl_id!("ui.delete_notebook"))
-                    .collapsible(false)
-                    .resizable(false)
-                    .title_bar(false)
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .frame(modal_frame(&self.tokens))
-                    .show(ctx, |ui| {
-                        ui.set_min_width(440.0);
-                        modal_title(ui, &self.tokens, crate::tl_id!("ui.delete_notebook"));
-                        ui.label(crate::i18n::format_message_id("ui.delete_notebook_title_and_everything_inside_it", &[("title", title)]));
-                        ui.add_space(4.0);
-                        ui.colored_label(self.tokens.warn, crate::tl_id!("ui.this_removes_the_notebook_folder_from_disk_and_cannot_be_undone"));
-                        ui.add_space(14.0);
-                        ui.separator();
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.cancel"), false).clicked() {
-                                keep = false;
-                            }
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.delete_notebook"), true).clicked() {
-                                go = true;
-                            }
-                        });
-                    });
+                let res = crate::modal::Modal::new("delete-notebook-modal", crate::tl_id!("ui.delete_notebook"))
+                    .backdrop_id("delete-notebook-modal-backdrop")
+                    .width(460.0)
+                    .show_with_footer(
+                        ctx,
+                        &tokens,
+                        |ui| {
+                            ui.label(crate::i18n::format_message_id("ui.delete_notebook_title_and_everything_inside_it", &[("title", title)]));
+                            ui.add_space(6.0);
+                            ui.colored_label(tokens.warn, crate::tl_id!("ui.this_removes_the_notebook_folder_from_disk_and_cannot_be_undone"));
+                        },
+                        |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if crate::modal::secondary_button(ui, crate::tl_id!("ui.cancel"), &tokens).clicked() {
+                                    keep = false;
+                                }
+                                if crate::modal::danger_button(ui, crate::tl_id!("ui.delete_notebook"), &tokens).clicked() {
+                                    go = true;
+                                }
+                            });
+                        },
+                    );
+                if res.closed {
+                    keep = false;
+                }
                 if go {
                     let path = path.clone();
                     let was_open = self.editor.as_ref().and_then(|editor| notebook_for(&editor.dir)).is_some_and(|notebook| notebook == path);
@@ -11082,43 +11235,44 @@ impl NocturneApp {
             Dialog::Delete { path, title, count } => {
                 let mut go = false;
                 let is_notebook = nocturne_store::tree::read_node(path).is_some_and(|node| node.kind == NodeKind::Notebook);
-                egui::Window::new(crate::tl_id!("ui.delete"))
-                    .collapsible(false)
-                    .resizable(false)
-                    .title_bar(false)
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .frame(modal_frame(&self.tokens))
-                    .show(ctx, |ui| {
-                        ui.set_min_width(420.0);
-                        modal_title(ui, &self.tokens, crate::tl_id!("ui.delete_notebook"));
-                        if is_notebook {
-                            ui.label(crate::i18n::format_message_id("ui.delete_notebook_title_and_everything_inside_it", &[("title", title)]));
-                            ui.colored_label(self.tokens.warn, crate::tl_id!("ui.this_removes_the_notebook_folder_from_disk_and_cannot_be_undone"));
-                        } else {
-                            ui.label(crate::i18n::format_count_message_id(
-                                "ui.move_title_and_everything_inside_it_n_item_to_this_n_20c3146ea1",
-                                *count as u64,
-                                &[("title", title)],
-                            ));
-                            ui.label(crate::tl_id!("ui.you_can_restore_it_from_history"));
-                        }
-                        ui.horizontal(|ui| {
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.cancel"), false).clicked() {
-                                keep = false;
+                let heading = if is_notebook { crate::tl_id!("ui.delete_notebook") } else { crate::tl_id!("ui.delete") };
+                let confirm_label = if is_notebook { crate::tl_id!("ui.delete_notebook") } else { crate::tl_id!("ui.move_to_recycle_bin") };
+                let res =
+                    crate::modal::Modal::new("delete-node-modal", heading).backdrop_id("delete-node-modal-backdrop").width(440.0).show_with_footer(
+                        ctx,
+                        &tokens,
+                        |ui| {
+                            if is_notebook {
+                                ui.label(crate::i18n::format_message_id("ui.delete_notebook_title_and_everything_inside_it", &[("title", title)]));
+                                ui.add_space(6.0);
+                                ui.colored_label(tokens.warn, crate::tl_id!("ui.this_removes_the_notebook_folder_from_disk_and_cannot_be_undone"));
+                            } else {
+                                ui.label(crate::i18n::format_count_message_id(
+                                    "ui.move_title_and_everything_inside_it_n_item_to_this_n_20c3146ea1",
+                                    *count as u64,
+                                    &[("title", title)],
+                                ));
+                                ui.add_space(6.0);
+                                ui.label(crate::tl_id!("ui.you_can_restore_it_from_history"));
                             }
-                            if modal_button(
-                                ui,
-                                &self.tokens,
-                                if is_notebook { crate::tl_id!("ui.delete_notebook") } else { crate::tl_id!("ui.move_to_recycle_bin") },
-                                true,
-                            )
-                            .clicked()
-                            {
-                                go = true;
-                            }
-                        });
-                    });
+                        },
+                        |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if crate::modal::secondary_button(ui, crate::tl_id!("ui.cancel"), &tokens).clicked() {
+                                    keep = false;
+                                }
+                                if crate::modal::danger_button(ui, confirm_label, &tokens).clicked() {
+                                    go = true;
+                                }
+                            });
+                        },
+                    );
+                if res.closed {
+                    keep = false;
+                }
                 if go {
+                    let was_open = self.editor.as_ref().is_some_and(|e| e.dir == *path || e.dir.starts_with(&*path));
+                    let was_selected = self.selected.as_ref().is_some_and(|s| *s == *path || s.starts_with(&*path));
                     if is_notebook {
                         let path = path.clone();
                         log::info!("deleting notebook: {:?}", path);
@@ -11126,9 +11280,13 @@ impl NocturneApp {
                             Ok(()) => {
                                 log::info!("notebook deleted successfully: {:?}", path);
                                 self.remove_recent_notebook(&path);
-                                self.editor = None;
-                                self.pad = None;
-                                self.selected = None;
+                                if was_open {
+                                    self.editor = None;
+                                    self.pad = None;
+                                }
+                                if was_selected {
+                                    self.selected = None;
+                                }
                                 self.open.remove(&path);
                                 let _ = self.run("tree.refresh", &Params::new());
                                 self.library_grid.invalidate_all();
@@ -11142,15 +11300,17 @@ impl NocturneApp {
                             }
                         }
                     } else {
-                        let was_open = self.editor.as_ref().map(|e| e.dir.starts_with(&*path)).unwrap_or(false);
                         log::info!("deleting node: {:?}", path);
                         match self.run("node.delete", &params(&[("path", &path_str(path))])) {
                             Some(_) => {
                                 log::info!("node deleted successfully: {:?}", path);
                                 if was_open {
                                     self.editor = None;
+                                    self.pad = None;
                                 }
-                                self.selected = None;
+                                if was_selected {
+                                    self.selected = None;
+                                }
                                 self.library_grid.invalidate_all();
                                 self.say(crate::tl_id!("ui.moved_to_the_notebook_recycle_bin"));
                             }
@@ -11169,36 +11329,46 @@ impl NocturneApp {
             }
             Dialog::PageVersions { page, versions } => {
                 let mut restore: Option<String> = None;
-                egui::Window::new(crate::tl_id!("ui.page_versions_2"))
-                    .collapsible(false)
-                    .resizable(true)
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .show(ctx, |ui| {
-                        ui.set_min_width(420.0);
-                        ui.label(crate::tl_id!("ui.saved_copies_of_this_page"));
-                        ui.add_space(6.0);
-                        if versions.is_empty() {
-                            ui.label(crate::tl_id!("ui.no_saved_versions_yet_nocturne_keeps_a_copy_when_th_aa2e25acad"));
-                        } else {
-                            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                let res = crate::modal::Modal::new("page-versions-modal", crate::tl_id!("ui.page_versions_2"))
+                    .backdrop_id("page-versions-modal-backdrop")
+                    .width(480.0)
+                    .show_with_footer(
+                        ctx,
+                        &tokens,
+                        |ui| {
+                            ui.label(crate::tl_id!("ui.saved_copies_of_this_page"));
+                            ui.add_space(6.0);
+                            if versions.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(crate::tl_id!("ui.no_saved_versions_yet_nocturne_keeps_a_copy_when_th_aa2e25acad"))
+                                        .color(tokens.muted),
+                                );
+                            } else {
                                 for version in versions.iter() {
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label(&version.created);
                                         let size = (version.bytes.div_ceil(1024)).to_string();
                                         let size = crate::i18n::format_message_id("ui.size_kb", &[("size", &size)]);
-                                        ui.label(egui::RichText::new(size).small().color(self.tokens.muted));
-                                        if modal_button(ui, &self.tokens, crate::tl_id!("ui.restore"), true).clicked() {
+                                        ui.label(egui::RichText::new(size).small().color(tokens.muted));
+                                        if crate::modal::primary_button(ui, crate::tl_id!("ui.restore"), &tokens).clicked() {
                                             restore = Some(version.id.clone());
                                         }
                                     });
+                                    ui.add_space(4.0);
+                                }
+                            }
+                        },
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                if crate::modal::secondary_button(ui, crate::tl_id!("ui.close"), &tokens).clicked() {
+                                    keep = false;
                                 }
                             });
-                        }
-                        ui.add_space(8.0);
-                        if modal_button(ui, &self.tokens, crate::tl_id!("ui.close"), false).clicked() {
-                            keep = false;
-                        }
-                    });
+                        },
+                    );
+                if res.closed {
+                    keep = false;
+                }
                 if let Some(id) = restore {
                     if self.run("page.version.restore", &params(&[("path", &path_str(page)), ("id", &id)])).is_some() {
                         self.open_page(page);
@@ -11210,19 +11380,19 @@ impl NocturneApp {
             Dialog::RecycleBin { notebook, items } => {
                 let mut restore: Option<String> = None;
                 let mut purge: Option<(String, String)> = None;
-                egui::Window::new(crate::tl_id!("ui.notebook_recycle_bin_2"))
-                    .collapsible(false)
-                    .resizable(true)
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .show(ctx, |ui| {
-                        ui.set_min_width(460.0);
-                        if items.is_empty() {
-                            ui.label(crate::tl_id!("ui.this_notebook_s_recycle_bin_is_empty"));
-                        } else {
-                            egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
+                let res = crate::modal::Modal::new("recycle-bin-modal", crate::tl_id!("ui.notebook_recycle_bin_2"))
+                    .backdrop_id("recycle-bin-modal-backdrop")
+                    .width(540.0)
+                    .show_with_footer(
+                        ctx,
+                        &tokens,
+                        |ui| {
+                            if items.is_empty() {
+                                ui.label(egui::RichText::new(crate::tl_id!("ui.this_notebook_s_recycle_bin_is_empty")).color(tokens.muted));
+                            } else {
                                 for item in items.iter() {
-                                    ui.horizontal(|ui| {
-                                        ui.label(&item.title);
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(egui::RichText::new(&item.title).strong().color(tokens.strong));
                                         ui.label(
                                             egui::RichText::new(crate::i18n::format_message_id(
                                                 "ui.count_deleted",
@@ -11232,22 +11402,30 @@ impl NocturneApp {
                                                 ],
                                             ))
                                             .small()
-                                            .color(self.tokens.muted),
+                                            .color(tokens.muted),
                                         );
-                                        if modal_button(ui, &self.tokens, crate::tl_id!("ui.restore"), true).clicked() {
+                                        if crate::modal::primary_button(ui, crate::tl_id!("ui.restore"), &tokens).clicked() {
                                             restore = Some(item.id.clone());
                                         }
-                                        if modal_button(ui, &self.tokens, crate::tl_id!("ui.delete_permanently"), true).clicked() {
+                                        if crate::modal::danger_button(ui, crate::tl_id!("ui.delete_permanently"), &tokens).clicked() {
                                             purge = Some((item.id.clone(), item.title.clone()));
                                         }
                                     });
+                                    ui.add_space(6.0);
+                                }
+                            }
+                        },
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                if crate::modal::secondary_button(ui, crate::tl_id!("ui.close"), &tokens).clicked() {
+                                    keep = false;
                                 }
                             });
-                        }
-                        if modal_button(ui, &self.tokens, crate::tl_id!("ui.close"), false).clicked() {
-                            keep = false;
-                        }
-                    });
+                        },
+                    );
+                if res.closed {
+                    keep = false;
+                }
                 if let Some(id) = restore {
                     if self.run("recycle.restore", &params(&[("notebook", &path_str(notebook)), ("id", &id)])).is_some() {
                         self.say(crate::tl_id!("ui.restored_to_the_original_location"));
@@ -11259,22 +11437,31 @@ impl NocturneApp {
             }
             Dialog::PurgeRecycleItem { notebook, id, title } => {
                 let mut purge = false;
-                egui::Window::new(crate::tl_id!("ui.permanently_delete"))
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .show(ctx, |ui| {
-                        ui.label(crate::i18n::format_message_id("ui.permanently_delete_title_and_everything_inside_it", &[("title", title)]));
-                        ui.colored_label(self.tokens.warn, crate::tl_id!("ui.this_cannot_be_undone"));
-                        ui.horizontal(|ui| {
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.cancel"), false).clicked() {
-                                keep = false;
-                            }
-                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.delete_permanently"), true).clicked() {
-                                purge = true;
-                            }
-                        });
-                    });
+                let res = crate::modal::Modal::new("purge-recycle-modal", crate::tl_id!("ui.permanently_delete"))
+                    .backdrop_id("purge-recycle-modal-backdrop")
+                    .width(440.0)
+                    .show_with_footer(
+                        ctx,
+                        &tokens,
+                        |ui| {
+                            ui.label(crate::i18n::format_message_id("ui.permanently_delete_title_and_everything_inside_it", &[("title", title)]));
+                            ui.add_space(6.0);
+                            ui.colored_label(tokens.warn, crate::tl_id!("ui.this_cannot_be_undone"));
+                        },
+                        |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if crate::modal::secondary_button(ui, crate::tl_id!("ui.cancel"), &tokens).clicked() {
+                                    keep = false;
+                                }
+                                if crate::modal::danger_button(ui, crate::tl_id!("ui.delete_permanently"), &tokens).clicked() {
+                                    purge = true;
+                                }
+                            });
+                        },
+                    );
+                if res.closed {
+                    keep = false;
+                }
                 if purge && self.run("recycle.purge", &params(&[("notebook", &path_str(notebook)), ("id", id)])).is_some() {
                     self.say(crate::tl_id!("ui.permanently_deleted"));
                     keep = false;
@@ -11282,44 +11469,43 @@ impl NocturneApp {
             }
             Dialog::Symbols => {
                 let mut chosen: Option<&'static str> = None;
-                // A modal like the other dialogs (issue #262): the page behind is dimmed and
-                // takes no clicks, so the caret stays where the symbol will go, and Escape
-                // closes it with nothing inserted.
-                if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)) {
-                    keep = false;
-                }
-                let backdrop = modal_backdrop(ctx, "insert-symbol-backdrop");
-                egui::Window::new(crate::tl_id!("ui.insert_symbol"))
-                    .title_bar(false)
-                    .collapsible(false)
-                    .resizable(false)
-                    .order(egui::Order::Foreground)
-                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .frame(modal_frame(&self.tokens))
-                    .show(ctx, |ui| {
-                        stay_above(ui, backdrop);
-                        modal_title(ui, &self.tokens, crate::tl_id!("ui.insert_symbol"));
-                        ui.label(crate::tl_id!("ui.choose_a_symbol_to_insert_at_the_caret"));
-                        ui.add_space(6.0);
-                        for row in [["©", "®", "™", "§", "¶"], ["•", "→", "←", "±", "°"], ["×", "÷", "√", "€", "£"], ["¥", "¢", "∞", "≠", "≤"]]
-                        {
-                            ui.horizontal(|ui| {
-                                for symbol in row {
-                                    let button = egui::Button::new(egui::RichText::new(symbol).size(20.0).color(self.tokens.text))
-                                        .min_size(vec2(46.0, 36.0))
-                                        .fill(self.tokens.panel)
-                                        .stroke(egui::Stroke::new(0.8, self.tokens.faint));
-                                    if ui.add(button).clicked() {
-                                        chosen = Some(symbol);
+                let res = crate::modal::Modal::new("insert-symbol-modal", crate::tl_id!("ui.insert_symbol"))
+                    .backdrop_id("insert-symbol-backdrop")
+                    .width(340.0)
+                    .closable(false)
+                    .show_with_footer(
+                        ctx,
+                        &tokens,
+                        |ui| {
+                            ui.label(crate::tl_id!("ui.choose_a_symbol_to_insert_at_the_caret"));
+                            ui.add_space(8.0);
+                            for row in [["©", "®", "™", "§", "¶"], ["•", "→", "←", "±", "°"], ["×", "÷", "√", "€", "£"], ["¥", "¢", "∞", "≠", "≤"]]
+                            {
+                                ui.horizontal(|ui| {
+                                    for symbol in row {
+                                        let button = egui::Button::new(egui::RichText::new(symbol).size(20.0).color(tokens.text))
+                                            .min_size(vec2(46.0, 36.0))
+                                            .fill(tokens.panel)
+                                            .stroke(egui::Stroke::new(1.0, tokens.border))
+                                            .corner_radius(egui::CornerRadius::same(crate::theme::RADIUS_CONTROL));
+                                        if ui.add(button).clicked() {
+                                            chosen = Some(symbol);
+                                        }
                                     }
+                                });
+                            }
+                        },
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                if crate::modal::secondary_button(ui, crate::tl_id!("ui.close"), &tokens).clicked() {
+                                    keep = false;
                                 }
                             });
-                        }
-                        ui.add_space(6.0);
-                        if modal_button(ui, &self.tokens, crate::tl_id!("ui.close"), false).clicked() {
-                            keep = false;
-                        }
-                    });
+                        },
+                    );
+                if res.closed {
+                    keep = false;
+                }
                 if let Some(symbol) = chosen {
                     self.insert_in_page(symbol);
                     keep = false;
@@ -11328,7 +11514,7 @@ impl NocturneApp {
             Dialog::CloudSync(form) => {
                 let supported = self.session.sync_http().is_supported() && self.session.sync_secrets().is_supported();
                 let busy = self.sync_job.is_some();
-                let out = crate::sync_ui::show_sync_dialog(ctx, form, supported, busy, &self.tokens);
+                let out = crate::sync_ui::show_sync_dialog(ctx, form, supported, busy, &tokens);
                 if out.cancel_running
                     && let Some(job) = self.sync_job.as_ref()
                 {
@@ -11381,41 +11567,105 @@ impl NocturneApp {
                     keep = false;
                 }
             }
-            Dialog::MathOcrSetup(form) => match crate::math_ocr::show_setup(ctx, form, &self.tokens) {
-                crate::math_ocr::SetupOutcome::Keep => {}
-                crate::math_ocr::SetupOutcome::Close => {
-                    keep = false;
-                }
-                crate::math_ocr::SetupOutcome::ForgetKey => {
-                    if self.run("ink.math_ocr_configure", &params(&[("provider", form.provider.id()), ("clear_key", "true")])).is_some() {
-                        *form = crate::math_ocr::Setup::from_session(&self.session);
+            Dialog::MathOcrSetup(form) => {
+                let download = self.ocr_model_download.as_ref().map(crate::math_ocr::ModelDownloadWorker::progress);
+                match crate::math_ocr::show_setup(ctx, form, download, &tokens) {
+                    crate::math_ocr::SetupOutcome::Keep => {}
+                    crate::math_ocr::SetupOutcome::Close => {
+                        keep = false;
                     }
-                }
-                crate::math_ocr::SetupOutcome::Save => {
-                    let mut p = params(&[("provider", form.provider.id()), ("endpoint", form.endpoint.trim()), ("model", form.model.trim())]);
-                    if !form.key.trim().is_empty() {
-                        p.insert("key".into(), form.key.trim().into());
-                    }
-                    if !form.app_id.trim().is_empty() {
-                        p.insert("app_id".into(), form.app_id.trim().into());
-                    }
-                    match self.session.run("ink.math_ocr_configure", &p) {
-                        Ok(_) => {
-                            form.key.clear();
-                            form.app_id.clear();
-                            self.say(crate::tl_id!("ui.recognition_service_saved"));
-                            keep = false;
+                    crate::math_ocr::SetupOutcome::ForgetKey => {
+                        if self.run("ink.math_ocr_configure", &params(&[("provider", form.provider.id()), ("clear_key", "true")])).is_some() {
+                            *form = crate::math_ocr::Setup::from_session(&self.session);
                         }
-                        Err(e) => self.fail(&e),
+                    }
+                    crate::math_ocr::SetupOutcome::DownloadModel => {
+                        if self.ocr_model_download.is_none() {
+                            form.error = None;
+                            match crate::math_ocr::ModelDownloadWorker::start(ctx.clone(), self.session.sync_http(), self.session.ocr_model_dir()) {
+                                Ok(worker) => self.ocr_model_download = Some(worker),
+                                Err(err) => {
+                                    form.error = Some(err.clone());
+                                    self.complain(&err);
+                                }
+                            }
+                        }
+                    }
+                    crate::math_ocr::SetupOutcome::CancelDownload => {
+                        if let Some(worker) = self.ocr_model_download.as_ref() {
+                            worker.cancel();
+                        }
+                    }
+                    crate::math_ocr::SetupOutcome::RemoveModel => match self.session.run("ink.math_ocr_remove_model", &Params::new()) {
+                        Ok(_) => {
+                            form.refresh_local_status(&self.session);
+                            form.error = None;
+                        }
+                        Err(e) => {
+                            form.error = Some(e.to_string());
+                            self.fail(&e);
+                        }
+                    },
+                    crate::math_ocr::SetupOutcome::Save => {
+                        let mut p = params(&[("provider", form.provider.id()), ("endpoint", form.endpoint.trim()), ("model", form.model.trim())]);
+                        if !form.key.trim().is_empty() {
+                            p.insert("key".into(), form.key.trim().into());
+                        }
+                        if !form.app_id.trim().is_empty() {
+                            p.insert("app_id".into(), form.app_id.trim().into());
+                        }
+                        match self.session.run("ink.math_ocr_configure", &p) {
+                            Ok(_) => {
+                                form.key.clear();
+                                form.app_id.clear();
+                                form.error = None;
+                                self.say(crate::tl_id!("ui.recognition_service_saved"));
+                                keep = false;
+                            }
+                            Err(e) => {
+                                form.error = Some(e.to_string());
+                                self.fail(&e);
+                            }
+                        }
                     }
                 }
-            },
+            }
         }
         if keep {
             self.dialog = Some(next);
         } else {
             // Closed: a dialog of the same kind opened next is a new one.
             self.dialog_shown = None;
+        }
+    }
+
+    fn poll_ocr_model_download(&mut self) {
+        let Some(outcome) = self.ocr_model_download.as_ref().and_then(crate::math_ocr::ModelDownloadWorker::try_recv) else {
+            return;
+        };
+        self.ocr_model_download = None;
+        match outcome {
+            Ok(()) => {
+                if let Some(Dialog::MathOcrSetup(form)) = self.dialog.as_mut() {
+                    form.model_installed = true;
+                    form.error = None;
+                }
+                self.say(crate::tl_id!("ui.ocr_model_installed"));
+            }
+            Err(nocturne_engine::SyncError::Cancelled) => {
+                if let Some(Dialog::MathOcrSetup(form)) = self.dialog.as_mut() {
+                    form.refresh_local_status(&self.session);
+                    form.error = None;
+                }
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                if let Some(Dialog::MathOcrSetup(form)) = self.dialog.as_mut() {
+                    form.refresh_local_status(&self.session);
+                    form.error = Some(msg.clone());
+                }
+                self.complain(&msg);
+            }
         }
     }
 
@@ -11484,12 +11734,17 @@ impl NocturneApp {
             return;
         }
         let Some(pad) = self.pad.as_mut() else { return };
+        pad.settle();
         if !pad.remove_exact_strokes(&conv.strokes) {
             self.save_now();
             self.complain(crate::tl_id!("ui.ink_changed_not_converted"));
             return;
         }
+        pad.settle();
         if let Err(e) = pad.save() {
+            // Roll back the in-memory stroke removal so a failed save never leaves lost or
+            // unsettled ink.
+            let _ = pad.undo();
             self.complain(&crate::i18n::format_message_id("ui.cannot_write_the_drawing_error", &[("error", &e.to_string())]));
             return;
         }
@@ -11500,16 +11755,14 @@ impl NocturneApp {
         self.last_ink_change = Some(now);
         self.last_local_edit_at = Some(now);
         self.sync_dirty_since_last = true;
-        if let Some(pad) = self.pad.as_mut() {
-            pad.settle();
-        }
         self.tell_kept_ink();
         self.sync_ink_reference();
         if let Some(ed) = self.editor.as_mut() {
             ed.boxes.retain(|c| c.blocks > 0);
             let default_width = ed.boxes.first().map_or(360.0, |c| c.width);
             let before = ed.blocks.len();
-            ed.boxes = nocturne_model::container::fit(&ed.boxes, before, default_width);
+            // Do not fabricate a 0-block ghost container when inserting onto an empty page.
+            ed.boxes = if before == 0 { Vec::new() } else { nocturne_model::container::fit(&ed.boxes, before, default_width) };
             let [x0, y0, x1, _y1] = conv.bounds;
             let x = (x0 - 6.0).max(0.0).round();
             let y = (y0 - 14.0).max(0.0).round();
@@ -11517,10 +11770,15 @@ impl NocturneApp {
             ed.blocks.push(nocturne_formats::markdown::Block::MathBlock(clean_tex));
             ed.boxes.push(nocturne_model::container::Container::new(x, y, box_width, 1));
             ed.arranged = true;
+            if ed.caret.as_ref().is_some_and(|c| c.block >= ed.blocks.len()) {
+                ed.caret = None;
+            }
+            ed.across = None;
             ed.rebuild_body();
             Self::mark_dirty_from_blocks(ed);
             Self::remember_edit(ed);
         }
+        self.save_now();
         self.undone.clear();
         self.library_grid.invalidate_page(&conv.page);
         self.say(crate::tl_id!("ui.equation_inserted"));
@@ -11848,6 +12106,7 @@ impl NocturneApp {
             // Whether a dialog is up over the window (Android's Back closes it first).
             "dialogOpen": self.dialog.is_some(),
             "formattingBarVisible": self.formatting_bar_visible(),
+            "layout_mode": self.session.layout_mode().id(),
             "theme": {"id": self.theme().id(), "modePref": self.mode_pref.id(), "accent": self.accent.id()},
             // The paper behind the pages, as the View tab's gallery sets it.
             "paper": self.paper_now().id(),
@@ -11965,7 +12224,12 @@ impl NocturneApp {
             egui::Rect::from_min_max(egui::pos2(outer.min.x, inner.min.y), egui::pos2(inner.min.x, inner.max.y)),
             egui::Rect::from_min_max(egui::pos2(inner.max.x, inner.min.y), egui::pos2(outer.max.x, inner.max.y)),
         ];
-        strips.into_iter().filter(|r| r.is_positive()).map(|r| (r, self.tokens.band)).collect()
+        let colour = if self.is_tablet_studio(ctx) {
+            if self.backstage.is_some() || (self.editor.is_none() && self.is_studio_grid(ctx)) { self.tokens.panel } else { self.tokens.editor }
+        } else {
+            self.tokens.band
+        };
+        strips.into_iter().filter(|r| r.is_positive()).map(|r| (r, colour)).collect()
     }
 
     pub fn show(&mut self, ui: &mut Ui) {
@@ -12033,24 +12297,21 @@ impl NocturneApp {
                 ctx.copy_text(text);
             }
         }
-        if self.keyboard_paste_requested {
-            self.keyboard_paste_requested = false;
-            log::debug!("queued keyboard paste dispatched to paste_here");
-            self.paste_here();
-        }
+        self.last_ctx_is_ios = ctx.os() == egui::os::OperatingSystem::IOS;
+        self.compact_layout(ctx);
+        self.last_tablet_studio = self.is_tablet_studio(ctx);
         // A button whose file dialog Android or iOS cannot show says so (`filepicker.*.rs`).
         #[cfg(any(target_os = "android", target_os = "ios"))]
         if let Some(notice) = crate::filepicker::take_notice() {
-            if self.is_tablet_studio(ctx) {
+            if self.last_tablet_studio {
                 self.studio_notice = Some((notice.clone(), Instant::now()));
             }
             self.say(notice);
         }
-        self.last_ctx_is_ios = ctx.os() == egui::os::OperatingSystem::IOS;
-        self.clipboard_keys(ctx);
         self.poll_control(ctx);
         self.poll_import(ctx);
         self.poll_sync(ctx);
+        self.poll_ocr_model_download();
         if std::mem::take(&mut self.pending_math_ocr_start) {
             self.start_math_ocr(ctx);
         }
@@ -12058,6 +12319,41 @@ impl NocturneApp {
         if !self.event_frames.is_empty() {
             ctx.request_repaint();
         }
+        // The File screen takes the whole window while it is open, as it does in Office.
+        // Run before page keyboard shortcuts and file drops so nothing behind Backstage can
+        // mutate or absorb dropped files while Backstage is showing.
+        if self.backstage.is_some() {
+            self.keyboard_paste_requested = false;
+            // No page is drawn under it, so the last page's rect is dropped: the platform's pan
+            // and pinch take only touches on a page that is on the screen.
+            self.page_rect = None;
+            self.page_view_rect = None;
+            if !self.is_tablet_studio(ctx) {
+                self.title_band(ui, false);
+            }
+            self.storage_notice(ui);
+            self.backstage_screen(ui);
+            self.theme_window_ui(ctx);
+            self.dialogs(ctx);
+            self.import_progress(ctx);
+            self.frame_edges(ctx);
+            if ctx.input(|i| i.viewport().close_requested()) {
+                self.save_now();
+            }
+            self.take_saves(false);
+            if self.saver.busy() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            return;
+        }
+        if self.keyboard_paste_requested {
+            self.keyboard_paste_requested = false;
+            if self.should_intercept_page_paste(ctx) {
+                log::debug!("queued keyboard paste dispatched to paste_here");
+                self.paste_here();
+            }
+        }
+        self.clipboard_keys(ctx);
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)) {
             if let Some(ed) = self.editor.as_mut() {
                 ed.dirty_since.get_or_insert_with(Instant::now);
@@ -12067,13 +12363,13 @@ impl NocturneApp {
         // Taken before any widget sees them: a text box has an undo of its own that
         // knows only about the letters in that one box, and the page's undo has to be the
         // one that answers, or Ctrl+Z would mean two different things on one page.
-        let ctrl_shift = Modifiers { ctrl: true, shift: true, command: true, ..Modifiers::NONE };
+        let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
         // Not while a dialog is open: it owns the keyboard, and the page behind it must not
         // change unseen (issue #262: Ctrl+Z undid and saved an edit behind Insert symbol). A
         // text box in the dialog keeps its own undo.
         let math_preview_open = matches!(self.math_ocr.as_ref().map(|c| &c.stage), Some(crate::math_ocr::Stage::Preview { .. }));
-        let page_keys = self.dialog.is_none() && !math_preview_open;
-        if page_keys && ctx.input_mut(|i| i.consume_key(ctrl_shift, Key::Z) || i.consume_key(Modifiers::COMMAND, Key::Y)) {
+        let page_keys = self.dialog.is_none() && !self.theme_window && !math_preview_open && self.backstage.is_none();
+        if page_keys && ctx.input_mut(|i| i.consume_key(cmd_shift, Key::Z) || i.consume_key(Modifiers::COMMAND, Key::Y)) {
             // The ink's as well as the page's, whichever Undo took back.
             self.redo();
         } else if page_keys && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Z)) {
@@ -12108,21 +12404,6 @@ impl NocturneApp {
         self.hierarchy_keys(ctx);
         self.restore_last_page();
         self.attach_dropped(ctx);
-        // The File screen takes the whole window while it is open, as it does in Office.
-        if self.backstage.is_some() {
-            // No page is drawn under it, so the last page's rect is dropped: the platform's pan
-            // and pinch take only touches on a page that is on the screen.
-            self.page_rect = None;
-            self.page_view_rect = None;
-            self.title_band(ui, false);
-            self.storage_notice(ui);
-            self.backstage_screen(ui);
-            self.dialogs(ctx);
-            self.import_progress(ctx);
-            self.frame_edges(ctx);
-            return;
-        }
-        self.compact_layout(ctx);
         self.top_bar(ui);
         self.storage_notice(ui);
         self.mobile_formatting_bar(ui);
@@ -12172,6 +12453,7 @@ impl NocturneApp {
         self.laser_keys(ctx);
         self.search_popup(ctx);
         self.math_ocr_ui(ctx);
+        self.theme_window_ui(ctx);
         self.dialogs(ctx);
         self.import_progress(ctx);
         self.frame_edges(ctx);

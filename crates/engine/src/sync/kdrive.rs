@@ -85,6 +85,17 @@ impl<'a> KDriveClient<'a> {
         extra_headers: &[(&str, &str)],
         body: Vec<u8>,
     ) -> Result<SyncHttpResponse, SyncError> {
+        self.send_with_retry_inner(method, path_and_query, extra_headers, body, false)
+    }
+
+    fn send_with_retry_inner(
+        &self,
+        method: SyncHttpMethod,
+        path_and_query: &str,
+        extra_headers: &[(&str, &str)],
+        body: Vec<u8>,
+        allow_not_found: bool,
+    ) -> Result<SyncHttpResponse, SyncError> {
         let url = format!("{}{}", self.endpoint, path_and_query);
         let mut attempt = 0usize;
         loop {
@@ -97,6 +108,7 @@ impl<'a> KDriveClient<'a> {
             let resp = self.http.request(SyncHttpRequest { method, url: url.clone(), headers, body: body.clone(), timeout_secs: 60 })?;
             match resp.status {
                 200..=299 => return Ok(resp),
+                404 if allow_not_found => return Ok(resp),
                 401 | 403 => {
                     let detail = extract_api_error(&resp.body).unwrap_or_else(|| format!("HTTP {}", resp.status));
                     return Err(SyncError::Auth(format!(
@@ -386,16 +398,11 @@ impl<'a> KDriveClient<'a> {
     }
 
     /// Moves `file_id` to kDrive's trash (`DELETE /2/drive/{drive_id}/files/{file_id}`).
-    /// Treats HTTP 404 as already deleted so re-running after a partial trash pass is idempotent.
+    /// Checks cancellation before and between retries, retries transient 429/503 responses, and
+    /// treats HTTP 404 as already deleted so re-running after a partial trash pass is idempotent.
     pub fn trash_file(&self, drive_id: u64, file_id: u64) -> Result<(), SyncError> {
         let path = format!("/2/drive/{drive_id}/files/{file_id}");
-        let url = format!("{}{}", self.endpoint, path);
-        let headers = vec![("Authorization".to_string(), format!("Bearer {}", self.token)), ("Accept".to_string(), "application/json".to_string())];
-        let resp = self.http.request(SyncHttpRequest { method: SyncHttpMethod::Delete, url, headers, body: Vec::new(), timeout_secs: 60 })?;
-        if resp.status == 404 || (200..=299).contains(&resp.status) {
-            return Ok(());
-        }
-        let _ = self.send_with_retry(SyncHttpMethod::Delete, &path, &[], Vec::new())?;
+        let _ = self.send_with_retry_inner(SyncHttpMethod::Delete, &path, &[], Vec::new(), true)?;
         Ok(())
     }
 }

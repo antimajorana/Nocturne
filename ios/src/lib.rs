@@ -20,6 +20,7 @@ pub mod pasteboard_codec;
 pub mod pencil;
 pub mod storage;
 pub mod text_input;
+pub mod vision_ocr;
 
 /// Starts Nocturne inside the iOS / iPadOS UIKit event loop.
 #[cfg(target_os = "ios")]
