@@ -4,7 +4,7 @@ members = ["crates/*", "apps/*", "android", "ios", "xtask", "docs/demo/scripts"]
 default-members = ["crates/*", "apps/nocturne", "apps/nocturne-cli", "apps/nocturne-setup", "xtask"]
 
 [workspace.package]
-version = "0.0.13"
+version = "0.0.16"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
