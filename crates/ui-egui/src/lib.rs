@@ -48,6 +48,7 @@ pub mod inkpad;
 pub mod math_ocr;
 pub mod mathview;
 pub mod minimap;
+pub mod modal;
 pub mod navhistory;
 pub mod pageedit;
 pub mod pagemenu;

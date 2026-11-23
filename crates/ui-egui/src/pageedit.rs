@@ -1563,7 +1563,7 @@ fn frame_block(ui: &Ui, top: f32, editing: bool, t: &Tokens, zoom: f32) {
         egui::pos2(ui.max_rect().min.x - 6.0 * zoom, top - 3.0 * zoom),
         egui::pos2(ui.max_rect().max.x + 6.0 * zoom, bottom + 1.0 * zoom),
     );
-    ui.painter().rect_stroke(rect, 2.0 * zoom, egui::Stroke::new(1.0 * zoom, t.faint), egui::StrokeKind::Inside);
+    ui.painter().rect_stroke(rect, 2.0 * zoom, egui::Stroke::new(1.0 * zoom, t.border_subtle), egui::StrokeKind::Inside);
 }
 
 /// The text the caret writes in: the words of the block without the tag marker, because
@@ -3721,12 +3721,7 @@ fn lead(ui: &mut Ui, block: &Block, t: &Tokens) -> Option<bool> {
     {
         let (rect, resp) = ui.allocate_exact_size(vec2(21.0, 20.0), Sense::hover());
         let mark = crate::ribbon::mark_for(tag);
-        crate::ribbon_icons::paint(
-            &ui.painter_at(rect),
-            egui::Rect::from_center_size(rect.center(), vec2(17.0, 17.0)),
-            mark,
-            mark.color(t.text, t.accent),
-        );
+        crate::ribbon_icons::paint(&ui.painter_at(rect), egui::Rect::from_center_size(rect.center(), vec2(17.0, 17.0)), mark, mark.color_for(t));
         resp.on_hover_text(crate::tl!(tag.label()));
     }
     match block {

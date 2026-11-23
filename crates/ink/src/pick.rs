@@ -94,35 +94,72 @@ pub fn encloses(loop_: &[(f32, f32)], x: f32, y: f32) -> bool {
     inside
 }
 
-/// Moves the strokes at these places by (`dx`, `dy`).
+/// Moves the strokes at these places by (`dx`, `dy`), expanding the drawing's view box so
+/// moved ink is never clipped outside it.
 pub fn move_by(drawing: &mut Drawing, held: &[usize], dx: f32, dy: f32) {
     if !dx.is_finite() || !dy.is_finite() {
         return;
     }
+    let mut moved = false;
     for i in held {
         if let Some(s) = drawing.strokes.get_mut(*i) {
             for d in &mut s.dabs {
-                d.x += dx;
-                d.y += dy;
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    d.x = (f64::from(d.x) + f64::from(dx)).clamp(-1.0e6, 1.0e6) as f32;
+                    d.y = (f64::from(d.y) + f64::from(dy)).clamp(-1.0e6, 1.0e6) as f32;
+                }
             }
+            moved = true;
         }
+    }
+    if moved && let Some(box_) = bounds(drawing, held) {
+        drawing.include_bounds(box_);
     }
 }
 
-/// Stretches them about (`ox`, `oy`). The line's own width follows the smaller of the two
-/// factors, so a stroke made half as wide does not keep a fat edge.
+/// Stretches them about (`ox`, `oy`), expanding the drawing's view box so scaled ink is never
+/// clipped outside it. The line's own width follows the smaller of the two factors, so a stroke
+/// made half as wide does not keep a fat edge.
 pub fn scale_about(drawing: &mut Drawing, held: &[usize], ox: f32, oy: f32, fx: f32, fy: f32) {
+    if !ox.is_finite() || !oy.is_finite() {
+        return;
+    }
     let sane = |f: f32| if f.is_finite() { f.clamp(0.05, 20.0) } else { 1.0 };
     let (fx, fy) = (sane(fx), sane(fy));
+    let mut scaled = false;
     for i in held {
         if let Some(s) = drawing.strokes.get_mut(*i) {
             for d in &mut s.dabs {
-                d.x = ox + (d.x - ox) * fx;
-                d.y = oy + (d.y - oy) * fy;
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    d.x = (f64::from(ox) + (f64::from(d.x) - f64::from(ox)) * f64::from(fx)).clamp(-1.0e6, 1.0e6) as f32;
+                    d.y = (f64::from(oy) + (f64::from(d.y) - f64::from(oy)) * f64::from(fy)).clamp(-1.0e6, 1.0e6) as f32;
+                }
             }
             s.width = (s.width * fx.min(fy)).clamp(crate::MIN_WIDTH, crate::MAX_WIDTH);
+            scaled = true;
         }
     }
+    if scaled && let Some(box_) = bounds(drawing, held) {
+        drawing.include_bounds(box_);
+    }
+}
+
+/// Moves every stroke whose top bound is at or below `y` vertically by `dy`, expanding the
+/// drawing's view box so shifted ink is never clipped outside it. Returns how many strokes
+/// moved.
+pub fn shift_below(drawing: &mut Drawing, y: f32, dy: f32) -> usize {
+    if !y.is_finite() || !dy.is_finite() || dy == 0.0 {
+        return 0;
+    }
+    let below: Vec<usize> =
+        drawing.strokes.iter().enumerate().filter(|(_, s)| s.bounds().is_some_and(|(_, top, _, _)| top >= y)).map(|(i, _)| i).collect();
+    if below.is_empty() {
+        return 0;
+    }
+    move_by(drawing, &below, 0.0, dy);
+    below.len()
 }
 
 /// Takes the strokes at these places out, and gives back how many went. Places that are not
@@ -264,5 +301,104 @@ mod tests {
         assert_eq!(remove(&mut d, &[0, 0, 7]), 1);
         assert!(d.strokes.is_empty());
         assert_eq!(remove(&mut d, &[3]), 0);
+    }
+
+    fn viewport_contains_stroke(drawing: &Drawing, index: usize) {
+        let ring = crate::shape::outline(&drawing.strokes[index]);
+        let (vx0, vy0) = (drawing.view_x, drawing.view_y);
+        let (vx1, vy1) = (drawing.view_x + drawing.width, drawing.view_y + drawing.height);
+        for (x, y) in ring {
+            assert!(
+                x >= vx0 - 0.01 && y >= vy0 - 0.01 && x <= vx1 + 0.01 && y <= vy1 + 0.01,
+                "outline point ({x}, {y}) clipped outside viewBox ({vx0}, {vy0}, {vx1}, {vy1})"
+            );
+        }
+    }
+
+    #[test]
+    fn move_by_expands_view_box_in_every_direction_without_shrinking() {
+        let mut d = sheet();
+        // Moving inside the existing sheet keeps the view box unchanged.
+        move_by(&mut d, &[0], 20.0, 10.0);
+        assert_eq!((d.view_x, d.view_y, d.width, d.height), (0.0, 0.0, 400.0, 300.0));
+
+        // Moving past the bottom-right expands width and height while preserving top-left.
+        move_by(&mut d, &[2], 250.0, 180.0);
+        assert_eq!((d.view_x, d.view_y), (0.0, 0.0));
+        assert!(d.width >= 551.0 && d.height >= 381.0, "bottom-right expanded: {}x{}", d.width, d.height);
+        viewport_contains_stroke(&d, 2);
+
+        // Moving past the top-left expands view_x and view_y negatively while keeping the old right/bottom.
+        let right_before = d.view_x + d.width;
+        let bottom_before = d.view_y + d.height;
+        move_by(&mut d, &[0], -80.0, -70.0);
+        assert!(d.view_x <= -51.0 && d.view_y <= -41.0, "top-left expanded negatively: {}, {}", d.view_x, d.view_y);
+        assert!((d.view_x + d.width - right_before).abs() < 0.01, "right edge did not shrink");
+        assert!((d.view_y + d.height - bottom_before).abs() < 0.01, "bottom edge did not shrink");
+        for i in 0..d.strokes.len() {
+            viewport_contains_stroke(&d, i);
+        }
+
+        // The expanded view box round-trips cleanly through SVG.
+        let xml = crate::svg::write(&d, crate::svg::Flavour::Editable);
+        let (back, flat) = crate::svg::read(&xml).expect("read moved drawing");
+        assert_eq!(flat, 0);
+        assert_eq!((back.view_x, back.view_y, back.width, back.height), (d.view_x, d.view_y, d.width, d.height));
+    }
+
+    #[test]
+    fn scale_about_expands_view_box_for_positive_and_negative_growth() {
+        let mut d = sheet();
+        // Scale stroke 2 past the bottom-right edge and widen it at the same time.
+        scale_about(&mut d, &[2], 200.0, 200.0, 3.0, 3.0);
+        assert!(d.view_x + d.width >= 503.0, "right edge covers scaled stroke + half-width: {}", d.view_x + d.width);
+        viewport_contains_stroke(&d, 2);
+
+        // Scale stroke 0 about a point to its right/bottom so it expands into negative coordinates.
+        let right_before = d.view_x + d.width;
+        let bottom_before = d.view_y + d.height;
+        scale_about(&mut d, &[0], 60.0, 20.0, 3.0, 2.0);
+        assert!(d.view_x <= -92.0, "left edge expanded negatively: {}", d.view_x);
+        assert!((d.view_x + d.width - right_before).abs() < 0.01, "right edge preserved");
+        assert!((d.view_y + d.height - bottom_before).abs() < 0.01, "bottom edge preserved");
+        viewport_contains_stroke(&d, 0);
+
+        // Non-finite origin is ignored rather than corrupting strokes or view box.
+        let before = d.clone();
+        scale_about(&mut d, &[0], f32::NAN, 0.0, 2.0, 2.0);
+        assert_eq!(d, before);
+    }
+
+    #[test]
+    fn shift_below_moves_only_lower_strokes_and_expands_view_box() {
+        let mut d = sheet();
+        let top_stroke = d.strokes[0].clone();
+
+        // Shift everything at or below y = 40 down past the bottom of the 300pt sheet.
+        let moved = shift_below(&mut d, 40.0, 180.0);
+        assert_eq!(moved, 2, "strokes 1 and 2 sit below y = 40");
+        assert_eq!(d.strokes[0], top_stroke, "stroke above the cut stayed put");
+        assert!((d.strokes[1].dabs[0].y - 230.0).abs() < 0.01);
+        assert!((d.strokes[2].dabs[0].y - 380.0).abs() < 0.01);
+        assert!(d.view_y + d.height >= 381.0, "view box expanded downward: {}", d.view_y + d.height);
+        for i in 0..d.strokes.len() {
+            viewport_contains_stroke(&d, i);
+        }
+
+        // Shift everything up past y = 0 to verify negative top expansion too.
+        let moved_up = shift_below(&mut d, 0.0, -60.0);
+        assert_eq!(moved_up, 3);
+        assert!(d.view_y <= -41.0, "view box expanded upward: {}", d.view_y);
+        for i in 0..d.strokes.len() {
+            viewport_contains_stroke(&d, i);
+        }
+
+        // Zero, non-finite, or empty shifts are no-ops.
+        let before = d.clone();
+        assert_eq!(shift_below(&mut d, 0.0, 0.0), 0);
+        assert_eq!(shift_below(&mut d, f32::NAN, 10.0), 0);
+        assert_eq!(shift_below(&mut d, 0.0, f32::INFINITY), 0);
+        assert_eq!(shift_below(&mut d, 1000.0, 50.0), 0);
+        assert_eq!(d, before);
     }
 }

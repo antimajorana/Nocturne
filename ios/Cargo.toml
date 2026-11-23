@@ -47,7 +47,8 @@ nocturne-setup = { path = "../apps/nocturne-setup" }
 objc2 = "0.6"
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFCGTypes", "objc2"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "NSArray", "NSAttributedString", "NSBundle", "NSData", "NSDate", "NSDictionary", "NSError", "NSNotification", "NSObjCRuntime", "NSObject", "NSOperation", "NSPathUtilities", "NSProcessInfo", "NSRange", "NSString", "NSURL", "NSURLRequest", "NSURLResponse", "NSURLSession", "NSValue"] }
-objc2-ui-kit = { version = "0.3", default-features = false, features = ["std", "bitflags", "block2", "objc2-core-foundation", "NSText", "UIAction", "UICommand", "UIEditMenuInteraction", "UIEvent", "UIGeometry", "UIGestureRecognizer", "UIImage", "UIIndirectScribbleInteraction", "UIInteraction", "UIMenu", "UIMenuController", "UIMenuElement", "UIPanGestureRecognizer", "UIPasteboard", "UIPencilInteraction", "UIPinchGestureRecognizer", "UIResponder", "UIScreen", "UIScribbleInteraction", "UITextInput", "UITextInputTraits", "UITouch", "UIView", "UIWindow"] }
+objc2-ui-kit = { version = "0.3", default-features = false, features = ["std", "bitflags", "block2", "objc2-core-foundation", "NSText", "UIAction", "UICommand", "UIEditMenuInteraction", "UIEvent", "UIGeometry", "UIGestureRecognizer", "UIImage", "UIIndirectScribbleInteraction", "UIInteraction", "UIMenu", "UIMenuController", "UIMenuElement", "UIPanGestureRecognizer", "UIPasteboard", "UIPencilInteraction", "UIPinchGestureRecognizer", "UIResponder", "UIScreen", "UIScribbleInteraction", "UITapGestureRecognizer", "UITextInput", "UITextInputTraits", "UITouch", "UIView", "UIWindow"] }
+objc2-vision = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "VNObservation", "VNRecognizeTextRequest", "VNRequest", "VNRequestHandler", "VNTypes"] }
 raw-window-handle = "0.6"
 time = { workspace = true }
 

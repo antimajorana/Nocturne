@@ -6,7 +6,7 @@
 
 use nocturne_ui_egui::{NocturneApp, PlatformEditAction};
 use std::cmp::Ordering;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::ops::Range;
 
 /// Maximum UTF-16 code units kept in the local `TextDocumentModel` window.
@@ -500,6 +500,276 @@ pub fn indirect_scribble_target_rect(caret_rect: Option<[f32; 4]>, pointer_is_wr
     let out_w = (max_x - min_x).max(MIN_CARET_WIDTH_PTS);
     let out_h = (max_y - min_y).max(MIN_CARET_HEIGHT_PTS);
     if min_x.is_finite() && min_y.is_finite() && out_w.is_finite() && out_h.is_finite() { Some([min_x, min_y, out_w, out_h]) } else { None }
+}
+
+/// Maximum finger drift (in egui logical points) for a single-finger tap to re-summon the
+/// dismissed software keyboard.
+pub const RESUMMON_TAP_MAX_DRIFT_PTS: f32 = 12.0;
+
+/// Maximum hold duration (in seconds) for a single-finger tap to re-summon the dismissed
+/// software keyboard (strictly shorter than `TouchLongPress`'s 0.50 s long-press threshold).
+pub const RESUMMON_TAP_MAX_SECS: f64 = 0.45;
+
+const RESUMMON_CARET_HIT_PAD_X_PTS: f32 = 320.0;
+const RESUMMON_CARET_HIT_PAD_Y_PTS: f32 = 36.0;
+const RESUMMON_PAGE_CARET_PAD_Y_PTS: f32 = 48.0;
+
+/// Sanitizes `egui::Context::zoom_factor()`, falling back to `1.0` for non-finite or non-positive values.
+#[must_use]
+pub fn sanitize_zoom_factor(zoom_factor: f32) -> f32 {
+    if zoom_factor.is_finite() && zoom_factor > 0.0 { zoom_factor } else { 1.0 }
+}
+
+/// Converts a rectangle `[x, y, w, h]` from egui logical points into UIKit view points using
+/// `zoom_factor` (`uikit_pts = egui_pts * zoom_factor`).
+///
+/// Returns `None` if `rect` has non-finite components, negative dimensions, or overflows when scaled.
+#[must_use]
+pub fn egui_rect_to_uikit_points(rect: [f32; 4], zoom_factor: f32) -> Option<[f32; 4]> {
+    let [x, y, w, h] = rect;
+    if !(x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite()) || w < 0.0 || h < 0.0 {
+        return None;
+    }
+    let z = sanitize_zoom_factor(zoom_factor);
+    let out = [x * z, y * z, w * z, h * z];
+    out.iter().all(|v| v.is_finite()).then_some(out)
+}
+
+/// Converts a rectangle `[x, y, w, h]` from UIKit view points into egui logical points using
+/// `zoom_factor` (`egui_pts = uikit_pts / zoom_factor`).
+#[must_use]
+pub fn uikit_rect_to_egui_points(rect: [f32; 4], zoom_factor: f32) -> Option<[f32; 4]> {
+    let [x, y, w, h] = rect;
+    if !(x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite()) || w < 0.0 || h < 0.0 {
+        return None;
+    }
+    let z = sanitize_zoom_factor(zoom_factor);
+    let out = [x / z, y / z, w / z, h / z];
+    out.iter().all(|v| v.is_finite()).then_some(out)
+}
+
+/// Converts a point `[x, y]` from UIKit view points into egui logical points using `zoom_factor`.
+#[must_use]
+pub fn uikit_point_to_egui_points(point: [f32; 2], zoom_factor: f32) -> Option<[f32; 2]> {
+    let [x, y] = point;
+    if !(x.is_finite() && y.is_finite()) {
+        return None;
+    }
+    let z = sanitize_zoom_factor(zoom_factor);
+    let out = [x / z, y / z];
+    (out[0].is_finite() && out[1].is_finite()).then_some(out)
+}
+
+/// Converts an optional egui-logical caret/selection rect `[x, y, w, h]` into UIKit view points
+/// and enforces minimum caret dimensions or `view_bounds_uikit` fallback.
+#[must_use]
+pub fn caret_rect_in_uikit_points(caret_rect_egui: Option<[f32; 4]>, view_bounds_uikit: [f32; 4], zoom_factor: f32) -> [f32; 4] {
+    let scaled = caret_rect_egui.and_then(|r| egui_rect_to_uikit_points(r, zoom_factor));
+    caret_rect_or_fallback(scaled, view_bounds_uikit)
+}
+
+/// Converts an egui-logical caret rect into UIKit view points and expands it for
+/// `UIIndirectScribbleInteraction` when `pointer_is_write` is `true`.
+#[must_use]
+pub fn indirect_scribble_target_rect_in_uikit_points(
+    caret_rect_egui: Option<[f32; 4]>,
+    pointer_is_write: bool,
+    zoom_factor: f32,
+) -> Option<[f32; 4]> {
+    let scaled = caret_rect_egui.and_then(|r| egui_rect_to_uikit_points(r, zoom_factor));
+    indirect_scribble_target_rect(scaled, pointer_is_write)
+}
+
+/// Action `TextInputBridge::sync_state` should take on `NocturneTextInputView`'s UIKit
+/// first-responder state for the current frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResponderFocusAction {
+    /// Leave UIKit responder ownership unchanged.
+    None,
+    /// Acquire first responder (`becomeFirstResponder`) to summon the software keyboard.
+    BecomeFirstResponder,
+    /// Cycle `resignFirstResponder` followed by `becomeFirstResponder` when UIKit retained
+    /// first-responder ownership after the user manually dismissed the software keyboard and
+    /// then tapped the focused text surface again.
+    CycleFirstResponder,
+    /// Release first responder (`resignFirstResponder`) when focus leaves text editing.
+    ResignFirstResponder,
+}
+
+/// Resolves the UIKit first-responder transition for the current frame.
+///
+/// Crucially, when `prev_should_focus && should_focus` (already focused):
+/// - If `!resummon_requested`, returns [`ResponderFocusAction::None`] so a manual keyboard
+///   dismiss by the user is respected instead of fighting to re-open the keyboard every frame.
+/// - If `resummon_requested` (a fresh single-finger tap landed on the focused text target):
+///   - `!is_first_responder` -> [`ResponderFocusAction::BecomeFirstResponder`].
+///   - `is_first_responder && !soft_keyboard_visible` -> [`ResponderFocusAction::CycleFirstResponder`].
+///   - `is_first_responder && soft_keyboard_visible` -> [`ResponderFocusAction::None`] (avoids
+///     keyboard flicker when repositioning the caret while the keyboard is already open).
+#[must_use]
+pub const fn resolve_responder_focus_action(
+    prev_should_focus: bool,
+    should_focus: bool,
+    is_first_responder: bool,
+    resummon_requested: bool,
+    soft_keyboard_visible: bool,
+) -> ResponderFocusAction {
+    match (prev_should_focus, should_focus) {
+        (false, true) => {
+            if !is_first_responder {
+                ResponderFocusAction::BecomeFirstResponder
+            } else if resummon_requested && !soft_keyboard_visible {
+                ResponderFocusAction::CycleFirstResponder
+            } else {
+                ResponderFocusAction::None
+            }
+        }
+        (true, false) | (false, false) => {
+            if is_first_responder {
+                ResponderFocusAction::ResignFirstResponder
+            } else {
+                ResponderFocusAction::None
+            }
+        }
+        (true, true) => {
+            if !resummon_requested {
+                ResponderFocusAction::None
+            } else if !is_first_responder {
+                ResponderFocusAction::BecomeFirstResponder
+            } else if !soft_keyboard_visible {
+                ResponderFocusAction::CycleFirstResponder
+            } else {
+                ResponderFocusAction::None
+            }
+        }
+    }
+}
+
+/// Returns `true` when `tap_pos` (in egui logical points) targeted the currently focused text
+/// surface so a dismissed software keyboard should be re-summoned.
+#[must_use]
+pub fn is_tap_in_resummon_target(tap_pos: egui::Pos2, caret_rect: Option<egui::Rect>, page_rect: Option<egui::Rect>, egui_wants_ime: bool) -> bool {
+    if !tap_pos.is_finite() {
+        return false;
+    }
+    if egui_wants_ime {
+        return caret_rect
+            .filter(|r| r.is_finite())
+            .is_some_and(|r| r.expand2(egui::vec2(RESUMMON_CARET_HIT_PAD_X_PTS, RESUMMON_CARET_HIT_PAD_Y_PTS)).contains(tap_pos));
+    }
+    if page_rect.filter(|r| r.is_finite()).is_some_and(|pr| pr.contains(tap_pos)) {
+        return true;
+    }
+    caret_rect
+        .filter(|r| r.is_finite())
+        .is_some_and(|r| r.expand2(egui::vec2(RESUMMON_CARET_HIT_PAD_X_PTS, RESUMMON_PAGE_CARET_PAD_Y_PTS)).contains(tap_pos))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingResummonTap {
+    id: egui::TouchId,
+    start_pos: egui::Pos2,
+    start_time: f64,
+}
+
+/// Tracks quick, stationary single-finger taps from `egui::RawInput::events` so tapping an
+/// already-focused text field after manually dismissing the iPadOS software keyboard cleanly
+/// re-summons the keyboard without re-opening it during drags, scrolls, long-presses,
+/// multi-touch gestures, or Apple Pencil strokes.
+#[derive(Clone, Debug, Default)]
+pub struct KeyboardResummonTapTracker {
+    active_touches: BTreeSet<egui::TouchId>,
+    pending: Option<PendingResummonTap>,
+    completed_tap: Option<egui::Pos2>,
+}
+
+impl KeyboardResummonTapTracker {
+    /// Creates an idle [`KeyboardResummonTapTracker`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Clears all in-flight and completed tap state.
+    pub fn reset(&mut self) {
+        self.active_touches.clear();
+        self.pending = None;
+        self.completed_tap = None;
+    }
+
+    /// Observes a frame's filtered `egui::Event` batch at timestamp `now_secs`.
+    ///
+    /// Call this in `raw_input_hook` after native gesture and long-press consumption filters have
+    /// stripped or cancelled non-tap touches.
+    pub fn observe_events(&mut self, now_secs: f64, events: &[egui::Event]) {
+        for event in events {
+            let egui::Event::Touch { id, phase, pos, force, .. } = event else {
+                continue;
+            };
+            match phase {
+                egui::TouchPhase::Start => {
+                    self.active_touches.insert(*id);
+                    self.completed_tap = None;
+                    if force.is_some() || self.active_touches.len() > 1 || !now_secs.is_finite() || !pos.is_finite() {
+                        self.pending = None;
+                    } else {
+                        self.pending = Some(PendingResummonTap { id: *id, start_pos: *pos, start_time: now_secs });
+                    }
+                }
+                egui::TouchPhase::Move => {
+                    if let Some(pending) = self.pending {
+                        let dist = pos.distance(pending.start_pos);
+                        let within_drift = dist.is_finite() && dist <= RESUMMON_TAP_MAX_DRIFT_PTS;
+                        if force.is_some() || *id != pending.id || self.active_touches.len() != 1 || !within_drift {
+                            self.pending = None;
+                        }
+                    }
+                }
+                egui::TouchPhase::End => {
+                    self.active_touches.remove(id);
+                    if let Some(pending) = self.pending.take()
+                        && pending.id == *id
+                        && force.is_none()
+                        && self.active_touches.is_empty()
+                        && now_secs.is_finite()
+                        && pos.is_finite()
+                    {
+                        let dt = now_secs - pending.start_time;
+                        let dist = pos.distance(pending.start_pos);
+                        if (0.0..=RESUMMON_TAP_MAX_SECS).contains(&dt) && dist.is_finite() && dist <= RESUMMON_TAP_MAX_DRIFT_PTS {
+                            self.completed_tap = Some(*pos);
+                        }
+                    }
+                }
+                egui::TouchPhase::Cancel => {
+                    self.active_touches.remove(id);
+                    if self.pending.is_some_and(|pending| pending.id == *id) {
+                        self.pending = None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Consumes and returns the latest completed single-finger tap position, if any.
+    pub fn take_completed_tap(&mut self) -> Option<egui::Pos2> {
+        self.completed_tap.take()
+    }
+
+    /// Consumes any completed tap and returns `true` iff `should_focus` is active and the tap
+    /// landed inside the focused text surface.
+    pub fn take_resummon_request(
+        &mut self,
+        should_focus: bool,
+        caret_rect: Option<egui::Rect>,
+        page_rect: Option<egui::Rect>,
+        egui_wants_ime: bool,
+    ) -> bool {
+        let Some(tap_pos) = self.completed_tap.take() else {
+            return false;
+        };
+        should_focus && is_tap_in_resummon_target(tap_pos, caret_rect, page_rect, egui_wants_ime)
+    }
 }
 
 /// Local UTF-16-addressable text window synchronized with `NocturneApp`'s active caret/selection.
@@ -1063,7 +1333,10 @@ impl TextDocumentModel {
 
 #[cfg(target_os = "ios")]
 pub mod ios {
-    use super::{TextDocumentModel, TextEditAction, TextEditCommand, caret_rect_or_fallback, indirect_scribble_target_rect};
+    use super::{
+        ResponderFocusAction, TextDocumentModel, TextEditAction, TextEditCommand, caret_rect_or_fallback, egui_rect_to_uikit_points,
+        indirect_scribble_target_rect, resolve_responder_focus_action,
+    };
     use block2::DynBlock;
     use objc2::rc::{Retained, Weak};
     use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject, Sel};
@@ -1962,20 +2235,27 @@ pub mod ios {
 
         /// Synchronizes focus, caret geometry, selected text, and tool mode from `NocturneApp`.
         ///
-        /// `document` is the whole text and character selection of the egui field that has the
-        /// keyboard, when one has ([`NocturneApp::focused_text_field`]); `pending_commands` says
-        /// the app has not yet applied everything the keyboard did. With no `document` the
-        /// page's own caret has the keyboard and only `selected_text` is mirrored, as before.
+        /// - `caret_rect` is in egui logical points and converted into UIKit view points via
+        ///   `zoom_factor` before being reported to `UITextInput` and `UIIndirectScribbleInteraction`.
+        /// - `document` is the whole text and character selection of the egui field that has the
+        ///   keyboard, when one has ([`NocturneApp::focused_text_field`]); `pending_commands` says
+        ///   the app has not yet applied everything the keyboard did. With no `document` the
+        ///   page's own caret has the keyboard and only `selected_text` is mirrored, as before.
+        /// - `resummon_requested` + `soft_keyboard_visible` allow tapping an already-focused text
+        ///   field after manually dismissing the iPadOS software keyboard to re-summon it cleanly.
         #[allow(clippy::too_many_arguments)]
         pub fn sync_state(
             &self,
             should_focus: bool,
             caret_rect: Option<egui::Rect>,
+            zoom_factor: f32,
             selected_text: &str,
             document: Option<(&str, (usize, usize))>,
             pending_commands: bool,
             pointer_is_write: bool,
             is_writable: bool,
+            resummon_requested: bool,
+            soft_keyboard_visible: bool,
         ) {
             if let Some(superview) = self.view.superview() {
                 let bounds = superview.bounds();
@@ -1984,7 +2264,8 @@ pub mod ios {
                 state.view_bounds = [bounds.origin.x as f32, bounds.origin.y as f32, bounds.size.width as f32, bounds.size.height as f32];
             }
 
-            let caret_arr = caret_rect.filter(|r| r.is_finite()).map(|r| [r.min.x, r.min.y, r.width(), r.height()]);
+            let caret_arr =
+                caret_rect.filter(|r| r.is_finite()).and_then(|r| egui_rect_to_uikit_points([r.min.x, r.min.y, r.width(), r.height()], zoom_factor));
 
             let (focus_transition, selection_changed) = {
                 let mut state = self.state.borrow_mut();
@@ -2009,16 +2290,24 @@ pub mod ios {
                 self.view.notify_selection_changed();
             }
 
-            match focus_transition {
-                (false, true) => {
-                    if !self.view.isFirstResponder() {
-                        let _ = self.view.becomeFirstResponder();
-                    }
+            match resolve_responder_focus_action(
+                focus_transition.0,
+                focus_transition.1,
+                self.view.isFirstResponder(),
+                resummon_requested,
+                soft_keyboard_visible,
+            ) {
+                ResponderFocusAction::None => {}
+                ResponderFocusAction::BecomeFirstResponder => {
+                    let _ = self.view.becomeFirstResponder();
                 }
-                (true, false) if self.view.isFirstResponder() => {
+                ResponderFocusAction::CycleFirstResponder => {
+                    let _ = self.view.resignFirstResponder();
+                    let _ = self.view.becomeFirstResponder();
+                }
+                ResponderFocusAction::ResignFirstResponder => {
                     let _ = self.view.resignFirstResponder();
                 }
-                _ => {}
             }
         }
 
@@ -2862,5 +3151,139 @@ mod tests {
         let ime_over_popup = egui::Rect::from_center_size(popup_center, egui::vec2(2.0, 16.0));
         let _ = ime_in_popup;
         assert!(super::should_route_ime_to_egui(Some(ime_over_popup), Some(caret_rect), Some(page_rect), &popup_ctx));
+    }
+
+    fn touch_ev(id: u64, phase: egui::TouchPhase, pos: egui::Pos2, force: Option<f32>) -> egui::Event {
+        egui::Event::Touch { device_id: egui::TouchDeviceId(0), id: egui::TouchId(id), phase, pos, force }
+    }
+
+    #[test]
+    fn resolve_responder_focus_action_covers_focus_transitions_and_manual_dismiss_resummon() {
+        use super::{ResponderFocusAction, resolve_responder_focus_action};
+
+        // Entering focus acquires first responder.
+        assert_eq!(resolve_responder_focus_action(false, true, false, false, false), ResponderFocusAction::BecomeFirstResponder);
+        assert_eq!(resolve_responder_focus_action(false, true, true, false, true), ResponderFocusAction::None);
+        assert_eq!(resolve_responder_focus_action(false, true, true, true, false), ResponderFocusAction::CycleFirstResponder);
+
+        // Leaving focus or staying unfocused resigns if still first responder.
+        assert_eq!(resolve_responder_focus_action(true, false, true, false, true), ResponderFocusAction::ResignFirstResponder);
+        assert_eq!(resolve_responder_focus_action(true, false, false, false, false), ResponderFocusAction::None);
+        assert_eq!(resolve_responder_focus_action(false, false, true, true, false), ResponderFocusAction::ResignFirstResponder);
+        assert_eq!(resolve_responder_focus_action(false, false, false, true, false), ResponderFocusAction::None);
+
+        // Staying focused without a tap NEVER fights user's manual keyboard dismiss.
+        assert_eq!(resolve_responder_focus_action(true, true, false, false, false), ResponderFocusAction::None);
+        assert_eq!(resolve_responder_focus_action(true, true, true, false, false), ResponderFocusAction::None);
+        assert_eq!(resolve_responder_focus_action(true, true, true, false, true), ResponderFocusAction::None);
+
+        // Staying focused WITH a tap after manual dismiss:
+        // - UIKit resigned responder -> BecomeFirstResponder.
+        assert_eq!(resolve_responder_focus_action(true, true, false, true, false), ResponderFocusAction::BecomeFirstResponder);
+        // - UIKit kept responder while software keyboard hid -> CycleFirstResponder.
+        assert_eq!(resolve_responder_focus_action(true, true, true, true, false), ResponderFocusAction::CycleFirstResponder);
+        // - Software keyboard is already visible -> None (no keyboard bounce on caret repositioning).
+        assert_eq!(resolve_responder_focus_action(true, true, true, true, true), ResponderFocusAction::None);
+    }
+
+    #[test]
+    fn keyboard_resummon_tap_tracker_resummons_on_clean_tap_and_ignores_drags_long_press_multitouch_and_pencil() {
+        use super::KeyboardResummonTapTracker;
+
+        let page = Some(egui::Rect::from_min_max(egui::pos2(200.0, 120.0), egui::pos2(900.0, 720.0)));
+        let caret = Some(egui::Rect::from_min_size(egui::pos2(260.0, 220.0), egui::vec2(2.0, 18.0)));
+        let mut tracker = KeyboardResummonTapTracker::new();
+
+        // 1. Clean single-finger tap inside page_rect triggers resummon once and consumes.
+        let tap = egui::pos2(300.0, 260.0);
+        tracker.observe_events(1.00, &[touch_ev(1, egui::TouchPhase::Start, tap, None)]);
+        tracker.observe_events(1.06, &[touch_ev(1, egui::TouchPhase::Move, tap + egui::vec2(4.0, 3.0), None)]);
+        tracker.observe_events(1.12, &[touch_ev(1, egui::TouchPhase::End, tap + egui::vec2(5.0, 3.0), None)]);
+        assert!(tracker.take_resummon_request(true, caret, page, false));
+        assert!(!tracker.take_resummon_request(true, caret, page, false), "completed tap must be consumed once");
+
+        // 2. Tap on toolbar outside page_rect & caret does NOT re-summon.
+        let toolbar = egui::pos2(60.0, 20.0);
+        tracker.observe_events(2.00, &[touch_ev(2, egui::TouchPhase::Start, toolbar, None)]);
+        tracker.observe_events(2.08, &[touch_ev(2, egui::TouchPhase::End, toolbar, None)]);
+        assert!(!tracker.take_resummon_request(true, caret, page, false));
+
+        // 3. Focused egui TextEdit (search/title/dialog): tap near caret re-summons, tap elsewhere does not.
+        let search_caret = Some(egui::Rect::from_min_size(egui::pos2(760.0, 20.0), egui::vec2(2.0, 16.0)));
+        tracker.observe_events(3.00, &[touch_ev(3, egui::TouchPhase::Start, egui::pos2(820.0, 24.0), None)]);
+        tracker.observe_events(3.09, &[touch_ev(3, egui::TouchPhase::End, egui::pos2(820.0, 24.0), None)]);
+        assert!(tracker.take_resummon_request(true, search_caret, page, true));
+
+        tracker.observe_events(3.50, &[touch_ev(4, egui::TouchPhase::Start, egui::pos2(300.0, 400.0), None)]);
+        tracker.observe_events(3.58, &[touch_ev(4, egui::TouchPhase::End, egui::pos2(300.0, 400.0), None)]);
+        assert!(!tracker.take_resummon_request(true, search_caret, page, true));
+
+        // 4. Drag exceeding drift threshold does NOT re-summon.
+        tracker.observe_events(4.00, &[touch_ev(5, egui::TouchPhase::Start, tap, None)]);
+        tracker.observe_events(4.08, &[touch_ev(5, egui::TouchPhase::Move, tap + egui::vec2(25.0, 0.0), None)]);
+        tracker.observe_events(4.14, &[touch_ev(5, egui::TouchPhase::End, tap + egui::vec2(25.0, 0.0), None)]);
+        assert!(!tracker.take_resummon_request(true, caret, page, false));
+
+        // 5. Long press (>= RESUMMON_TAP_MAX_SECS) does NOT re-summon.
+        tracker.observe_events(5.00, &[touch_ev(6, egui::TouchPhase::Start, tap, None)]);
+        tracker.observe_events(5.55, &[touch_ev(6, egui::TouchPhase::End, tap, None)]);
+        assert!(!tracker.take_resummon_request(true, caret, page, false));
+
+        // 6. Cancelled touch (native pan/pinch or consumed long-press) does NOT re-summon.
+        tracker.observe_events(6.00, &[touch_ev(7, egui::TouchPhase::Start, tap, None)]);
+        tracker.observe_events(6.10, &[touch_ev(7, egui::TouchPhase::Cancel, tap, None)]);
+        assert!(!tracker.take_resummon_request(true, caret, page, false));
+
+        // 7. Two-finger tap (e.g. Undo) does NOT re-summon.
+        tracker.observe_events(7.00, &[touch_ev(8, egui::TouchPhase::Start, tap, None)]);
+        tracker.observe_events(7.02, &[touch_ev(9, egui::TouchPhase::Start, tap + egui::vec2(40.0, 0.0), None)]);
+        tracker.observe_events(
+            7.09,
+            &[touch_ev(8, egui::TouchPhase::End, tap, None), touch_ev(9, egui::TouchPhase::End, tap + egui::vec2(40.0, 0.0), None)],
+        );
+        assert!(!tracker.take_resummon_request(true, caret, page, false));
+
+        // 8. Apple Pencil tap (`force: Some(_)`) does NOT re-summon.
+        tracker.observe_events(8.00, &[touch_ev(10, egui::TouchPhase::Start, tap, Some(0.4))]);
+        tracker.observe_events(8.08, &[touch_ev(10, egui::TouchPhase::End, tap, Some(0.0))]);
+        assert!(!tracker.take_resummon_request(true, caret, page, false));
+
+        // 9. Unfocused state rejects and discards a pending tap.
+        tracker.observe_events(9.00, &[touch_ev(11, egui::TouchPhase::Start, tap, None)]);
+        tracker.observe_events(9.06, &[touch_ev(11, egui::TouchPhase::End, tap, None)]);
+        assert!(!tracker.take_resummon_request(false, caret, page, false));
+        assert!(!tracker.take_resummon_request(true, caret, page, false), "stale tap from unfocused frame must not leak");
+    }
+
+    #[test]
+    fn zoom_factor_converts_caret_and_scribble_rects_between_egui_and_uikit_points() {
+        use super::{
+            caret_rect_in_uikit_points, egui_rect_to_uikit_points, indirect_scribble_target_rect_in_uikit_points, uikit_point_to_egui_points,
+            uikit_rect_to_egui_points,
+        };
+
+        let egui_caret = [200.0, 100.0, 2.0, 18.0];
+        let uikit_caret = [250.0, 125.0, 2.5, 22.5];
+        assert_eq!(egui_rect_to_uikit_points(egui_caret, 1.25), Some(uikit_caret));
+        assert_eq!(uikit_rect_to_egui_points(uikit_caret, 1.25), Some(egui_caret));
+        assert_eq!(uikit_point_to_egui_points([250.0, 125.0], 1.25), Some([200.0, 100.0]));
+
+        // `caret_rect_in_uikit_points` scales into UIKit points and enforces minimum UIKit dimensions.
+        assert_eq!(caret_rect_in_uikit_points(Some([100.0, 80.0, 1.0, 10.0]), [0.0, 0.0, 1024.0, 768.0], 1.25), [125.0, 100.0, 2.0, 18.0]);
+        assert_eq!(caret_rect_in_uikit_points(Some([100.0, 80.0, 4.0, 20.0]), [0.0, 0.0, 1024.0, 768.0], 1.5), [150.0, 120.0, 6.0, 30.0]);
+        assert_eq!(caret_rect_in_uikit_points(None, [0.0, 0.0, 1024.0, 768.0], 1.25), [512.0, 192.0, 2.0, 18.0]);
+
+        // `indirect_scribble_target_rect_in_uikit_points` scales caret before UIKit padding.
+        assert_eq!(indirect_scribble_target_rect_in_uikit_points(Some([200.0, 100.0, 2.0, 18.0]), false, 1.25), None);
+        assert_eq!(indirect_scribble_target_rect_in_uikit_points(Some([200.0, 100.0, 2.0, 18.0]), true, 1.25), Some([90.0, 77.0, 322.5, 118.5]));
+
+        // Non-finite, zero, or negative zoom factors safely default to 1.0.
+        for bad_zoom in [0.0, -1.25, f32::NAN, f32::INFINITY] {
+            assert_eq!(egui_rect_to_uikit_points(egui_caret, bad_zoom), Some(egui_caret));
+            assert_eq!(uikit_rect_to_egui_points(egui_caret, bad_zoom), Some(egui_caret));
+            assert_eq!(uikit_point_to_egui_points([40.0, 80.0], bad_zoom), Some([40.0, 80.0]));
+        }
+        assert_eq!(egui_rect_to_uikit_points([f32::NAN, 0.0, 2.0, 18.0], 1.25), None);
+        assert_eq!(egui_rect_to_uikit_points([0.0, 0.0, -2.0, 18.0], 1.25), None);
     }
 }

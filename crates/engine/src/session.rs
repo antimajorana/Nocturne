@@ -1,8 +1,10 @@
 use crate::commands::{self, Output, Params};
 use crate::error::EngineError;
+use crate::ocr::NativeOcrBackend;
 use crate::sync::{SecretStore, SyncHttpClient, default_http_client, default_secret_store};
 use crate::tool_state::{
     DockRoster, EraserKind, EraserToggleMode, InkActiveMode, InkOptions, InkPenKind, InkToolState, LibraryView, StudioOptions, ToolbarDock,
+    UiLayoutMode,
 };
 use nocturne_store::tree::{self, Node};
 use nocturne_store::{Settings, StoreError};
@@ -27,6 +29,7 @@ pub struct Session {
     studio_options: StudioOptions,
     sync_http: Arc<dyn SyncHttpClient>,
     sync_secrets: Arc<dyn SecretStore>,
+    native_ocr: Option<Arc<dyn NativeOcrBackend>>,
 }
 
 /// How the settings file keeps the list. A vertical bar cannot appear in a Windows path and
@@ -63,6 +66,7 @@ impl Session {
             studio_options,
             sync_http,
             sync_secrets,
+            native_ocr: None,
         };
         s.refresh();
         Ok(s)
@@ -81,6 +85,16 @@ impl Session {
 
     pub fn sync_secrets(&self) -> Arc<dyn SecretStore> {
         Arc::clone(&self.sync_secrets)
+    }
+
+    /// Installs a platform-native on-device OCR backend (for example Apple Vision on iPadOS/macOS).
+    pub fn set_native_ocr_backend(&mut self, backend: Arc<dyn NativeOcrBackend>) {
+        self.native_ocr = Some(backend);
+    }
+
+    /// Returns the installed platform-native on-device OCR backend, if any.
+    pub fn native_ocr_backend(&self) -> Option<Arc<dyn NativeOcrBackend>> {
+        self.native_ocr.clone()
     }
 
     pub fn root(&self) -> &Path {
@@ -331,6 +345,17 @@ impl Session {
     pub fn set_library_view(&mut self, view: LibraryView) {
         self.studio_options.library_view = view;
         let _ = self.settings.set(StudioOptions::LIBRARY_VIEW_KEY, view.id());
+    }
+
+    /// Which top-level interface layout Nocturne presents (`auto`, `tablet_studio`, or `classic_ribbon`).
+    pub fn layout_mode(&self) -> UiLayoutMode {
+        self.studio_options.layout_mode
+    }
+
+    /// Sets the top-level interface layout mode and remembers it in the settings file.
+    pub fn set_layout_mode(&mut self, mode: UiLayoutMode) {
+        self.studio_options.layout_mode = mode;
+        let _ = self.settings.set(StudioOptions::LAYOUT_MODE_KEY, mode.id());
     }
 }
 

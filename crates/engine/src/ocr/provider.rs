@@ -23,12 +23,13 @@ const MAX_TOKENS: u32 = 8000;
 /// The network client has its own limits; this is what is asked of one that honours it.
 const TIMEOUT_SECS: u64 = 60;
 
-pub(super) fn request(job: &OcrJob) -> SyncHttpRequest {
+pub(super) fn request(job: &OcrJob) -> Result<SyncHttpRequest, OcrError> {
     let picture = base64(&job.png);
     let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
     let mut header = |name: &str, value: &str| headers.push((name.to_string(), value.to_string()));
     let base = job.endpoint.trim_end_matches('/');
     let (url, body) = match job.provider {
+        OcrProvider::AppleVision | OcrProvider::LocalModel => return Err(OcrError::Unsupported),
         OcrProvider::Anthropic => {
             header("x-api-key", &job.key);
             header("anthropic-version", ANTHROPIC_VERSION);
@@ -78,7 +79,7 @@ pub(super) fn request(job: &OcrJob) -> SyncHttpRequest {
             (format!("{base}/v3/text"), body)
         }
     };
-    SyncHttpRequest { method: SyncHttpMethod::Post, url, headers, body: body.to_string().into_bytes(), timeout_secs: TIMEOUT_SECS }
+    Ok(SyncHttpRequest { method: SyncHttpMethod::Post, url, headers, body: body.to_string().into_bytes(), timeout_secs: TIMEOUT_SECS })
 }
 
 fn text_of(v: &Value) -> &str {
@@ -89,6 +90,7 @@ fn text_of(v: &Value) -> &str {
 pub(super) fn answer(provider: OcrProvider, body: &[u8]) -> Result<String, OcrError> {
     let v: Value = serde_json::from_slice(body).map_err(|_| OcrError::BadReply)?;
     let (text, refused, cut_off) = match provider {
+        OcrProvider::AppleVision | OcrProvider::LocalModel => return Err(OcrError::Unsupported),
         OcrProvider::Anthropic => {
             // The first block may be the model's thinking; the answer is the first text block.
             let text = v["content"]
@@ -100,8 +102,13 @@ pub(super) fn answer(provider: OcrProvider, body: &[u8]) -> Result<String, OcrEr
         }
         OcrProvider::Gemini => {
             let candidate = &v["candidates"][0];
-            let text: String =
-                candidate["content"]["parts"].as_array().map(|parts| parts.iter().map(|p| text_of(&p["text"])).collect()).unwrap_or_default();
+            // Skip thinking parts (`"thought": true`) so chain-of-thought never contaminates LaTeX.
+            let text: String = candidate["content"]["parts"]
+                .as_array()
+                .map(|parts| {
+                    parts.iter().filter(|p| !p.get("thought").and_then(Value::as_bool).unwrap_or(false)).map(|p| text_of(&p["text"])).collect()
+                })
+                .unwrap_or_default();
             let reason = text_of(&candidate["finishReason"]);
             let blocked = !v["promptFeedback"]["blockReason"].is_null()
                 || matches!(
@@ -123,11 +130,16 @@ pub(super) fn answer(provider: OcrProvider, body: &[u8]) -> Result<String, OcrEr
             (text, refused, reason == "length")
         }
         OcrProvider::Mathpix => {
-            if !text_of(&v["error"]).is_empty() {
+            let err_info_id = text_of(&v["error_info"]["id"]);
+            if err_info_id.starts_with("http_unauthorized") || err_info_id.starts_with("auth_") {
+                return Err(OcrError::Auth);
+            }
+            if !text_of(&v["error"]).is_empty() || v.get("error_info").is_some_and(|e| !e.is_null()) {
                 return Err(OcrError::BadReply);
             }
             let styled = text_of(&v["latex_styled"]);
-            (if styled.trim().is_empty() { text_of(&v["text"]) } else { styled }.to_string(), false, false)
+            let chosen = if clean_latex(styled).is_empty() { text_of(&v["text"]) } else { styled };
+            (chosen.to_string(), false, false)
         }
     };
     if refused {

@@ -19,6 +19,75 @@ const STEP: f32 = 0.34;
 /// How many points make the half-circle at each end of a stroke.
 const CAP: usize = 6;
 
+/// Precomputed Catmull-Rom polynomial coefficients for one coordinate channel on a segment.
+#[derive(Clone, Copy)]
+struct Cubic {
+    c0: f32,
+    c1: f32,
+    c2: f32,
+    c3: f32,
+}
+
+impl Cubic {
+    #[inline]
+    fn catmull_rom(a: f32, b: f32, c: f32, d: f32) -> Self {
+        Self { c0: 2.0 * b, c1: -a + c, c2: 2.0 * a - 5.0 * b + 4.0 * c - d, c3: -a + 3.0 * b - 3.0 * c + d }
+    }
+
+    #[inline]
+    fn eval(self, t: f32, t2: f32, t3: f32) -> f32 {
+        0.5 * (self.c0 + self.c1 * t + self.c2 * t2 + self.c3 * t3)
+    }
+}
+
+#[inline]
+fn segment_steps(p1: Dab, p2: Dab) -> usize {
+    let span = ((p2.x - p1.x).powi(2) + (p2.y - p1.y).powi(2)).sqrt();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let steps = ((span / STEP).ceil() as usize).clamp(1, 400);
+    steps
+}
+
+fn centre_len(dabs: &[Dab]) -> usize {
+    if dabs.len() < 3 {
+        return dabs.len();
+    }
+    let samples: usize = dabs.windows(2).map(|w| segment_steps(w[0], w[1])).sum();
+    samples + 1
+}
+
+/// Streams the smoothed centreline of `stroke` in a single pass without allocating an
+/// intermediate vector, hoisting the Catmull-Rom polynomial coefficients once per segment.
+pub(crate) fn for_each_centre(stroke: &Stroke, mut emit: impl FnMut(Dab)) {
+    let dabs = &stroke.dabs;
+    if dabs.len() < 3 {
+        for &d in dabs {
+            emit(d);
+        }
+        return;
+    }
+    for (i, pair) in dabs.windows(2).enumerate() {
+        let (p1, p2) = (pair[0], pair[1]);
+        let p0 = i.checked_sub(1).and_then(|j| dabs.get(j)).copied().unwrap_or(p1);
+        let p3 = dabs.get(i + 2).copied().unwrap_or(p2);
+        // One point every STEP along this piece, from however long it is end to end.
+        let steps = segment_steps(p1, p2);
+        let cx = Cubic::catmull_rom(p0.x, p1.x, p2.x, p3.x);
+        let cy = Cubic::catmull_rom(p0.y, p1.y, p2.y, p3.y);
+        let cp = Cubic::catmull_rom(p0.pressure, p1.pressure, p2.pressure, p3.pressure);
+        for s in 0..steps {
+            #[allow(clippy::cast_precision_loss)]
+            let t = s as f32 / steps as f32;
+            let t2 = t * t;
+            let t3 = t2 * t;
+            emit(Dab { x: cx.eval(t, t2, t3), y: cy.eval(t, t2, t3), pressure: cp.eval(t, t2, t3).clamp(0.0, 1.0) });
+        }
+    }
+    if let Some(&last) = dabs.last() {
+        emit(last);
+    }
+}
+
 /// The smoothed middle of a stroke: the readings run through a Catmull-Rom spline, which
 /// passes through every one of them rather than near it, and resampled evenly.
 ///
@@ -28,26 +97,8 @@ pub fn centre(stroke: &Stroke) -> Vec<Dab> {
     if dabs.len() < 3 {
         return dabs.clone();
     }
-    let mut out = Vec::new();
-    let at = |i: isize| -> Dab {
-        let last = dabs.len() as isize - 1;
-        let i = i.clamp(0, last).max(0) as usize;
-        dabs.get(i).copied().unwrap_or(Dab { x: 0.0, y: 0.0, pressure: 1.0 })
-    };
-    for i in 0..dabs.len().saturating_sub(1) {
-        let (p0, p1, p2, p3) = (at(i as isize - 1), at(i as isize), at(i as isize + 1), at(i as isize + 2));
-        // One point every STEP along this piece, from however long it is end to end.
-        let span = ((p2.x - p1.x).powi(2) + (p2.y - p1.y).powi(2)).sqrt();
-        let steps = ((span / STEP).ceil() as usize).clamp(1, 400);
-        for s in 0..steps {
-            #[allow(clippy::cast_precision_loss)]
-            let t = s as f32 / steps as f32;
-            out.push(spline(p0, p1, p2, p3, t));
-        }
-    }
-    if let Some(last) = dabs.last() {
-        out.push(*last);
-    }
+    let mut out = Vec::with_capacity(centre_len(dabs));
+    for_each_centre(stroke, |d| out.push(d));
     out
 }
 
@@ -55,13 +106,10 @@ pub fn centre(stroke: &Stroke) -> Vec<Dab> {
 /// Pressure rides along the same curve, so it swells and fades as smoothly as the line.
 pub(crate) fn spline(p0: Dab, p1: Dab, p2: Dab, p3: Dab, t: f32) -> Dab {
     let (t2, t3) = (t * t, t * t * t);
-    let f = |a: f32, b: f32, c: f32, d: f32| {
-        0.5 * ((2.0 * b) + (-a + c) * t + (2.0 * a - 5.0 * b + 4.0 * c - d) * t2 + (-a + 3.0 * b - 3.0 * c + d) * t3)
-    };
     Dab {
-        x: f(p0.x, p1.x, p2.x, p3.x),
-        y: f(p0.y, p1.y, p2.y, p3.y),
-        pressure: f(p0.pressure, p1.pressure, p2.pressure, p3.pressure).clamp(0.0, 1.0),
+        x: Cubic::catmull_rom(p0.x, p1.x, p2.x, p3.x).eval(t, t2, t3),
+        y: Cubic::catmull_rom(p0.y, p1.y, p2.y, p3.y).eval(t, t2, t3),
+        pressure: Cubic::catmull_rom(p0.pressure, p1.pressure, p2.pressure, p3.pressure).eval(t, t2, t3).clamp(0.0, 1.0),
     }
 }
 
@@ -80,51 +128,82 @@ pub fn width_at(stroke: &Stroke, pressure: f32) -> f32 {
     (stroke.width * share).max(crate::MIN_WIDTH)
 }
 
+#[inline]
+fn ribbon_point(stroke: &Stroke, before: Dab, cur: Dab, after: Dab) -> ((f32, f32), (f32, f32)) {
+    // The direction here is the way the line is going, taken from the points either
+    // side so a corner leans the right way.
+    let (dx, dy) = (after.x - before.x, after.y - before.y);
+    let len = (dx * dx + dy * dy).sqrt();
+    // Two readings in the same place say nothing about direction; the ends are round
+    // anyway, so across the page is as good a guess as any.
+    let (nx, ny) = if len > f32::EPSILON { (-dy / len, dx / len) } else { (0.0, 1.0) };
+    let half = width_at(stroke, cur.pressure) / 2.0;
+    ((cur.x + nx * half, cur.y + ny * half), (cur.x - nx * half, cur.y - ny * half))
+}
+
+/// Streams the smoothed centreline in one pass, pushing ribbon edges into `left` and `right`
+/// and returning `(first, second, before_last, last)` when at least two points were emitted.
+fn push_sides(stroke: &Stroke, left: &mut Vec<(f32, f32)>, right: &mut Vec<(f32, f32)>) -> Option<(Dab, Dab, Dab, Dab)> {
+    let mut first: Option<Dab> = None;
+    let mut second: Option<Dab> = None;
+    let mut prev: Option<Dab> = None;
+    let mut cur: Option<Dab> = None;
+    for_each_centre(stroke, |next| {
+        if let Some(c) = cur {
+            if second.is_none() {
+                second = Some(next);
+            }
+            let before = prev.unwrap_or(c);
+            let (l, r) = ribbon_point(stroke, before, c, next);
+            left.push(l);
+            right.push(r);
+            prev = Some(c);
+            cur = Some(next);
+        } else {
+            first = Some(next);
+            cur = Some(next);
+        }
+    });
+    let last = cur?;
+    let before_last = prev.unwrap_or(last);
+    let (l, r) = ribbon_point(stroke, before_last, last, last);
+    left.push(l);
+    right.push(r);
+    Some((first?, second?, before_last, last))
+}
+
 /// The two edges of the ribbon, left and right of the smoothed middle, point for point
 /// with it. A painter that fills triangles wants these; SVG wants them joined up, which is
 /// what [`outline`] does. Both come from here, so the file and the screen agree.
 pub fn sides(stroke: &Stroke) -> (Vec<(f32, f32)>, Vec<(f32, f32)>) {
-    let line = centre(stroke);
-    let mut left: Vec<(f32, f32)> = Vec::with_capacity(line.len());
-    let mut right: Vec<(f32, f32)> = Vec::with_capacity(line.len());
-    for (i, d) in line.iter().enumerate() {
-        // The direction here is the way the line is going, taken from the points either
-        // side so a corner leans the right way.
-        let before = line.get(i.saturating_sub(1)).copied().unwrap_or(*d);
-        let after = line.get(i + 1).copied().unwrap_or(*d);
-        let (dx, dy) = (after.x - before.x, after.y - before.y);
-        let len = (dx * dx + dy * dy).sqrt();
-        // Two readings in the same place say nothing about direction; the ends are round
-        // anyway, so across the page is as good a guess as any.
-        let (nx, ny) = if len > f32::EPSILON { (-dy / len, dx / len) } else { (0.0, 1.0) };
-        let half = width_at(stroke, d.pressure) / 2.0;
-        left.push((d.x + nx * half, d.y + ny * half));
-        right.push((d.x - nx * half, d.y - ny * half));
-    }
+    let n = centre_len(&stroke.dabs);
+    let mut left: Vec<(f32, f32)> = Vec::with_capacity(n);
+    let mut right: Vec<(f32, f32)> = Vec::with_capacity(n);
+    push_sides(stroke, &mut left, &mut right);
     (left, right)
 }
 
 /// The closed polygon to fill for one stroke: down one side of the ribbon, round the end,
 /// back up the other, round the start. Empty for a stroke with no readings.
 pub fn outline(stroke: &Stroke) -> Vec<(f32, f32)> {
-    let line = centre(stroke);
-    let Some(first) = line.first().copied() else { return Vec::new() };
-    if line.len() == 1 {
+    let n = centre_len(&stroke.dabs);
+    if n == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        let Some(first) = stroke.dabs.first().copied() else { return Vec::new() };
         return circle(first.x, first.y, width_at(stroke, first.pressure) / 2.0);
     }
-    let (left, right) = sides(stroke);
-    let last = line.last().copied().unwrap_or(first);
-    let mut out = left;
+    let mut out: Vec<(f32, f32)> = Vec::with_capacity(2 * n + 2 * (CAP + 1));
+    let mut right: Vec<(f32, f32)> = Vec::with_capacity(n);
+    let Some((first, second, before_last, last)) = push_sides(stroke, &mut out, &mut right) else {
+        return Vec::new();
+    };
     // Where the readings give no direction, `sides` assumed the pen was going across the
     // page, left to right; each end assumes the same, so a tap still closes into a dot.
-    out.extend(half_circle(
-        last,
-        width_at(stroke, last.pressure) / 2.0,
-        line.get(line.len().saturating_sub(2)).copied().unwrap_or(first),
-        (1.0, 0.0),
-    ));
+    push_half_circle(&mut out, last, width_at(stroke, last.pressure) / 2.0, before_last, (1.0, 0.0));
     out.extend(right.into_iter().rev());
-    out.extend(half_circle(first, width_at(stroke, first.pressure) / 2.0, line.get(1).copied().unwrap_or(last), (-1.0, 0.0)));
+    push_half_circle(&mut out, first, width_at(stroke, first.pressure) / 2.0, second, (-1.0, 0.0));
     out
 }
 
@@ -140,10 +219,10 @@ fn circle(x: f32, y: f32, r: f32) -> Vec<(f32, f32)> {
         .collect()
 }
 
-/// The round end of a stroke: a half turn around `at`, starting on the side the ribbon
-/// arrived on. `from` is the point before it, which says which way the pen was going;
-/// `otherwise` is the way out to assume when `from` is in the same place.
-fn half_circle(at: Dab, r: f32, from: Dab, otherwise: (f32, f32)) -> Vec<(f32, f32)> {
+/// Appends the round end of a stroke directly to `out`: a half turn around `at`, starting on
+/// the side the ribbon arrived on. `from` is the point before it, which says which way the
+/// pen was going; `otherwise` is the way out to assume when `from` is in the same place.
+fn push_half_circle(out: &mut Vec<(f32, f32)>, at: Dab, r: f32, from: Dab, otherwise: (f32, f32)) {
     let (dx, dy) = (at.x - from.x, at.y - from.y);
     let len = (dx * dx + dy * dy).sqrt();
     let (ux, uy) = if len > f32::EPSILON { (dx / len, dy / len) } else { otherwise };
@@ -154,13 +233,11 @@ fn half_circle(at: Dab, r: f32, from: Dab, otherwise: (f32, f32)) -> Vec<(f32, f
     // back out of the stroke and its "left" is the ribbon's right edge, which is where the
     // outline has just arrived.
     let start = ux.atan2(-uy);
-    (0..=CAP)
-        .map(|i| {
-            #[allow(clippy::cast_precision_loss)]
-            let a = start - std::f32::consts::PI * i as f32 / CAP as f32;
-            (at.x + r * a.cos(), at.y + r * a.sin())
-        })
-        .collect()
+    for i in 0..=CAP {
+        #[allow(clippy::cast_precision_loss)]
+        let a = start - std::f32::consts::PI * i as f32 / CAP as f32;
+        out.push((at.x + r * a.cos(), at.y + r * a.sin()));
+    }
 }
 
 /// Whether a circle of `radius` at (`x`, `y`) touches the stroke: the eraser's question,
@@ -496,6 +573,90 @@ mod tests {
         // A tap is many readings in one place; it is a whole dot, not half of one.
         for (x, y) in [(8.3, 7.0), (5.7, 7.0), (7.0, 8.3), (7.0, 5.7)] {
             assert!(encloses(&ring, x, y), "({x}, {y}) is inside the dot");
+        }
+    }
+
+    #[test]
+    fn single_pass_spline_matches_reference_centre_sides_outline_and_bounds() {
+        let mut wavy = Stroke::with_curve(Tool::FountainPen, Rgb::BLACK, 12.0, 1.4, crate::PressureCurve::Soft);
+        for i in 0..20 {
+            let t = i as f32;
+            let p = 0.1 + 0.9 * (0.5 + 0.5 * (t * 0.45).sin());
+            wavy.dabs.push(Dab::new(t * 11.5, 40.0 + (t * 0.6).sin() * 28.0, p));
+        }
+        let cases = [
+            Stroke::default(),
+            drawn(Tool::Pen, &[(5.0, 5.0, 0.5)]),
+            drawn(Tool::Pen, &[(0.0, 0.0, 0.2), (50.0, 20.0, 0.9)]),
+            drawn(Tool::BrushPen, &[(0.0, 0.0, 0.1), (40.0, 35.0, 0.8), (80.0, 0.0, 0.3)]),
+            drawn(Tool::Highlighter, &[(10.0, 10.0, 1.0); 8]),
+            wavy,
+        ];
+
+        for stroke in &cases {
+            let line = centre(stroke);
+            assert_eq!(line.len(), centre_len(&stroke.dabs), "precomputed length matches emitted points");
+            assert_eq!(line.capacity(), line.len(), "centre allocates exact capacity without growth");
+
+            // Reference per-segment spline evaluation matches hoisted Cubic evaluation bit-for-bit.
+            if stroke.dabs.len() >= 3 {
+                let dabs = &stroke.dabs;
+                let mut expected = Vec::new();
+                for i in 0..dabs.len() - 1 {
+                    let p0 = dabs[i.saturating_sub(1)];
+                    let p1 = dabs[i];
+                    let p2 = dabs[i + 1];
+                    let p3 = dabs[(i + 2).min(dabs.len() - 1)];
+                    let steps = segment_steps(p1, p2);
+                    for s in 0..steps {
+                        let t = s as f32 / steps as f32;
+                        expected.push(spline(p0, p1, p2, p3, t));
+                    }
+                }
+                expected.push(*dabs.last().expect("last dab"));
+                assert_eq!(line, expected, "hoisted cubic evaluation matches per-sample spline");
+            }
+
+            // Streaming sides match direct computation from `centre(stroke)`.
+            let (left, right) = sides(stroke);
+            assert_eq!(left.len(), line.len());
+            assert_eq!(right.len(), line.len());
+            for (i, d) in line.iter().enumerate() {
+                let before = line[i.saturating_sub(1)];
+                let after = line.get(i + 1).copied().unwrap_or(*d);
+                let (exp_l, exp_r) = ribbon_point(stroke, before, *d, after);
+                assert_eq!(left[i], exp_l);
+                assert_eq!(right[i], exp_r);
+            }
+
+            // Single-pass outline matches exact length, exact capacity, and left/right edges.
+            let ring = outline(stroke);
+            match line.len() {
+                0 => assert!(ring.is_empty()),
+                1 => assert_eq!(ring.len(), CAP * 2),
+                n => {
+                    let expected_len = 2 * n + 2 * (CAP + 1);
+                    assert_eq!(ring.len(), expected_len);
+                    assert_eq!(ring.capacity(), expected_len, "outline allocates once with exact final capacity");
+                    assert_eq!(&ring[..n], left.as_slice());
+                    let rev_right: Vec<(f32, f32)> = right.iter().copied().rev().collect();
+                    assert_eq!(&ring[n + CAP + 1..2 * n + CAP + 1], rev_right.as_slice());
+                }
+            }
+
+            // Zero-allocation Stroke::bounds matches explicit scan over raw dabs + centre.
+            let expected_bounds = stroke.dabs.first().map(|first| {
+                let (mut x0, mut y0, mut x1, mut y1) = (first.x, first.y, first.x, first.y);
+                for d in stroke.dabs.iter().chain(&line) {
+                    x0 = x0.min(d.x);
+                    y0 = y0.min(d.y);
+                    x1 = x1.max(d.x);
+                    y1 = y1.max(d.y);
+                }
+                let edge = stroke.width / 2.0;
+                (x0 - edge, y0 - edge, x1 + edge, y1 + edge)
+            });
+            assert_eq!(stroke.bounds(), expected_bounds);
         }
     }
 }

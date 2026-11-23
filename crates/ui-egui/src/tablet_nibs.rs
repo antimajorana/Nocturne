@@ -4,13 +4,13 @@
 //! page. Inactive tools sit recessed against the outer dock edge; the active tool rises inward by
 //! [`ACTIVE_NIB_RAISE`] points so the chosen pen is immediately clear at a glance.
 
-use crate::theme::{Tokens, mix, readable_on};
-use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, Vec2, pos2, vec2};
+use crate::theme::{RADIUS_POPUP, Tokens, mix, readable_on};
+use egui::{Color32, CornerRadius, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, Vec2, pos2, vec2};
 use nocturne_engine::ToolbarDock;
 use nocturne_ink::{Rgb, Tool, rack::Nib};
 
 /// Slot dimension along the length of the dock bar.
-pub const DOCK_NIB_ALONG: f32 = 28.0;
+pub const DOCK_NIB_ALONG: f32 = 34.0;
 
 /// Slot dimension perpendicular to the dock bar, including [`ACTIVE_NIB_RAISE`] travel room.
 pub const DOCK_NIB_CROSS: f32 = 42.0;
@@ -75,11 +75,30 @@ pub fn nib_visual_rect(slot_rect: Rect, dock: ToolbarDock, active: bool) -> Rect
 #[must_use]
 pub fn nib_colors_for_theme(t: &Tokens, colour: Rgb, active: bool) -> NibColors {
     let barrel_fill = mix(t.editor, t.panel, if active { 0.12 } else { 0.38 });
-    let barrel_stroke = if active { t.accent } else { t.muted };
+    let barrel_stroke = if active { t.accent } else { t.border };
     let collar_fill = mix(barrel_fill, t.muted, 0.22);
-    let ink_fill = crate::tablet_chrome::shown_nib_color(colour, t.panel);
-    let band_stroke = readable_on(t.muted, barrel_fill, 2.5, luma_is_dark(barrel_fill));
+    let ink_fill = crate::tablet_chrome::shown_nib_color(colour, t.surface_elevated);
+    let band_stroke = readable_on(t.border, barrel_fill, 2.5, luma_is_dark(barrel_fill));
     NibColors { barrel_fill, barrel_stroke, collar_fill, ink_fill, band_stroke }
+}
+
+/// Paints hover, pressed, and keyboard-focus affordances behind an upright dock nib without
+/// altering the resting pixel geometry of the pen silhouette.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_nib_state(painter: &Painter, slot_rect: Rect, visual_rect: Rect, active: bool, hovered: bool, pressed: bool, focused: bool, t: &Tokens) {
+    let r = CornerRadius::same(RADIUS_POPUP);
+    if pressed {
+        let hit = slot_rect.shrink(1.0);
+        painter.rect_filled(hit, r, t.row_selected);
+        painter.rect_stroke(hit, r, Stroke::new(1.5, t.accent), StrokeKind::Inside);
+    } else if hovered {
+        let hi = if active { slot_rect.shrink(1.0) } else { visual_rect.expand(1.5) };
+        painter.rect_filled(hi, r, t.row_hover);
+        painter.rect_stroke(hi, r, Stroke::new(1.0, t.border_subtle), StrokeKind::Inside);
+    }
+    if focused {
+        painter.rect_stroke(slot_rect.expand(1.0), CornerRadius::same(RADIUS_POPUP + 2), Stroke::new(2.0, t.accent), StrokeKind::Outside);
+    }
 }
 
 /// Maps local upright pen coordinates `(u, v)` (`u` in `[-1.0, 1.0]` across width, `v` in
@@ -203,6 +222,7 @@ mod tests {
 
     #[test]
     fn active_nib_shifts_inward_on_all_four_edges_while_staying_inside_slot() {
+        assert!((DOCK_NIB_ALONG - 34.0).abs() < 0.01);
         for dock in ToolbarDock::ALL {
             let slot = Rect::from_min_size(pos2(100.0, 200.0), nib_slot_size(dock));
             let active = nib_visual_rect(slot, dock, true);
@@ -225,6 +245,7 @@ mod tests {
                 for active in [false, true] {
                     let c = nib_colors_for_theme(&tokens, rgb, active);
                     assert!(contrast(c.barrel_stroke, tokens.panel) >= 3.0);
+                    assert!(contrast(c.barrel_stroke, tokens.surface_elevated) >= 3.0);
                     assert!(contrast(c.band_stroke, c.barrel_fill) >= 2.2);
                 }
             }

@@ -790,3 +790,212 @@ fn openapi_account_discovery_url_drive_id_302_download_revised_at_and_child_form
     assert!(!new_page.exists(), "recycled page must not be re-downloaded when propagate_deletes is false");
     assert!(!r_del["trashed_remote"].as_array().expect("arr").is_empty(), "recycled page files must be trashed on kDrive");
 }
+
+#[test]
+fn file_secret_store_creates_0600_files_atomically_and_leaves_no_temp_files() {
+    use nocturne_engine::sync::{FileSecretStore, SecretStore};
+    let tmp = TempDir::new("secret-store-perms");
+    let store = FileSecretStore::new(tmp.path());
+    store.set_secret("kdrive_personal_token", "top-secret-1").expect("set 1");
+    assert_eq!(store.get_secret("kdrive_personal_token").expect("get 1").as_deref(), Some("top-secret-1"));
+    store.set_secret("kdrive_personal_token", "top-secret-2").expect("set 2");
+    assert_eq!(store.get_secret("kdrive_personal_token").expect("get 2").as_deref(), Some("top-secret-2"));
+
+    let secret_path = tmp.path().join("kdrive_personal_token.secret");
+    assert!(secret_path.is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&secret_path).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "secret file must be owner-only 0o600, got {mode:o}");
+    }
+    let leftover_tmps = std::fs::read_dir(tmp.path())
+        .expect("read_dir")
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().contains("tmp-secret"))
+        .count();
+    assert_eq!(leftover_tmps, 0, "no temporary secret files should remain");
+}
+
+#[test]
+fn trash_file_handles_cancel_404_auth_and_retry_to_404() {
+    use nocturne_engine::sync::{KDriveClient, SyncError, SyncHttpClient, SyncHttpRequest, SyncHttpResponse};
+    use std::collections::VecDeque;
+
+    struct ScriptedHttp {
+        responses: Mutex<VecDeque<SyncHttpResponse>>,
+        calls: Mutex<usize>,
+    }
+
+    impl SyncHttpClient for ScriptedHttp {
+        fn request(&self, _req: SyncHttpRequest) -> Result<SyncHttpResponse, SyncError> {
+            *self.calls.lock().expect("calls") += 1;
+            let resp =
+                self.responses.lock().expect("resps").pop_front().unwrap_or(SyncHttpResponse { status: 500, headers: Vec::new(), body: Vec::new() });
+            Ok(resp)
+        }
+    }
+
+    // 1. Pre-cancelled returns Cancelled with zero HTTP calls.
+    let cancel = AtomicBool::new(true);
+    let http = ScriptedHttp { responses: Mutex::new(VecDeque::new()), calls: Mutex::new(0) };
+    let client = KDriveClient::new(&http, "https://api.infomaniak.com", "tok", Some(&cancel)).expect("client");
+    assert_eq!(client.trash_file(1, 42), Err(SyncError::Cancelled));
+    assert_eq!(*http.calls.lock().expect("calls"), 0);
+
+    // 2. 401 returns Auth immediately with exactly 1 HTTP call (no duplicate DELETE).
+    let http = ScriptedHttp {
+        responses: Mutex::new(VecDeque::from([SyncHttpResponse { status: 401, headers: Vec::new(), body: b"{}".to_vec() }])),
+        calls: Mutex::new(0),
+    };
+    let client = KDriveClient::new(&http, "https://api.infomaniak.com", "tok", None).expect("client");
+    assert!(matches!(client.trash_file(1, 42), Err(SyncError::Auth(_))));
+    assert_eq!(*http.calls.lock().expect("calls"), 1);
+
+    // 3. 429 followed by 404 (already trashed) retries once and succeeds idempotently.
+    let http = ScriptedHttp {
+        responses: Mutex::new(VecDeque::from([
+            SyncHttpResponse { status: 429, headers: vec![("Retry-After".into(), "1".into())], body: b"{}".to_vec() },
+            SyncHttpResponse { status: 404, headers: Vec::new(), body: b"{}".to_vec() },
+        ])),
+        calls: Mutex::new(0),
+    };
+    let client = KDriveClient::new(&http, "https://api.infomaniak.com", "tok", None).expect("client");
+    client.trash_file(1, 42).expect("429 -> 404 succeeds");
+    assert_eq!(*http.calls.lock().expect("calls"), 2);
+}
+
+#[test]
+fn ureq_client_honors_timeout_and_streams_downloads_with_cancel() {
+    use nocturne_engine::sync::{SyncError, SyncHttpClient, SyncHttpMethod, SyncHttpRequest, UnsupportedSyncClient, UreqSyncClient};
+    use std::time::{Duration, Instant};
+
+    let tmp = TempDir::new("ureq-stream-timeout");
+    let unsupported = UnsupportedSyncClient::new("disabled");
+    assert!(matches!(
+        unsupported.download_to_file("https://example.test/f", &tmp.path().join("x"), None, &mut |_, _| {}),
+        Err(SyncError::Unsupported(_))
+    ));
+
+    // 1. Timeout test: server accepts connection and stalls 4s; 1s request timeout must trip well before 4s.
+    let slow_listener = TcpListener::bind("127.0.0.1:0").expect("bind slow");
+    let slow_addr = slow_listener.local_addr().expect("addr");
+    let slow_handle = thread::spawn(move || {
+        if let Ok((mut stream, _)) = slow_listener.accept() {
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf);
+            thread::sleep(Duration::from_secs(3));
+        }
+    });
+    let client = UreqSyncClient::new();
+    let started = Instant::now();
+    let err = client
+        .request(SyncHttpRequest {
+            method: SyncHttpMethod::Get,
+            url: format!("http://{slow_addr}/slow"),
+            headers: Vec::new(),
+            body: Vec::new(),
+            timeout_secs: 1,
+        })
+        .expect_err("1s timeout must abort stalled server");
+    assert!(matches!(err, SyncError::Transport(_)), "got: {err:?}");
+    assert!(started.elapsed() < Duration::from_secs(3), "elapsed {:?} should honor 1s timeout", started.elapsed());
+    let _ = slow_handle.join();
+
+    // 2. Streaming download_to_file with progress and mid-stream cancellation.
+    let payload: Vec<u8> = (0..(256 * 1024)).map(|i| (i % 251) as u8).collect();
+    let payload_ok = payload.clone();
+    let dl_listener = TcpListener::bind("127.0.0.1:0").expect("bind dl");
+    let dl_addr = dl_listener.local_addr().expect("addr");
+    let dl_handle = thread::spawn(move || {
+        for _ in 0..2 {
+            if let Ok((mut stream, _)) = dl_listener.accept() {
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                loop {
+                    let mut h = String::new();
+                    let _ = reader.read_line(&mut h);
+                    if h.trim().is_empty() {
+                        break;
+                    }
+                }
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", payload_ok.len());
+                let _ = stream.write_all(head.as_bytes());
+                for chunk in payload_ok.chunks(16 * 1024) {
+                    if stream.write_all(chunk).is_err() {
+                        break;
+                    }
+                    let _ = stream.flush();
+                }
+            }
+        }
+    });
+
+    let dest = tmp.path().join("streamed.bin");
+    let mut progress_points = Vec::new();
+    let written = client
+        .download_to_file(&format!("http://{dl_addr}/file"), &dest, None, &mut |done, total| progress_points.push((done, total)))
+        .expect("streamed download ok");
+    assert_eq!(written, payload.len() as u64);
+    assert_eq!(std::fs::read(&dest).expect("read dest"), payload);
+    assert!(progress_points.last() == Some(&(payload.len() as u64, Some(payload.len() as u64))));
+
+    // Second request: cancel on the very first progress callback; partial file must be removed.
+    let cancel_flag = AtomicBool::new(false);
+    let cancelled_dest = tmp.path().join("cancelled.bin");
+    let res = client.download_to_file(&format!("http://{dl_addr}/file"), &cancelled_dest, Some(&cancel_flag), &mut |_, _| {
+        cancel_flag.store(true, Ordering::Relaxed);
+    });
+    assert_eq!(res, Err(SyncError::Cancelled));
+    assert!(!cancelled_dest.exists(), "partial file must be cleaned up on cancel");
+    let _ = dl_handle.join();
+}
+
+#[test]
+fn repeated_conflicts_in_same_second_do_not_overwrite_earlier_conflict_copy_and_dropped_stage_cleans_up() {
+    let srv = LoopbackServer::start("tok-uniq", 888);
+    let tmp = TempDir::new("sync-unique-conflict");
+    let mut s = Session::new(&tmp.path().join("nb"), Settings::at(tmp.path().join("cfg/s.toml"))).expect("s");
+    s.run("sync.configure", &params(&[("endpoint", &srv.endpoint), ("drive_id", "888"), ("token", "tok-uniq")])).expect("cfg");
+
+    std::fs::create_dir_all(s.root().join("notes")).expect("dir");
+    std::fs::write(s.root().join("notes/doc.md"), b"base").expect("base");
+    s.run("sync.now", &params(&[])).expect("sync base");
+
+    // Trigger two rapid conflicts on `notes/doc.md` (likely within the same second).
+    for (local_txt, remote_txt) in [("local-1", "remote-1"), ("local-2", "remote-2")] {
+        std::fs::write(s.root().join("notes/doc.md"), local_txt.as_bytes()).expect("local edit");
+        {
+            let mut st = srv.state.lock().expect("lock");
+            let dir_id = st.ensure_dir_chain_under_private("The Oracle/Nocturne/notes");
+            st.put_file(dir_id, "doc.md", remote_txt.as_bytes(), 1_702_000_000);
+        }
+        let r = json_of(s.run("sync.now", &params(&[])).expect("conflict sync"));
+        assert_eq!(r["conflicts"].as_array().expect("arr").len(), 1);
+    }
+
+    let conflict_contents: Vec<String> = std::fs::read_dir(s.root().join("notes"))
+        .expect("read notes")
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().contains(".conflict-"))
+        .map(|e| std::fs::read_to_string(e.path()).expect("read conflict"))
+        .collect();
+    assert_eq!(conflict_contents.len(), 2, "both conflict copies must survive: {conflict_contents:?}");
+    assert!(conflict_contents.iter().any(|c| c == "remote-1"));
+    assert!(conflict_contents.iter().any(|c| c == "remote-2"));
+
+    // Dropping an unapplied StagedSync cleans up its run-* staging directory.
+    {
+        let mut st = srv.state.lock().expect("lock");
+        let dir_id = st.ensure_dir_chain_under_private("The Oracle/Nocturne/notes");
+        st.put_file(dir_id, "extra.md", b"staged-only", 1_702_000_050);
+    }
+    let cfg = SyncConfig::load(&s.settings);
+    let staged = stage_sync(s.root(), &s.settings, &cfg, s.sync_http().as_ref(), s.sync_secrets().as_ref(), None).expect("stage");
+    drop(staged);
+    let leftovers = std::fs::read_dir(s.root().join(".nocturne-sync-stage"))
+        .map(|rd| rd.filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().starts_with("run-")).count())
+        .unwrap_or(0);
+    assert_eq!(leftovers, 0, "dropping StagedSync must clean up stage_dir");
+}

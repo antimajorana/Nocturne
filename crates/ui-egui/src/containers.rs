@@ -35,7 +35,14 @@ const INITIAL_PAGE_LINES: f32 = 20.0;
 
 /// Width for an unarranged page's single default container, in page coordinates.
 pub fn responsive_default_width(available_width: f32, zoom: f32) -> f32 {
-    (available_width / zoom - 2.0 * PAD).max(container::MIN_WIDTH)
+    (available_width / zoom.max(0.01) - 2.0 * PAD).max(container::MIN_WIDTH)
+}
+
+/// Converts a screen-space click on open paper into page-space container coordinates so the new
+/// container's text origin lands directly under the pointer at any zoom factor.
+fn click_to_page_box_origin(click_pos: Pos2, area_min: Pos2, zoom: f32) -> Pos2 {
+    let z = zoom.max(0.01);
+    pos2(((click_pos.x - area_min.x) / z - PAD).max(0.0), ((click_pos.y - area_min.y) / z - HANDLE).max(0.0))
 }
 const EMPTY_LINE_HEIGHT: f32 = 22.0;
 const TRAILING_LINE_HEIGHT: f32 = 22.0;
@@ -506,8 +513,8 @@ pub fn show_with_touch_and_handles(
             && !selection_was_up
             && let Some(at) = empty_paper.interact_pointer_pos().or(empty_tapped)
         {
-            let where_ = pos2((at.x - area.min.x - PAD).max(0.0), (at.y - area.min.y - HANDLE).max(0.0));
-            start_a_box(blocks, boxes, caret, where_, (area.width() - 2.0 * PAD).max(container::MIN_WIDTH));
+            let where_ = click_to_page_box_origin(at, area.min, zoom);
+            start_a_box(blocks, boxes, caret, where_, responsive_default_width(area.width(), zoom));
             out.changed.caret = true;
             out.changed.blocks = true;
             out.boxes = true;
@@ -1607,8 +1614,8 @@ pub fn show_with_touch_and_handles(
         && !outward_handles.iter().any(|r| r.contains(at))
         && !pill_rect.is_some_and(|r| r.contains(at))
     {
-        let where_ = pos2((at.x - area.min.x - PAD).max(0.0), (at.y - area.min.y - HANDLE).max(0.0));
-        start_a_box(blocks, boxes, caret, where_, (area.width() - 2.0 * PAD).max(container::MIN_WIDTH));
+        let where_ = click_to_page_box_origin(at, area.min, zoom);
+        start_a_box(blocks, boxes, caret, where_, responsive_default_width(area.width(), zoom));
         out.changed.caret = true;
         out.changed.blocks = true;
         out.boxes = true;
@@ -1632,8 +1639,8 @@ pub fn show_with_touch_and_handles(
         out.changed.caret = true;
         match below.interact_pointer_pos().or(below_tapped) {
             Some(at) => {
-                let where_ = pos2((at.x - area.min.x - PAD).max(0.0), (at.y - area.min.y - HANDLE).max(0.0));
-                start_a_box(blocks, boxes, caret, where_, (area.width() - 2.0 * PAD).max(container::MIN_WIDTH));
+                let where_ = click_to_page_box_origin(at, area.min, zoom);
+                start_a_box(blocks, boxes, caret, where_, responsive_default_width(area.width(), zoom));
                 out.boxes = true;
                 out.changed.blocks = true;
             }
@@ -2592,5 +2599,113 @@ more
         frame.textures_delta.clear();
         assert_eq!(boxes.len(), 1, "everything in one box rather than losing a block");
         assert_eq!(boxes.first().map(|b| b.blocks), Some(4));
+    }
+
+    #[test]
+    fn click_to_place_scales_coordinates_at_every_zoom() {
+        let t = Theme::DEFAULT.tokens();
+        let screen = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 800.0));
+        let click_empty = pos2(320.0, 240.0);
+        let click_beside = pos2(520.0, 60.0);
+        let click_below = pos2(420.0, 380.0);
+        let button = |pos: Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        for zoom in [0.5_f32, 1.0, 1.5, 2.0] {
+            // 1. Empty canvas click-to-place.
+            let ctx = egui::Context::default();
+            let mut blocks: Vec<Block> = Vec::new();
+            let mut boxes: Vec<Container> = Vec::new();
+            let mut caret: Option<Caret> = None;
+            let run_frame = |events: Vec<egui::Event>, blocks: &mut Vec<Block>, boxes: &mut Vec<Container>, caret: &mut Option<Caret>| {
+                let input = egui::RawInput { events, screen_rect: Some(screen), ..Default::default() };
+                let mut frame_origin = Pos2::ZERO;
+                let mut out = ctx.run_ui(input, |ui| {
+                    crate::fonts::install_once(ui.ctx());
+                    let moved = show(
+                        ui,
+                        blocks,
+                        boxes,
+                        caret,
+                        std::path::Path::new("."),
+                        &t,
+                        Some(nocturne_model::Dir::Ltr),
+                        &mut Default::default(),
+                        &mut Default::default(),
+                        &mut None,
+                        "",
+                        zoom,
+                        None,
+                    );
+                    frame_origin = moved.origin;
+                });
+                out.textures_delta.clear();
+                frame_origin
+            };
+            let origin = run_frame(vec![], &mut blocks, &mut boxes, &mut caret);
+            run_frame(vec![egui::Event::PointerMoved(click_empty), button(click_empty, true)], &mut blocks, &mut boxes, &mut caret);
+            run_frame(vec![button(click_empty, false)], &mut blocks, &mut boxes, &mut caret);
+            assert_eq!(boxes.len(), 1, "zoom={zoom}: empty click creates one container");
+            let placed = boxes[0];
+            let want_x = ((click_empty.x - origin.x) / zoom - PAD).max(0.0);
+            let want_y = ((click_empty.y - origin.y) / zoom - HANDLE).max(0.0);
+            assert!((placed.x - want_x).abs() < 0.01, "zoom={zoom}: empty x={} expected {want_x}", placed.x);
+            assert!((placed.y - want_y).abs() < 0.01, "zoom={zoom}: empty y={} expected {want_y}", placed.y);
+            // Round-trip back to screen space: inner text origin lands directly on the click point.
+            let rendered_inner = pos2(origin.x + (placed.x + PAD) * zoom, origin.y + (placed.y + HANDLE) * zoom);
+            assert!((rendered_inner - click_empty).length() < 0.01, "zoom={zoom}: rendered inner {rendered_inner:?} != click {click_empty:?}");
+
+            // 2. Click on open paper beside and below an existing box.
+            let ctx2 = egui::Context::default();
+            let mut blocks2 = page("existing\n");
+            let mut boxes2 = vec![Container::new(0.0, 0.0, 120.0, 1)];
+            let mut caret2: Option<Caret> = None;
+            let run_frame2 = |events: Vec<egui::Event>, blocks: &mut Vec<Block>, boxes: &mut Vec<Container>, caret: &mut Option<Caret>| {
+                let input = egui::RawInput { events, screen_rect: Some(screen), ..Default::default() };
+                let mut frame_origin = Pos2::ZERO;
+                let mut out = ctx2.run_ui(input, |ui| {
+                    crate::fonts::install_once(ui.ctx());
+                    let moved = show(
+                        ui,
+                        blocks,
+                        boxes,
+                        caret,
+                        std::path::Path::new("."),
+                        &t,
+                        Some(nocturne_model::Dir::Ltr),
+                        &mut Default::default(),
+                        &mut Default::default(),
+                        &mut None,
+                        "",
+                        zoom,
+                        None,
+                    );
+                    frame_origin = moved.origin;
+                });
+                out.textures_delta.clear();
+                frame_origin
+            };
+            let origin2 = run_frame2(vec![], &mut blocks2, &mut boxes2, &mut caret2);
+            for click_at in [click_beside, click_below] {
+                run_frame2(vec![egui::Event::PointerMoved(click_at), button(click_at, true)], &mut blocks2, &mut boxes2, &mut caret2);
+                run_frame2(vec![button(click_at, false)], &mut blocks2, &mut boxes2, &mut caret2);
+                let placed = boxes2.last().copied().expect("placed container");
+                let expected = click_to_page_box_origin(click_at, origin2, zoom);
+                assert!(
+                    (placed.x - expected.x).abs() < 0.01 && (placed.y - expected.y).abs() < 0.01,
+                    "zoom={zoom} click={click_at:?}: placed=({}, {}) expected={expected:?}",
+                    placed.x,
+                    placed.y
+                );
+                // Put text in it so the next click does not drop it as blank.
+                if let Some(last_block) = blocks2.last_mut() {
+                    *last_block = Block::Paragraph(vec![nocturne_formats::markdown::Span { text: "ok".into(), ..Default::default() }]);
+                }
+            }
+        }
     }
 }

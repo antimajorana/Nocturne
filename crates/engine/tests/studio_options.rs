@@ -129,3 +129,38 @@ fn the_layout_is_remembered_and_junk_in_the_file_is_the_default() {
     let s = Session::new(&t.path().join("notebooks"), settings).expect("session");
     assert_eq!(s.studio_options(), StudioOptions::default());
 }
+
+#[test]
+fn layout_mode_parses_switches_persists_and_rejects_unknown_values() {
+    use nocturne_engine::UiLayoutMode;
+    let t = TempDir::new("studio-options-layout-mode");
+    let mut s = session(&t);
+    assert!(registry().iter().any(|c| c.id == "ui.layout_mode" && !c.changes_tree));
+    assert_eq!(s.layout_mode(), UiLayoutMode::Auto);
+    assert_eq!(json_of(s.run("ui.layout_mode", &Params::new()).expect("initial")), json!({ "layout_mode": "auto" }));
+
+    for (raw, expected) in [
+        ("tablet_studio", UiLayoutMode::TabletStudio),
+        ("tablet", UiLayoutMode::TabletStudio),
+        ("CLASSIC_RIBBON", UiLayoutMode::ClassicRibbon),
+        (" classic ", UiLayoutMode::ClassicRibbon),
+        ("auto", UiLayoutMode::Auto),
+    ] {
+        let out = json_of(s.run("ui.layout_mode", &p(&[("mode", raw)])).expect("set mode"));
+        assert_eq!(out, json!({ "layout_mode": expected.id() }));
+        assert_eq!(s.layout_mode(), expected);
+        assert_eq!(s.studio_options().layout_mode, expected);
+    }
+
+    s.run("ui.layout_mode", &p(&[("mode", "tablet")])).expect("set tablet");
+    assert!(matches!(s.run("ui.layout_mode", &p(&[("mode", "floating")])), Err(EngineError::BadParam(_))));
+    assert_eq!(s.layout_mode(), UiLayoutMode::TabletStudio, "refused mode changes nothing");
+    drop(s);
+
+    assert_eq!(session(&t).layout_mode(), UiLayoutMode::TabletStudio, "persisted across sessions");
+
+    let settings = Settings::at(t.path().join("settings").join("s.toml"));
+    settings.set("ui_layout_mode", "not-a-mode").expect("junk layout mode");
+    let reloaded = Session::new(&t.path().join("notebooks"), settings).expect("reloaded");
+    assert_eq!(reloaded.layout_mode(), UiLayoutMode::Auto);
+}

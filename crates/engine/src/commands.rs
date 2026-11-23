@@ -519,6 +519,15 @@ fn ui_library_view(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
     Ok(Output::Json(serde_json::json!({ "library_view": s.library_view().id() })))
 }
 
+fn ui_layout_mode(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
+    if let Some(raw) = p.get("mode") {
+        let mode = crate::UiLayoutMode::parse(raw)
+            .ok_or_else(|| EngineError::BadParam("mode must be auto, tablet_studio (or tablet), or classic_ribbon (or classic)".into()))?;
+        s.set_layout_mode(mode);
+    }
+    Ok(Output::Json(serde_json::json!({ "layout_mode": s.layout_mode().id() })))
+}
+
 fn ink_hold_to_straighten(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
     let enabled = switch_param(p, "enabled", s.ink_options().hold_to_straighten)?;
     s.set_hold_to_straighten(enabled);
@@ -970,7 +979,7 @@ blocks (optional): the justified paragraphs' positions among the page's blocks, 
     CommandSpec {
         id: "ink.math_ocr_configure",
         label: "Choose the service that reads handwritten equations, and give it its key",
-        params: "provider (optional): anthropic, gemini, openai, mathpix, or custom\nendpoint (optional): the service's address, https only unless it is on this machine; default for the service's own\nmodel (optional): the model to ask; default for the service's own\nkey (optional): the service's key, kept outside the settings file and never shown\napp_id (optional): the app id Mathpix needs beside its key\nclear_key (optional): true forgets the key\nwithout parameters, reports the settings",
+        params: "provider (optional): apple_vision, local_model, anthropic, gemini, openai, mathpix, or custom\nendpoint (optional): the service's address, https only unless it is on this machine; default for the service's own\nmodel (optional): the model to ask; default for the service's own\nkey (optional): the service's key, kept outside the settings file and never shown\napp_id (optional): the app id Mathpix needs beside its key\nclear_key (optional): true forgets the key\nwithout parameters, reports the settings",
         changes_tree: false,
         run: crate::ocr::commands::configure,
     },
@@ -980,6 +989,13 @@ blocks (optional): the justified paragraphs' positions among the page's blocks, 
         params: "path (required): the page\nstrokes (optional): which strokes, by position, comma separated; default: all of them",
         changes_tree: false,
         run: crate::ocr::commands::convert,
+    },
+    CommandSpec {
+        id: "ink.math_ocr_remove_model",
+        label: "Remove the downloaded on-device math recognition model files",
+        params: "",
+        changes_tree: false,
+        run: crate::ocr::commands::remove_model,
     },
     CommandSpec {
         id: "ink.configure_tools",
@@ -1001,6 +1017,13 @@ blocks (optional): the justified paragraphs' positions among the page's blocks, 
         params: "view (optional): studio_grid, classic_tree, or toggle; without it, reports the current view",
         changes_tree: false,
         run: ui_library_view,
+    },
+    CommandSpec {
+        id: "ui.layout_mode",
+        label: "Choose whether Nocturne uses Tablet Studio, Classic Ribbon, or automatic layout",
+        params: "mode (optional): auto, tablet_studio (or tablet), or classic_ribbon (or classic); without it, reports the current mode",
+        changes_tree: false,
+        run: ui_layout_mode,
     },
     CommandSpec {
         id: "sync.status",

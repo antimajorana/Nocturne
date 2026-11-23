@@ -22,3 +22,7 @@ web-time = { workspace = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))'.dependencies]
 ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier", "json"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tract-onnx = "0.23"
+

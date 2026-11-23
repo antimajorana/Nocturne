@@ -606,15 +606,19 @@ fn order_middle_dialog_blocks_native_gesture_while_ink_overlay_does_not() {
     step_app_frame(&ctx, &mut app, egui::RawInput::default());
     let page = app.page_rect().expect("page_rect populated");
 
-    // Open an Order::Middle egui::Window dialog (`Dialog::Link`) and settle 2 frames.
+    // Open the unified modal dialog (`Dialog::Link`) and settle 2 frames.
     app.open_link_dialog();
     step_app_frame(&ctx, &mut app, egui::RawInput::default());
     step_app_frame(&ctx, &mut app, egui::RawInput::default());
 
     let dialog_center = Pos2::new(512.0, 384.0);
-    assert_eq!(ctx.layer_id_at(dialog_center).map(|layer| layer.order), Some(egui::Order::Middle), "Link dialog must register an Order::Middle Area");
+    assert_eq!(
+        ctx.layer_id_at(dialog_center).map(|layer| layer.order),
+        Some(egui::Order::Foreground),
+        "Link dialog must register an Order::Foreground modal Area"
+    );
     let blocked_in_dialog = egui_overlay_blocks_native_gesture(&ctx, false, Some(dialog_center));
-    assert!(blocked_in_dialog, "Order::Middle dialog must block native pan/pinch");
+    assert!(blocked_in_dialog, "Modal dialog must block native pan/pinch");
     assert!(!should_begin_native_pan(1, false, true, blocked_in_dialog));
     assert!(!should_begin_native_pinch(2, true, blocked_in_dialog));
 

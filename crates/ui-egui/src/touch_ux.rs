@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 /// Minimum interactive control height (and width) in points for comfortable tablet touch targets.
-pub const TABLET_MIN_INTERACT_HEIGHT: f32 = 36.0;
+pub const TABLET_MIN_INTERACT_HEIGHT: f32 = 40.0;
 
 /// Minimum hit-target width/height in points for touch selection and resize handles.
 pub const TOUCH_HANDLE_HIT_SIZE: f32 = 32.0;
@@ -48,6 +48,185 @@ pub fn apply_mobile_touch_style(style: &mut egui::Style) {
     // pressing the button and stays there. The delay is long, not infinite: egui makes a
     // Duration of it.
     style.interaction.tooltip_delay = style.interaction.tooltip_delay.max(NO_HOVER_TOOLTIP_DELAY_SECS);
+}
+
+/// Input state for [`mobile_formatting_bar`], describing which docked formatting and quick-switch
+/// buttons are enabled or active for the current caret/selection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MobileFormattingBarState {
+    pub can_outdent: bool,
+    pub can_indent: bool,
+    pub can_undo: bool,
+    pub can_redo: bool,
+    pub can_format: bool,
+    pub bold_active: bool,
+    pub italic_active: bool,
+    pub underline_active: bool,
+    pub can_block: bool,
+    pub bullets_active: bool,
+    pub todo_active: bool,
+    pub can_quick_pen: bool,
+    pub pen_active: bool,
+}
+
+/// Action returned when the user taps a control on [`mobile_formatting_bar`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MobileFormattingAction {
+    Outdent,
+    Indent,
+    Undo,
+    Redo,
+    Bold,
+    Italic,
+    Underline,
+    Bullets,
+    Todo,
+    QuickPen,
+}
+
+impl MobileFormattingAction {
+    /// Converts this action into the matching [`crate::ribbon::Act`].
+    /// `active_nib` is the current pen rack index used by [`Self::QuickPen`].
+    #[must_use]
+    pub fn into_ribbon_act(self, active_nib: usize) -> crate::ribbon::Act {
+        match self {
+            Self::Outdent => crate::ribbon::Act::Indent(false),
+            Self::Indent => crate::ribbon::Act::Indent(true),
+            Self::Undo => crate::ribbon::Act::Undo,
+            Self::Redo => crate::ribbon::Act::Redo,
+            Self::Bold => crate::ribbon::Act::Mark("bold"),
+            Self::Italic => crate::ribbon::Act::Mark("italic"),
+            Self::Underline => crate::ribbon::Act::Mark("underline"),
+            Self::Bullets => crate::ribbon::Act::Block("bullet"),
+            Self::Todo => crate::ribbon::Act::Block("todo"),
+            Self::QuickPen => crate::ribbon::Act::InkPen(active_nib),
+        }
+    }
+
+    /// True when this action formats text and the editor should keep caret focus/selection
+    /// active after applying it. [`Self::QuickPen`] switches into drawing instead.
+    #[must_use]
+    pub fn restores_text_caret(self) -> bool {
+        !matches!(self, Self::QuickPen)
+    }
+}
+
+/// Renders the docked mobile/tablet formatting bar above the soft keyboard with 40pt touch
+/// targets and returns whichever action was tapped this frame.
+pub fn mobile_formatting_bar(ui: &mut egui::Ui, state: MobileFormattingBarState, tokens: &crate::theme::Tokens) -> Option<MobileFormattingAction> {
+    use crate::floating::Glyph;
+    use crate::icons::Icon;
+    use crate::ribbon_icons::Mark;
+    use crate::theme::{RADIUS_POPUP, Tokens};
+    use egui::{CornerRadius, Sense, Stroke, StrokeKind, vec2};
+
+    let mut chosen: Option<MobileFormattingAction> = None;
+    egui::Panel::bottom("mobile-formatting-bar")
+        .frame(egui::Frame::new().fill(tokens.surface_elevated).inner_margin(egui::Margin::symmetric(8, 4)).stroke(Stroke::new(1.0, tokens.border)))
+        .show_separator_line(false)
+        .show(ui, |ui| {
+            egui::ScrollArea::horizontal()
+                .id_salt("mobile-formatting-scroll")
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let items: [(&str, Glyph, bool, bool, MobileFormattingAction); 10] = [
+                            (
+                                crate::tl_id!("ui.decrease_indentation"),
+                                Glyph::Mark(Mark::IndentLess),
+                                state.can_outdent,
+                                false,
+                                MobileFormattingAction::Outdent,
+                            ),
+                            (
+                                crate::tl_id!("ui.increase_indentation"),
+                                Glyph::Mark(Mark::IndentMore),
+                                state.can_indent,
+                                false,
+                                MobileFormattingAction::Indent,
+                            ),
+                            (crate::tl_id!("ui.undo"), Glyph::Icon(Icon::Undo), state.can_undo, false, MobileFormattingAction::Undo),
+                            (crate::tl_id!("ui.redo"), Glyph::Icon(Icon::Redo), state.can_redo, false, MobileFormattingAction::Redo),
+                            (crate::tl_id!("ui.bold"), Glyph::Mark(Mark::Bold), state.can_format, state.bold_active, MobileFormattingAction::Bold),
+                            (
+                                crate::tl_id!("ui.italic"),
+                                Glyph::Mark(Mark::Italic),
+                                state.can_format,
+                                state.italic_active,
+                                MobileFormattingAction::Italic,
+                            ),
+                            (
+                                crate::tl_id!("ui.underline"),
+                                Glyph::Mark(Mark::Underline),
+                                state.can_format,
+                                state.underline_active,
+                                MobileFormattingAction::Underline,
+                            ),
+                            (
+                                crate::tl_id!("ui.bullets"),
+                                Glyph::Icon(Icon::ListBullet),
+                                state.can_block,
+                                state.bullets_active,
+                                MobileFormattingAction::Bullets,
+                            ),
+                            (crate::tl_id!("ui.to_do_2"), Glyph::Mark(Mark::ToDo), state.can_block, state.todo_active, MobileFormattingAction::Todo),
+                            (
+                                crate::tl_id!("ui.pen"),
+                                Glyph::Icon(Icon::Pen),
+                                state.can_quick_pen,
+                                state.pen_active,
+                                MobileFormattingAction::QuickPen,
+                            ),
+                        ];
+                        for (label, glyph, enabled, active, action) in items {
+                            let resp = ui
+                                .add_enabled_ui(enabled, |ui| {
+                                    let size = vec2(46.0, TABLET_MIN_INTERACT_HEIGHT);
+                                    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+                                    let painter = ui.painter_at(rect);
+                                    let pressed = enabled && resp.is_pointer_button_down_on();
+                                    let r = CornerRadius::same(RADIUS_POPUP);
+                                    if pressed {
+                                        painter.rect_filled(rect, r, tokens.row_selected);
+                                        painter.rect_stroke(rect, r, Stroke::new(1.5, tokens.accent), StrokeKind::Inside);
+                                    } else if active {
+                                        painter.rect_filled(rect, r, tokens.row_selected);
+                                        painter.rect_stroke(rect, r, Stroke::new(1.0, tokens.accent), StrokeKind::Inside);
+                                    } else if resp.hovered() && enabled {
+                                        painter.rect_filled(rect, r, tokens.row_hover);
+                                        painter.rect_stroke(rect, r, Stroke::new(1.0, tokens.border_subtle), StrokeKind::Inside);
+                                    }
+                                    if enabled && resp.has_focus() {
+                                        ui.painter().rect_stroke(
+                                            rect.expand(1.5),
+                                            CornerRadius::same(RADIUS_POPUP + 2),
+                                            Stroke::new(2.0, tokens.accent),
+                                            StrokeKind::Outside,
+                                        );
+                                    }
+                                    let icon_tokens = if !enabled {
+                                        Tokens { text: tokens.disabled, accent: tokens.disabled, ..*tokens }
+                                    } else if active || pressed {
+                                        Tokens { text: tokens.accent, ..*tokens }
+                                    } else {
+                                        *tokens
+                                    };
+                                    let icon_rect = egui::Rect::from_center_size(rect.center(), vec2(20.0, 20.0));
+                                    glyph.paint(&painter, icon_rect, &icon_tokens);
+                                    let name = label.to_string();
+                                    resp.widget_info(move || egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, active, name.clone()));
+                                    resp.on_hover_text(label)
+                                })
+                                .inner;
+                            if enabled && resp.clicked() {
+                                chosen = Some(action);
+                            }
+                        }
+                    });
+                });
+        });
+    chosen
 }
 
 /// A tooltip delay long enough that no tooltip is ever shown.
@@ -451,5 +630,72 @@ mod tests {
         assert_eq!(lp.next_wakeup_delay(f64::NAN), None);
         assert_eq!(lp.update(1.50, &[]), Some(p));
         assert_eq!(lp.next_wakeup_delay(1.50), None);
+    }
+
+    #[test]
+    fn tablet_min_interact_height_is_40pt() {
+        assert!((TABLET_MIN_INTERACT_HEIGHT - 40.0).abs() < f32::EPSILON);
+        assert!((TOUCH_PILL_HEIGHT - 40.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn mobile_formatting_action_maps_to_ribbon_acts_and_caret_policy() {
+        use crate::ribbon::Act;
+        assert_eq!(MobileFormattingAction::Bold.into_ribbon_act(2), Act::Mark("bold"));
+        assert_eq!(MobileFormattingAction::Italic.into_ribbon_act(2), Act::Mark("italic"));
+        assert_eq!(MobileFormattingAction::Underline.into_ribbon_act(2), Act::Mark("underline"));
+        assert_eq!(MobileFormattingAction::Bullets.into_ribbon_act(2), Act::Block("bullet"));
+        assert_eq!(MobileFormattingAction::Todo.into_ribbon_act(2), Act::Block("todo"));
+        assert_eq!(MobileFormattingAction::Outdent.into_ribbon_act(2), Act::Indent(false));
+        assert_eq!(MobileFormattingAction::Indent.into_ribbon_act(2), Act::Indent(true));
+        assert_eq!(MobileFormattingAction::Undo.into_ribbon_act(2), Act::Undo);
+        assert_eq!(MobileFormattingAction::Redo.into_ribbon_act(2), Act::Redo);
+        assert_eq!(MobileFormattingAction::QuickPen.into_ribbon_act(2), Act::InkPen(2));
+
+        assert!(MobileFormattingAction::Italic.restores_text_caret());
+        assert!(MobileFormattingAction::Underline.restores_text_caret());
+        assert!(MobileFormattingAction::Bullets.restores_text_caret());
+        assert!(!MobileFormattingAction::QuickPen.restores_text_caret());
+    }
+
+    #[test]
+    fn mobile_formatting_bar_exposes_italic_underline_bullets_and_quick_pen_at_40pt() {
+        let ctx = egui::Context::default();
+        let tokens = crate::theme::Theme::DEFAULT.tokens();
+        let state = MobileFormattingBarState {
+            can_outdent: true,
+            can_indent: true,
+            can_undo: true,
+            can_redo: true,
+            can_format: true,
+            can_block: true,
+            can_quick_pen: true,
+            ..Default::default()
+        };
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, vec2(800.0, 200.0));
+        let run = |events: Vec<Event>| {
+            let mut got = None;
+            let raw = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| {
+                got = mobile_formatting_bar(ui, state, &tokens);
+            });
+            out.textures_delta.clear();
+            got
+        };
+        assert_eq!(run(Vec::new()), None);
+        // 10 buttons of width 46 + 6px spacing inside 8px left margin, bottom-aligned at height 40pt.
+        let bar_y = screen.max.y - 4.0 - TABLET_MIN_INTERACT_HEIGHT * 0.5;
+        let center_of = |idx: usize| pos2(8.0 + (idx as f32) * (46.0 + 6.0) + 23.0, bar_y);
+        for (idx, expected) in [
+            (5usize, MobileFormattingAction::Italic),
+            (6, MobileFormattingAction::Underline),
+            (7, MobileFormattingAction::Bullets),
+            (9, MobileFormattingAction::QuickPen),
+        ] {
+            let at = center_of(idx);
+            let _ = run(vec![Event::PointerMoved(at), button(true, true, at)]);
+            let fired = run(vec![button(true, false, at)]);
+            assert_eq!(fired, Some(expected), "tapping slot {idx} should fire {expected:?}");
+        }
     }
 }

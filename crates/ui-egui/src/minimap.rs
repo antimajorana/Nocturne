@@ -134,9 +134,10 @@ pub fn show(
         .movable(false)
         .show(ctx, |ui| {
             let frame = egui::Frame::NONE
-                .fill(tokens.panel.gamma_multiply(0.95))
-                .stroke(Stroke::new(1.0, tokens.container_border))
-                .corner_radius(8.0)
+                .fill(tokens.surface_elevated.gamma_multiply(0.96))
+                .stroke(Stroke::new(1.0, tokens.border))
+                .corner_radius(crate::theme::RADIUS_CARD)
+                .shadow(tokens.shadow_popup())
                 .inner_margin(egui::Margin::same(6));
             frame.show(ui, |ui| {
                 ui.set_width(panel_w - 12.0);
@@ -169,8 +170,8 @@ pub fn show(
                     let (map_rect, resp) = ui.allocate_exact_size(vec2(MAP_W, MAP_H), Sense::click_and_drag());
                     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, crate::tl_id!("ui.minimap_canvas_tip")));
                     let painter = ui.painter_at(map_rect);
-                    painter.rect_filled(map_rect, 4.0, tokens.editor);
-                    painter.rect_stroke(map_rect, 4.0, Stroke::new(1.0, tokens.faint), StrokeKind::Inside);
+                    painter.rect_filled(map_rect, crate::theme::RADIUS_CONTROL, tokens.editor);
+                    painter.rect_stroke(map_rect, crate::theme::RADIUS_CONTROL, Stroke::new(1.0, tokens.border_subtle), StrokeKind::Inside);
 
                     let pad_map = map_rect.shrink(4.0);
                     let sx = pad_map.width() / world.width().max(1.0);
@@ -186,7 +187,7 @@ pub fn show(
                         if cr.is_finite() {
                             let mr = rect_to_map(*cr).intersect(map_rect);
                             if mr.width() > 0.5 && mr.height() > 0.5 {
-                                painter.rect_filled(mr, 1.0, tokens.faint);
+                                painter.rect_filled(mr, 1.0, tokens.border_subtle);
                             }
                         }
                     }

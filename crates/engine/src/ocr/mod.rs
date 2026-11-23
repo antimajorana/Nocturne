@@ -13,14 +13,20 @@
 //! Keys travel in headers, never in an address, and no error text repeats a key or a reply.
 
 pub(crate) mod commands;
+pub mod local_model;
 mod provider;
 pub mod raster;
+pub mod vision_post;
+
+pub use vision_post::{VisionObservation, observations_to_latex};
 
 use crate::Session;
 use crate::sync::{SyncHttpClient, is_loopback_http};
 use nocturne_ink::Stroke;
 use nocturne_store::Settings;
 use std::fmt;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 pub const MATH_OCR_ENABLED_KEY: &str = "math_ocr_enabled";
 const PROVIDER_KEY: &str = "ocr_provider";
@@ -28,10 +34,39 @@ const ENDPOINT_KEY: &str = "ocr_endpoint";
 const MODEL_KEY: &str = "ocr_model";
 const MATHPIX_APP_ID_SECRET: &str = "ocr_app_id_mathpix";
 
+/// Platform-native on-device OCR backend (for example Apple Vision `VNRecognizeTextRequest` on
+/// iOS/iPadOS/macOS).
+pub trait NativeOcrBackend: Send + Sync {
+    /// Returns `true` when this native backend is available at runtime.
+    fn is_supported(&self) -> bool {
+        true
+    }
+
+    /// Runs on-device recognition on PNG image bytes and returns bounding-box observations in
+    /// top-left normalized `[0.0, 1.0]` coordinates.
+    fn recognize_png(&self, png_bytes: &[u8]) -> Result<Vec<VisionObservation>, OcrError>;
+}
+
+/// Fallback native OCR backend used when no platform implementation is installed.
+pub struct UnsupportedNativeOcrBackend;
+
+impl NativeOcrBackend for UnsupportedNativeOcrBackend {
+    fn is_supported(&self) -> bool {
+        false
+    }
+
+    fn recognize_png(&self, _png_bytes: &[u8]) -> Result<Vec<VisionObservation>, OcrError> {
+        Err(OcrError::Unsupported)
+    }
+}
+
 /// Who is asked to read the handwriting.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OcrProvider {
-    #[default]
+    /// Built-in Apple Vision on-device recognition (iOS / iPadOS / macOS).
+    AppleVision,
+    /// Built-in downloadable on-device Pix2Text MFR 1.5 ONNX math model (MIT, all non-WASM platforms).
+    LocalModel,
     Anthropic,
     Gemini,
     OpenAi,
@@ -40,11 +75,35 @@ pub enum OcrProvider {
     Custom,
 }
 
+#[allow(clippy::derivable_impls)]
+impl Default for OcrProvider {
+    fn default() -> Self {
+        #[cfg(any(target_os = "ios", target_os = "macos"))]
+        {
+            Self::AppleVision
+        }
+        #[cfg(not(any(target_os = "ios", target_os = "macos")))]
+        {
+            Self::Anthropic
+        }
+    }
+}
+
 impl OcrProvider {
-    pub const ALL: [OcrProvider; 5] = [OcrProvider::Anthropic, OcrProvider::Gemini, OcrProvider::OpenAi, OcrProvider::Mathpix, OcrProvider::Custom];
+    pub const ALL: [OcrProvider; 7] = [
+        OcrProvider::AppleVision,
+        OcrProvider::LocalModel,
+        OcrProvider::Anthropic,
+        OcrProvider::Gemini,
+        OcrProvider::OpenAi,
+        OcrProvider::Mathpix,
+        OcrProvider::Custom,
+    ];
 
     pub fn id(self) -> &'static str {
         match self {
+            OcrProvider::AppleVision => "apple_vision",
+            OcrProvider::LocalModel => "local_model",
             OcrProvider::Anthropic => "anthropic",
             OcrProvider::Gemini => "gemini",
             OcrProvider::OpenAi => "openai",
@@ -54,12 +113,29 @@ impl OcrProvider {
     }
 
     pub fn parse(text: &str) -> Option<OcrProvider> {
-        OcrProvider::ALL.into_iter().find(|p| p.id().eq_ignore_ascii_case(text.trim()))
+        match text.trim().to_ascii_lowercase().as_str() {
+            "apple_vision" | "apple-vision" | "vision" => Some(OcrProvider::AppleVision),
+            "local_model" | "local-model" | "local" | "pix2text" => Some(OcrProvider::LocalModel),
+            other => OcrProvider::ALL.into_iter().find(|p| p.id() == other),
+        }
     }
 
-    /// Where the service lives when no other address is given. A custom one has none.
+    /// True when recognition runs entirely on-device without sending images over the network.
+    #[must_use]
+    pub fn is_on_device(self) -> bool {
+        matches!(self, OcrProvider::AppleVision | OcrProvider::LocalModel)
+    }
+
+    /// True when this provider requires an API key in the secret store.
+    #[must_use]
+    pub fn requires_api_key(self) -> bool {
+        matches!(self, OcrProvider::Anthropic | OcrProvider::Gemini | OcrProvider::OpenAi | OcrProvider::Mathpix)
+    }
+
+    /// Where the service lives when no other address is given. On-device and custom providers have none.
     pub fn default_endpoint(self) -> &'static str {
         match self {
+            OcrProvider::AppleVision | OcrProvider::LocalModel => "",
             OcrProvider::Anthropic => "https://api.anthropic.com",
             OcrProvider::Gemini => "https://generativelanguage.googleapis.com",
             OcrProvider::OpenAi => "https://api.openai.com/v1",
@@ -68,20 +144,34 @@ impl OcrProvider {
         }
     }
 
-    /// The model asked when none is named. Mathpix has no models, and a custom server's
-    /// are its own.
+    /// The model asked when none is named. Mathpix, Apple Vision, and custom servers have none.
     pub fn default_model(self) -> &'static str {
         match self {
+            OcrProvider::LocalModel => local_model::MODEL_ID,
             OcrProvider::Anthropic => "claude-opus-5-5",
             OcrProvider::Gemini => "gemini-4-hydrogen",
             OcrProvider::OpenAi => "gpt-6.2-astra",
-            OcrProvider::Mathpix | OcrProvider::Custom => "",
+            OcrProvider::AppleVision | OcrProvider::Mathpix | OcrProvider::Custom => "",
         }
     }
 
     /// The name its key is kept under. One per service, so keys are never shared.
     pub fn secret_key(self) -> String {
         format!("ocr_api_key_{}", self.id())
+    }
+
+    /// Settings key storing the exact endpoint URL to which this provider's saved secret is bound.
+    pub(crate) fn key_endpoint_setting_key(self) -> String {
+        format!("ocr_key_endpoint_{}", self.id())
+    }
+}
+
+/// Returns `true` when the saved secret for `provider` is either unbound (legacy/direct store) or
+/// explicitly bound to `effective_endpoint`.
+pub(crate) fn key_matches_endpoint(settings: &Settings, provider: OcrProvider, effective_endpoint: &str) -> bool {
+    match settings.get(&provider.key_endpoint_setting_key()).map(|v| v.trim().to_string()) {
+        Some(bound) if !bound.is_empty() => bound == effective_endpoint,
+        _ => true,
     }
 }
 
@@ -115,7 +205,13 @@ impl OcrConfig {
     }
 
     pub fn effective_endpoint(&self) -> &str {
-        if self.endpoint.is_empty() { self.provider.default_endpoint() } else { &self.endpoint }
+        if self.provider.is_on_device() {
+            ""
+        } else if self.endpoint.is_empty() {
+            self.provider.default_endpoint()
+        } else {
+            &self.endpoint
+        }
     }
 
     pub fn effective_model(&self) -> &str {
@@ -196,6 +292,8 @@ pub struct OcrJob {
     pub key: String,
     pub app_id: String,
     pub png: Vec<u8>,
+    pub native_ocr: Option<Arc<dyn NativeOcrBackend>>,
+    pub model_dir: Option<PathBuf>,
 }
 
 impl fmt::Debug for OcrJob {
@@ -207,6 +305,8 @@ impl fmt::Debug for OcrJob {
             .field("model", &self.model)
             .field("has_key", &!self.key.is_empty())
             .field("png_bytes", &self.png.len())
+            .field("has_native_ocr", &self.native_ocr.is_some())
+            .field("has_model_dir", &self.model_dir.is_some())
             .finish()
     }
 }
@@ -216,12 +316,52 @@ impl Session {
         OcrConfig::load(&self.settings)
     }
 
+    /// Storage directory for the downloadable on-device Pix2Text MFR 1.5 math model.
+    #[must_use]
+    pub fn ocr_model_dir(&self) -> PathBuf {
+        local_model::default_model_dir(&self.settings)
+    }
+
     /// Turns equation recognition on or off. False if the settings file could not be written.
     pub fn set_math_ocr_enabled(&mut self, enabled: bool) -> bool {
         self.settings.set(MATH_OCR_ENABLED_KEY, if enabled { "true" } else { "false" }).is_ok()
     }
 
-    /// True if the chosen service has all it needs: an address, a model, and its key.
+    /// True if `provider` has a saved API key valid for its effective endpoint.
+    #[must_use]
+    pub fn ocr_has_key(&self, provider: OcrProvider) -> bool {
+        if provider.is_on_device() {
+            return false;
+        }
+        let cfg = self.ocr_config();
+        let ep = if cfg.provider == provider { cfg.effective_endpoint() } else { provider.default_endpoint() };
+        if cfg.provider == provider && !key_matches_endpoint(&self.settings, provider, ep) {
+            return false;
+        }
+        self.sync_secrets().get_secret(&provider.secret_key()).ok().flatten().is_some()
+    }
+
+    /// True if Mathpix has a saved `app_id` valid for its effective endpoint.
+    #[must_use]
+    pub fn ocr_has_mathpix_app_id(&self) -> bool {
+        let cfg = self.ocr_config();
+        if cfg.provider == OcrProvider::Mathpix && !key_matches_endpoint(&self.settings, OcrProvider::Mathpix, cfg.effective_endpoint()) {
+            return false;
+        }
+        self.sync_secrets().get_secret(MATHPIX_APP_ID_SECRET).ok().flatten().is_some()
+    }
+
+    /// True when `provider` has every credential it requires (for Mathpix: BOTH `app_key` and `app_id`).
+    #[must_use]
+    pub fn ocr_credentials_complete(&self, provider: OcrProvider) -> bool {
+        match provider {
+            OcrProvider::AppleVision | OcrProvider::LocalModel | OcrProvider::Custom => true,
+            OcrProvider::Mathpix => self.ocr_has_key(OcrProvider::Mathpix) && self.ocr_has_mathpix_app_id(),
+            OcrProvider::Anthropic | OcrProvider::Gemini | OcrProvider::OpenAi => self.ocr_has_key(provider),
+        }
+    }
+
+    /// True if the chosen service has all it needs: an address, a model, and its key (or on-device readiness).
     pub fn math_ocr_ready(&self) -> bool {
         self.ocr_parts().is_ok()
     }
@@ -231,19 +371,39 @@ impl Session {
         if !cfg.enabled {
             return Err(OcrError::Disabled);
         }
+        match cfg.provider {
+            OcrProvider::AppleVision => {
+                if self.native_ocr_backend().is_some_and(|b| b.is_supported()) {
+                    return Ok((cfg, String::new(), String::new()));
+                }
+                return Err(OcrError::Unsupported);
+            }
+            OcrProvider::LocalModel => {
+                if !local_model::is_supported_on_platform() {
+                    return Err(OcrError::Unsupported);
+                }
+                if !local_model::is_model_installed(&self.ocr_model_dir()) {
+                    return Err(OcrError::NotConfigured("the local math model"));
+                }
+                return Ok((cfg, String::new(), String::new()));
+            }
+            _ => {}
+        }
         if !self.sync_http().is_supported() {
             return Err(OcrError::Unsupported);
         }
-        if cfg.effective_endpoint().is_empty() {
+        let endpoint = cfg.effective_endpoint();
+        if endpoint.is_empty() {
             return Err(OcrError::NotConfigured("the service's address"));
         }
         if cfg.effective_model().is_empty() && cfg.provider != OcrProvider::Mathpix {
             return Err(OcrError::NotConfigured("the name of a model"));
         }
         let secrets = self.sync_secrets();
-        let secret = |name: &str| secrets.get_secret(name).ok().flatten().unwrap_or_default();
+        let bound_ok = key_matches_endpoint(&self.settings, cfg.provider, endpoint);
+        let secret = |name: &str| if bound_ok { secrets.get_secret(name).ok().flatten().unwrap_or_default() } else { String::new() };
         let key = secret(&cfg.provider.secret_key());
-        if key.is_empty() && cfg.provider != OcrProvider::Custom {
+        if key.is_empty() && cfg.provider.requires_api_key() {
             return Err(OcrError::NotConfigured("a key"));
         }
         let app_id = if cfg.provider == OcrProvider::Mathpix { secret(MATHPIX_APP_ID_SECRET) } else { String::new() };
@@ -265,27 +425,52 @@ impl Session {
             key,
             app_id,
             png,
+            native_ocr: self.native_ocr_backend(),
+            model_dir: Some(self.ocr_model_dir()),
         })
     }
 }
 
-/// The worker half: sends the picture and reads the LaTeX out of the reply.
+/// The worker half: runs on-device recognition or sends the picture and reads the LaTeX out of the reply.
 pub fn recognize(http: &dyn SyncHttpClient, job: &OcrJob) -> Result<String, OcrError> {
     if !job.enabled {
         return Err(OcrError::Disabled);
     }
-    if !http.is_supported() {
-        return Err(OcrError::Unsupported);
-    }
-    if !endpoint_is_safe(&job.endpoint) {
-        return Err(OcrError::NotConfigured("the service's address"));
-    }
-    let reply = http.request(provider::request(job)).map_err(|e| OcrError::Transport(without_secrets(&e.to_string(), job)))?;
-    match reply.status {
-        200..=299 => provider::answer(job.provider, &reply.body),
-        401 | 403 => Err(OcrError::Auth),
-        429 => Err(OcrError::RateLimited),
-        other => Err(OcrError::Status(other)),
+    match job.provider {
+        OcrProvider::AppleVision => {
+            let backend = job.native_ocr.as_deref().filter(|b| b.is_supported()).ok_or(OcrError::Unsupported)?;
+            let observations = backend.recognize_png(&job.png)?;
+            let latex = clean_latex(&vision_post::observations_to_latex(&observations));
+            if latex.is_empty() { Err(OcrError::BadReply) } else { Ok(latex) }
+        }
+        OcrProvider::LocalModel => {
+            if !local_model::is_supported_on_platform() {
+                return Err(OcrError::Unsupported);
+            }
+            let dir = job.model_dir.as_deref().ok_or(OcrError::NotConfigured("the local math model"))?;
+            if !local_model::is_model_installed(dir) {
+                return Err(OcrError::NotConfigured("the local math model"));
+            }
+            let raw = local_model::recognize_png(dir, &job.png)?;
+            let latex = clean_latex(&raw);
+            if latex.is_empty() { Err(OcrError::BadReply) } else { Ok(latex) }
+        }
+        _ => {
+            if !http.is_supported() {
+                return Err(OcrError::Unsupported);
+            }
+            if !endpoint_is_safe(&job.endpoint) {
+                return Err(OcrError::NotConfigured("the service's address"));
+            }
+            let req = provider::request(job)?;
+            let reply = http.request(req).map_err(|e| OcrError::Transport(without_secrets(&e.to_string(), job)))?;
+            match reply.status {
+                200..=299 => provider::answer(job.provider, &reply.body),
+                401 | 403 => Err(OcrError::Auth),
+                429 => Err(OcrError::RateLimited),
+                other => Err(OcrError::Status(other)),
+            }
+        }
     }
 }
 
@@ -304,8 +489,22 @@ fn without_secrets(text: &str, job: &OcrJob) -> String {
 pub fn clean_latex(raw: &str) -> String {
     let mut text = raw.trim();
     if let Some(rest) = text.strip_prefix("```") {
-        // The opening fence may name a language; the body starts on the next line.
-        let body = rest.split_once('\n').map_or("", |(_, body)| body);
+        let body = if let Some((_, after_nl)) = rest.split_once('\n') {
+            after_nl
+        } else {
+            // Single-line fenced block: strip closing ``` and any leading language tag
+            // (e.g. ```latex x^2```, ```tex x^2```, ```math x^2```, or ```x^2```).
+            let inner = rest.trim_end().strip_suffix("```").unwrap_or(rest).trim();
+            if matches!(inner.to_ascii_lowercase().as_str(), "latex" | "tex" | "math") {
+                ""
+            } else if let Some((tag, after_tag)) = inner.split_once(char::is_whitespace)
+                && matches!(tag.to_ascii_lowercase().as_str(), "latex" | "tex" | "math")
+            {
+                after_tag
+            } else {
+                inner
+            }
+        };
         text = body.trim_end().strip_suffix("```").unwrap_or(body).trim();
     }
     loop {

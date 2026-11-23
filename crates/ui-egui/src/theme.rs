@@ -111,27 +111,55 @@ impl Accent {
             Accent::Green => ((0x1e, 0x8a, 0x44), (0x6c, 0xd0, 0x8a)),
             Accent::Yellow => ((0xa8, 0x74, 0x00), (0xf2, 0xc9, 0x4c)),
             Accent::Blue => ((0x1a, 0x5f, 0xd0), (0x8f, 0xb8, 0xff)),
-            Accent::Gray => ((0x5b, 0x64, 0x72), (0xb4, 0xbc, 0xc8)),
+            Accent::Gray => ((0x52, 0x58, 0x62), (0xb4, 0xba, 0xc4)),
             Accent::Purple => ((0x7a, 0x45, 0xb8), (0xb0, 0x85, 0xe8)),
         };
         let (r, g, b) = if mode.is_dark() { d } else { l };
         Color32::from_rgb(r, g, b)
     }
 
-    /// How much of the accent is mixed into the surfaces. Default and Gray stay neutral.
+    /// How much of the accent is mixed into the surfaces. Default and Gray stay untinted.
     fn tint(self, mode: Mode) -> f32 {
         match self {
             Accent::Default | Accent::Gray => 0.0,
             _ => {
                 if mode.is_dark() {
-                    0.10
+                    0.09
                 } else {
                     0.05
                 }
             }
         }
     }
+
+    /// Base untinted surfaces `(panel0, editor0, faint0, text, muted0)` for this accent family.
+    ///
+    /// - `Accent::Default` preserves Nocturne's signature starlight / midnight-navy palette.
+    /// - `Accent::Gray` uses true neutral charcoal / alabaster with no navy bias.
+    /// - Chromatic accents start from clean neutral charcoal / paper so tinting never muddies
+    ///   warm hues with navy blue.
+    fn base_surfaces(self, dark: bool) -> (Color32, Color32, Color32, Color32, Color32) {
+        match (self, dark) {
+            (Accent::Default, true) => (rgb((12, 24, 54)), rgb((7, 17, 40)), rgb((20, 36, 76)), rgb((234, 241, 255)), rgb((150, 170, 212))),
+            (Accent::Default, false) => (rgb((244, 246, 252)), rgb((255, 255, 255)), rgb((233, 238, 249)), rgb((14, 24, 56)), rgb((78, 92, 132))),
+            (Accent::Gray, true) => (rgb((24, 25, 28)), rgb((16, 17, 19)), rgb((34, 36, 40)), rgb((238, 240, 243)), rgb((158, 162, 170))),
+            (Accent::Gray, false) => (rgb((245, 246, 247)), rgb((255, 255, 255)), rgb((235, 237, 240)), rgb((26, 28, 32)), rgb((92, 96, 104))),
+            (_, true) => (rgb((22, 23, 26)), rgb((15, 16, 18)), rgb((32, 34, 38)), rgb((240, 242, 245)), rgb((156, 160, 168))),
+            (_, false) => (rgb((246, 246, 247)), rgb((255, 255, 255)), rgb((236, 237, 239)), rgb((24, 25, 28)), rgb((90, 93, 100))),
+        }
+    }
 }
+
+/// Unified corner radius for standard controls (buttons, inputs, chips, tabs).
+pub const RADIUS_CONTROL: u8 = 4;
+/// Unified corner radius for floating menus, dropdowns, and popovers.
+pub const RADIUS_POPUP: u8 = 8;
+/// Unified corner radius for cards, preview panels, and floating widgets.
+pub const RADIUS_CARD: u8 = 10;
+/// Unified corner radius for modal dialog surfaces.
+pub const RADIUS_MODAL: u8 = 12;
+/// Unified corner radius for full stadium pills and capsule bars.
+pub const RADIUS_PILL: u8 = 99;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Theme {
@@ -141,6 +169,11 @@ pub struct Theme {
 
 impl Theme {
     pub const DEFAULT: Theme = Theme { mode: Mode::Light, accent: Accent::Default };
+    pub const RADIUS_CONTROL: u8 = RADIUS_CONTROL;
+    pub const RADIUS_CARD: u8 = RADIUS_CARD;
+    pub const RADIUS_POPUP: u8 = RADIUS_POPUP;
+    pub const RADIUS_MODAL: u8 = RADIUS_MODAL;
+    pub const RADIUS_PILL: u8 = RADIUS_PILL;
 
     /// All 14 themes: light then dark, each with the seven accents.
     pub fn all() -> Vec<Theme> {
@@ -163,25 +196,76 @@ impl Theme {
         Tokens::for_theme(self)
     }
 
-    /// The egui visuals for this theme.
+    /// Drop shadow for floating modals and elevated dialogs.
+    pub fn shadow_floating(self) -> egui::Shadow {
+        self.tokens().shadow_floating()
+    }
+
+    /// Drop shadow for transient menus, dropdowns, and popovers.
+    pub fn shadow_popup(self) -> egui::Shadow {
+        self.tokens().shadow_popup()
+    }
+
+    /// The egui visuals for this theme, fully populated across all five widget states,
+    /// selection wash, text cursor, window surfaces, strokes, corner radii, and shadows.
     pub fn visuals(self) -> egui::Visuals {
         let t = self.tokens();
         let mut v = if self.mode.is_dark() { egui::Visuals::dark() } else { egui::Visuals::light() };
+        v.dark_mode = self.mode.is_dark();
+        v.weak_text_color = Some(t.muted);
         v.panel_fill = t.panel;
-        v.window_fill = t.panel;
+        v.window_fill = t.surface_elevated;
+        v.window_stroke = egui::Stroke::new(1.0, t.border);
+        v.window_corner_radius = egui::CornerRadius::same(RADIUS_MODAL);
+        v.window_shadow = t.shadow_floating();
+        v.menu_corner_radius = egui::CornerRadius::same(RADIUS_POPUP);
+        v.popup_shadow = t.shadow_popup();
         v.extreme_bg_color = t.editor;
+        v.text_edit_bg_color = Some(t.editor);
         v.faint_bg_color = t.faint;
         v.code_bg_color = t.code_bg;
         v.hyperlink_color = t.link;
-        v.selection.bg_fill = mix(t.panel, t.accent, 0.40);
+        v.selection.bg_fill = t.row_selected;
         v.selection.stroke = egui::Stroke::new(1.0, t.accent);
-        v.widgets.hovered.weak_bg_fill = t.row_hover;
-        v.widgets.hovered.bg_fill = t.row_hover;
-        v.widgets.active.weak_bg_fill = t.row_selected;
-        v.widgets.active.bg_fill = t.row_selected;
+        v.text_cursor.stroke = egui::Stroke::new(2.0, t.accent);
+
+        let r = egui::CornerRadius::same(RADIUS_CONTROL);
+
         v.widgets.noninteractive.bg_fill = t.panel;
         v.widgets.noninteractive.weak_bg_fill = t.panel;
+        v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, t.border_subtle);
+        v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, t.text);
+        v.widgets.noninteractive.corner_radius = r;
+        v.widgets.noninteractive.expansion = 0.0;
+
+        v.widgets.inactive.bg_fill = t.faint;
         v.widgets.inactive.weak_bg_fill = t.faint;
+        v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, t.border);
+        v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, t.text);
+        v.widgets.inactive.corner_radius = r;
+        v.widgets.inactive.expansion = 0.0;
+
+        v.widgets.hovered.bg_fill = t.row_hover;
+        v.widgets.hovered.weak_bg_fill = t.row_hover;
+        v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, t.accent);
+        v.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, t.strong);
+        v.widgets.hovered.corner_radius = r;
+        v.widgets.hovered.expansion = 0.0;
+
+        v.widgets.active.bg_fill = t.row_selected;
+        v.widgets.active.weak_bg_fill = t.row_selected;
+        v.widgets.active.bg_stroke = egui::Stroke::new(1.5, t.accent);
+        v.widgets.active.fg_stroke = egui::Stroke::new(1.5, t.strong);
+        v.widgets.active.corner_radius = r;
+        v.widgets.active.expansion = 0.0;
+
+        v.widgets.open.bg_fill = t.row_selected;
+        v.widgets.open.weak_bg_fill = t.row_selected;
+        v.widgets.open.bg_stroke = egui::Stroke::new(1.0, t.accent);
+        v.widgets.open.fg_stroke = egui::Stroke::new(1.5, t.strong);
+        v.widgets.open.corner_radius = r;
+        v.widgets.open.expansion = 0.0;
+
         v.warn_fg_color = t.warn;
         v.error_fg_color = t.warn;
         v
@@ -190,13 +274,25 @@ impl Theme {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tokens {
+    /// The theme these tokens were derived from.
+    pub theme: Theme,
     pub panel: Color32,
+    /// Elevated surface for modals, popovers, menus, and floating cards.
+    pub surface_elevated: Color32,
     pub editor: Color32,
     pub faint: Color32,
+    /// Visible structural border for inputs, buttons, modals, and popups (>= 3:1 contrast).
+    pub border: Color32,
+    /// Quiet hairline separator for dividers, group rules, and subtle outlines.
+    pub border_subtle: Color32,
     /// The outline of an active text container, kept separate from other faint surfaces.
     pub container_border: Color32,
     pub text: Color32,
+    /// Disabled control text and icons: softer than `muted` yet still legible (>= 3:1).
+    pub disabled: Color32,
     pub accent: Color32,
+    /// Accent colour tuned for readable text on `panel` and `surface_elevated` (>= 4.5:1).
+    pub accent_text: Color32,
     pub notebook: Color32,
     pub group: Color32,
     pub section: Color32,
@@ -217,6 +313,18 @@ pub struct Tokens {
     pub selection: Color32,
     pub ok: Color32,
     pub warn: Color32,
+    /// Primary call-to-action button fill, hover fill, and contrast-guaranteed text.
+    pub btn_primary_bg: Color32,
+    pub btn_primary_hover: Color32,
+    pub btn_primary_text: Color32,
+    /// Destructive action button fill, hover fill, and contrast-guaranteed text.
+    pub btn_danger_bg: Color32,
+    pub btn_danger_hover: Color32,
+    pub btn_danger_text: Color32,
+    /// Translucent backdrop scrim behind modal dialogs.
+    pub scrim: Color32,
+    /// Destructive red hover fill for window and modal close buttons (white icon on top).
+    pub close_hover: Color32,
     /// Rule lines and grid lines drawn on the page itself (OneNote's View, Rule Lines).
     /// Decoration, so the target is low on purpose: visible, never competing with the text.
     pub rule_line: Color32,
@@ -341,21 +449,29 @@ fn selection_wash(editor: Color32, acc: Color32, text: Color32) -> Color32 {
 }
 
 impl Tokens {
+    pub const RADIUS_CONTROL: u8 = RADIUS_CONTROL;
+    pub const RADIUS_CARD: u8 = RADIUS_CARD;
+    pub const RADIUS_POPUP: u8 = RADIUS_POPUP;
+    pub const RADIUS_MODAL: u8 = RADIUS_MODAL;
+    pub const RADIUS_PILL: u8 = RADIUS_PILL;
+
     pub fn for_theme(theme: Theme) -> Tokens {
         let dark = theme.mode.is_dark();
         let acc = theme.accent.base(theme.mode);
         let tint = theme.accent.tint(theme.mode);
-        let (panel0, editor0, faint0, text) = if dark {
-            (rgb((12, 24, 54)), rgb((7, 17, 40)), rgb((20, 36, 76)), rgb((234, 241, 255)))
-        } else {
-            (rgb((244, 246, 252)), rgb((255, 255, 255)), rgb((233, 238, 249)), rgb((14, 24, 56)))
-        };
+        let (panel0, editor0, faint0, text, muted0) = theme.accent.base_surfaces(dark);
         let panel = mix(panel0, acc, tint);
+        let surface_elevated = if dark { mix(panel, Color32::WHITE, 0.06) } else { mix(panel, Color32::WHITE, 0.72) };
         let editor = mix(editor0, acc, tint * 0.5);
         let faint = mix(faint0, acc, tint);
+        let border_base = if dark { surface_elevated } else { panel };
+        let border = faint_line(border_base, text, 3.0);
+        let border_subtle = faint_line(border_base, text, 1.55);
+        let disabled = faint_line(border_base, text, 3.0);
         let container_border = faint_line(editor, text, 2.5);
-        let muted = ensure_contrast(if dark { rgb((150, 170, 212)) } else { rgb((78, 92, 132)) }, panel, 4.5, dark);
-        let accent = ensure_contrast(acc, panel, 3.0, dark);
+        let muted = ensure_contrast(ensure_contrast(muted0, panel, 4.5, dark), surface_elevated, 4.5, dark);
+        let accent = ensure_contrast(ensure_contrast(acc, panel, 3.0, dark), surface_elevated, 3.0, dark);
+        let accent_text = ensure_contrast(ensure_contrast(acc, panel, 4.5, dark), surface_elevated, 4.5, dark);
         // The band: the accent, taken darker until white writing reads on it (7, so it still reads under the hover tint), and in the
         // dark modes kept low, so the band is a deep colour and not a bright one.
         let band_base = if dark { mix(panel0, acc, 0.45) } else { acc };
@@ -363,13 +479,45 @@ impl Tokens {
         let link = ensure_contrast(acc, editor, 4.5, dark);
         let group = ensure_contrast(if dark { rgb((0xfc, 0xc3, 0x47)) } else { rgb((0xc2, 0x7b, 0x08)) }, panel, 3.0, dark);
         let section = ensure_contrast(if dark { rgb((0x6e, 0xdc, 0xf6)) } else { rgb((0x0e, 0x7c, 0x9e)) }, panel, 3.0, dark);
+
+        // Primary & danger buttons: dark modes use luminous accent fills with crisp dark ink
+        // (brightening on hover); light modes use deep fills with white text (darkening on hover).
+        // Both polarities guarantee WCAG AA (>= 4.5:1, targeted >= 5.0:1) on rest and hover.
+        let dark_ink = rgb((10, 12, 16));
+        let (btn_primary_bg, btn_primary_hover, btn_primary_text) = if dark {
+            let bg = ensure_contrast(acc, dark_ink, 5.0, true);
+            let hover = mix(bg, Color32::WHITE, 0.14);
+            (bg, hover, dark_ink)
+        } else {
+            let bg = ensure_contrast(acc, Color32::WHITE, 5.0, false);
+            let hover = mix(bg, Color32::BLACK, 0.14);
+            (bg, hover, Color32::WHITE)
+        };
+        let (btn_danger_bg, btn_danger_hover, btn_danger_text) = if dark {
+            let bg = ensure_contrast(rgb((0xf2, 0x74, 0x6b)), dark_ink, 5.0, true);
+            let hover = mix(bg, Color32::WHITE, 0.14);
+            (bg, hover, dark_ink)
+        } else {
+            let bg = ensure_contrast(rgb((0xc6, 0x28, 0x28)), Color32::WHITE, 5.0, false);
+            let hover = mix(bg, Color32::BLACK, 0.14);
+            (bg, hover, Color32::WHITE)
+        };
+        let scrim = if dark { Color32::from_black_alpha(165) } else { Color32::from_black_alpha(115) };
+        let close_hover = ensure_contrast(rgb((0xc4, 0x2b, 0x1c)), Color32::WHITE, 4.5, false);
+
         Tokens {
+            theme,
             panel,
+            surface_elevated,
             editor,
             faint,
+            border,
+            border_subtle,
             container_border,
             text,
+            disabled,
             accent,
+            accent_text,
             notebook: accent,
             group,
             section,
@@ -384,6 +532,14 @@ impl Tokens {
             selection: selection_wash(editor, acc, text),
             ok: ensure_contrast(if dark { rgb((0x6c, 0xd0, 0x8a)) } else { rgb((0x1e, 0x8a, 0x44)) }, panel, 3.0, dark),
             warn: ensure_contrast(if dark { rgb((0xff, 0x8a, 0x80)) } else { rgb((0xb3, 0x26, 0x1e)) }, panel, 4.5, dark),
+            btn_primary_bg,
+            btn_primary_hover,
+            btn_primary_text,
+            btn_danger_bg,
+            btn_danger_hover,
+            btn_danger_text,
+            scrim,
+            close_hover,
             rule_line: faint_line(editor, acc, 1.25),
             rule_line_strong: faint_line(editor, acc, 1.8),
             table_line: faint_line(editor, text, 2.2),
@@ -394,6 +550,35 @@ impl Tokens {
         }
     }
 
+    /// True when these tokens belong to a dark theme.
+    pub fn is_dark(&self) -> bool {
+        self.theme.mode.is_dark()
+    }
+
+    /// Returns the base (non-band) tokens for transient popups and menus launched from a
+    /// control that may itself sit on the dark title band (such as the Quick Access Toolbar).
+    pub fn for_popup(&self) -> Tokens {
+        self.theme.tokens()
+    }
+
+    /// Drop shadow for floating modals and elevated dialogs.
+    pub fn shadow_floating(&self) -> egui::Shadow {
+        if self.is_dark() {
+            egui::Shadow { offset: [0, 10], blur: 28, spread: 0, color: Color32::from_black_alpha(140) }
+        } else {
+            egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(48) }
+        }
+    }
+
+    /// Drop shadow for transient menus, dropdowns, and popovers.
+    pub fn shadow_popup(&self) -> egui::Shadow {
+        if self.is_dark() {
+            egui::Shadow { offset: [0, 6], blur: 16, spread: 0, color: Color32::from_black_alpha(115) }
+        } else {
+            egui::Shadow { offset: [0, 4], blur: 12, spread: 0, color: Color32::from_black_alpha(36) }
+        }
+    }
+
     /// The same colours seen from the band: its own surface and its own writing, so a control
     /// drawn for the page's surfaces (the Quick Access Toolbar, the theme button) reads there.
     pub fn on_band(&self) -> Tokens {
@@ -401,7 +586,9 @@ impl Tokens {
             panel: self.band,
             text: self.band_text,
             accent: self.band_text,
+            accent_text: self.band_text,
             muted: self.band_dim,
+            disabled: self.band_dim,
             strong: self.band_text,
             row_hover: self.band_hover,
             row_selected: self.band_hover,
@@ -411,15 +598,19 @@ impl Tokens {
     }
 }
 
-/// The shared popup treatment for language pickers: themed surface, outline, selection and padding.
+/// The shared popup treatment for language pickers and menus: themed elevated surface,
+/// visible border, shadow, selection, and padding.
 pub fn picker_popup_style(tokens: Tokens) -> egui::style::StyleModifier {
+    let tokens = tokens.for_popup();
     egui::style::StyleModifier::new(move |style| {
-        style.visuals.window_fill = tokens.panel;
+        style.visuals.window_fill = tokens.surface_elevated;
         // The popup can have a strongly tinted surface (for example, the Purple
-        // accent). Do not inherit the app's unrelated widget foreground colors.
+        // accent) or be launched from the dark title band. Always bind popup text
+        // to the popup's own surface tokens.
         style.visuals.override_text_color = Some(tokens.text);
-        style.visuals.window_stroke = egui::Stroke::new(1.0, tokens.container_border);
-        style.visuals.menu_corner_radius = egui::CornerRadius::same(8);
+        style.visuals.window_stroke = egui::Stroke::new(1.0, tokens.border);
+        style.visuals.popup_shadow = tokens.shadow_popup();
+        style.visuals.menu_corner_radius = egui::CornerRadius::same(RADIUS_POPUP);
         style.visuals.selection.bg_fill = tokens.row_selected;
         style.visuals.selection.stroke = egui::Stroke::new(1.0, tokens.accent);
         style.visuals.widgets.hovered.bg_fill = tokens.row_hover;
@@ -442,15 +633,23 @@ mod tests {
             let tokens = theme.tokens();
             let mut style = egui::Style::default();
             picker_popup_style(tokens).apply(&mut style);
-            assert_eq!(style.visuals.window_fill, tokens.panel, "{}: popup surface", theme.label());
+            assert_eq!(style.visuals.window_fill, tokens.surface_elevated, "{}: popup surface", theme.label());
             assert_eq!(style.visuals.override_text_color, Some(tokens.text), "{}: popup text", theme.label());
-            assert!(contrast(tokens.text, tokens.panel) >= 7.0, "{}: popup text on surface", theme.label());
+            assert!(contrast(tokens.text, tokens.surface_elevated) >= 7.0, "{}: popup text on surface", theme.label());
             assert!(contrast(tokens.text, tokens.row_hover) >= 7.0, "{}: popup text on hover", theme.label());
             assert!(contrast(tokens.text, tokens.row_selected) >= 7.0, "{}: popup text on selection", theme.label());
-            assert_eq!(style.visuals.window_stroke.color, tokens.container_border, "{}: popup border", theme.label());
+            assert_eq!(style.visuals.window_stroke.color, tokens.border, "{}: popup border", theme.label());
+            assert_eq!(style.visuals.popup_shadow, tokens.shadow_popup(), "{}: popup shadow", theme.label());
             assert_eq!(style.visuals.selection.bg_fill, tokens.row_selected, "{}: selected locale", theme.label());
-            assert_eq!(style.visuals.menu_corner_radius, egui::CornerRadius::same(8), "{}: rounded popup", theme.label());
+            assert_eq!(style.visuals.menu_corner_radius, egui::CornerRadius::same(RADIUS_POPUP), "{}: rounded popup", theme.label());
             assert_eq!(style.spacing.menu_margin, egui::Margin::same(8), "{}: popup padding", theme.label());
+
+            // Launching a popup from band-adapted tokens must still render on the elevated surface,
+            // never white text on a light popup.
+            let mut band_style = egui::Style::default();
+            picker_popup_style(tokens.on_band()).apply(&mut band_style);
+            assert_eq!(band_style.visuals.window_fill, tokens.surface_elevated, "{}: band popup surface", theme.label());
+            assert_eq!(band_style.visuals.override_text_color, Some(tokens.text), "{}: band popup text", theme.label());
         }
     }
 
@@ -466,6 +665,30 @@ mod tests {
                 assert_ne!(a, b, "two themes look the same");
             }
         }
+    }
+
+    #[test]
+    fn gray_is_true_neutral_and_default_preserves_midnight_navy() {
+        let dark_default = Theme { mode: Mode::Dark, accent: Accent::Default }.tokens();
+        assert_eq!(dark_default.panel, Color32::from_rgb(12, 24, 54), "Dark Default keeps midnight-navy panel");
+        assert_eq!(dark_default.editor, Color32::from_rgb(7, 17, 40), "Dark Default keeps midnight-navy editor");
+
+        for mode in [Mode::Light, Mode::Dark] {
+            let gray = Theme { mode, accent: Accent::Gray }.tokens();
+            let spread = |c: Color32| c.r().max(c.g()).max(c.b()) - c.r().min(c.g()).min(c.b());
+            assert!(spread(gray.panel) <= 6, "{mode:?} Gray panel should be neutral charcoal/slate, got {:?}", gray.panel);
+            assert!(spread(gray.editor) <= 6, "{mode:?} Gray editor should be neutral, got {:?}", gray.editor);
+            assert!(spread(gray.surface_elevated) <= 6, "{mode:?} Gray elevated surface should be neutral, got {:?}", gray.surface_elevated);
+        }
+
+        // Chromatic dark accents stay free of navy blue bias: Dark Red panel must be warmer than blue,
+        // Dark Green panel must lean green, and Dark Yellow panel must lean warm.
+        let dark_red = Theme { mode: Mode::Dark, accent: Accent::Red }.tokens();
+        assert!(dark_red.panel.r() > dark_red.panel.b(), "Dark Red should not be navy-muddied: {:?}", dark_red.panel);
+        let dark_green = Theme { mode: Mode::Dark, accent: Accent::Green }.tokens();
+        assert!(dark_green.panel.g() > dark_green.panel.b(), "Dark Green should not be navy-muddied: {:?}", dark_green.panel);
+        let dark_yellow = Theme { mode: Mode::Dark, accent: Accent::Yellow }.tokens();
+        assert!(dark_yellow.panel.r() > dark_yellow.panel.b(), "Dark Yellow should not be navy-muddied: {:?}", dark_yellow.panel);
     }
 
     #[test]
@@ -501,20 +724,85 @@ mod tests {
         }
     }
 
-    /// WCAG: body text 7:1 (AAA), secondary text 4.5:1 (AA), links 4.5:1, accents and icons 3:1.
+    /// WCAG: body text 7:1 (AAA), secondary text & accent_text & button text 4.5:1 (AA),
+    /// borders & disabled & icons 3:1.
     #[test]
     fn every_theme_is_readable() {
         for theme in Theme::all() {
             let t = theme.tokens();
             let name = theme.label();
             assert!(contrast(t.text, t.panel) >= 7.0, "{name}: text on panel {:.2}", contrast(t.text, t.panel));
+            assert!(contrast(t.text, t.surface_elevated) >= 7.0, "{name}: text on elevated {:.2}", contrast(t.text, t.surface_elevated));
             assert!(contrast(t.text, t.editor) >= 7.0, "{name}: text on editor {:.2}", contrast(t.text, t.editor));
+            assert!(contrast(t.text, t.faint) >= 7.0, "{name}: text on faint {:.2}", contrast(t.text, t.faint));
             assert!(contrast(t.container_border, t.editor) >= 2.5, "{name}: container border {:.2}", contrast(t.container_border, t.editor));
+            assert!(contrast(t.border, t.panel) >= 3.0, "{name}: border on panel {:.2}", contrast(t.border, t.panel));
+            assert!(contrast(t.border, t.surface_elevated) >= 3.0, "{name}: border on elevated {:.2}", contrast(t.border, t.surface_elevated));
+            assert!(contrast(t.border_subtle, t.panel) >= 1.5, "{name}: subtle border on panel {:.2}", contrast(t.border_subtle, t.panel));
+            assert!(
+                contrast(t.border_subtle, t.surface_elevated) >= 1.5,
+                "{name}: subtle border on elevated {:.2}",
+                contrast(t.border_subtle, t.surface_elevated)
+            );
+            assert!(contrast(t.border, t.panel) > contrast(t.border_subtle, t.panel), "{name}: border must be stronger than border_subtle");
+            assert!(contrast(t.disabled, t.panel) >= 3.0, "{name}: disabled on panel {:.2}", contrast(t.disabled, t.panel));
+            assert!(contrast(t.disabled, t.surface_elevated) >= 3.0, "{name}: disabled on elevated {:.2}", contrast(t.disabled, t.surface_elevated));
+            assert!(contrast(t.disabled, t.panel) < contrast(t.muted, t.panel), "{name}: disabled should be quieter than muted");
             assert!(contrast(t.strong, t.panel) >= 7.0, "{name}: strong text");
+            assert!(contrast(t.strong, t.surface_elevated) >= 7.0, "{name}: strong text on elevated");
             assert!(contrast(t.muted, t.panel) >= 4.5, "{name}: muted text {:.2}", contrast(t.muted, t.panel));
+            assert!(contrast(t.muted, t.surface_elevated) >= 4.5, "{name}: muted text on elevated {:.2}", contrast(t.muted, t.surface_elevated));
             assert!(contrast(t.muted, t.code_bg) >= 3.5, "{name}: muted on code background {:.2}", contrast(t.muted, t.code_bg));
             assert!(contrast(t.link, t.editor) >= 4.5, "{name}: link {:.2}", contrast(t.link, t.editor));
             assert!(contrast(t.accent, t.panel) >= 3.0, "{name}: accent {:.2}", contrast(t.accent, t.panel));
+            assert!(contrast(t.accent, t.surface_elevated) >= 3.0, "{name}: accent on elevated {:.2}", contrast(t.accent, t.surface_elevated));
+            assert!(contrast(t.accent_text, t.panel) >= 4.5, "{name}: accent_text on panel {:.2}", contrast(t.accent_text, t.panel));
+            assert!(
+                contrast(t.accent_text, t.surface_elevated) >= 4.5,
+                "{name}: accent_text on elevated {:.2}",
+                contrast(t.accent_text, t.surface_elevated)
+            );
+            // Primary and danger buttons: WCAG AA text on both rest and hover states,
+            // and visible separation from elevated modal surfaces.
+            assert!(
+                contrast(t.btn_primary_text, t.btn_primary_bg) >= 4.5,
+                "{name}: primary button text {:.2}",
+                contrast(t.btn_primary_text, t.btn_primary_bg)
+            );
+            assert!(
+                contrast(t.btn_primary_text, t.btn_primary_hover) >= 4.5,
+                "{name}: primary button hover text {:.2}",
+                contrast(t.btn_primary_text, t.btn_primary_hover)
+            );
+            assert!(
+                contrast(t.btn_primary_bg, t.surface_elevated) >= 3.0,
+                "{name}: primary button vs elevated {:.2}",
+                contrast(t.btn_primary_bg, t.surface_elevated)
+            );
+            assert_ne!(t.btn_primary_bg, t.btn_primary_hover, "{name}: primary hover must differ from rest");
+            assert!(
+                contrast(t.btn_danger_text, t.btn_danger_bg) >= 4.5,
+                "{name}: danger button text {:.2}",
+                contrast(t.btn_danger_text, t.btn_danger_bg)
+            );
+            assert!(
+                contrast(t.btn_danger_text, t.btn_danger_hover) >= 4.5,
+                "{name}: danger button hover text {:.2}",
+                contrast(t.btn_danger_text, t.btn_danger_hover)
+            );
+            assert!(
+                contrast(t.btn_danger_bg, t.surface_elevated) >= 3.0,
+                "{name}: danger button vs elevated {:.2}",
+                contrast(t.btn_danger_bg, t.surface_elevated)
+            );
+            assert_ne!(t.btn_danger_bg, t.btn_danger_hover, "{name}: danger hover must differ from rest");
+            assert!(
+                contrast(Color32::WHITE, t.close_hover) >= 4.5,
+                "{name}: white glyph on close_hover {:.2}",
+                contrast(Color32::WHITE, t.close_hover)
+            );
+            assert!(t.scrim.a() >= 90 && t.scrim.a() <= 200, "{name}: scrim alpha {}", t.scrim.a());
+
             for (what, c) in [("group icon", t.group), ("section icon", t.section), ("ok", t.ok)] {
                 assert!(contrast(c, t.panel) >= 3.0, "{name}: {what} {:.2}", contrast(c, t.panel));
             }
@@ -565,9 +853,42 @@ mod tests {
     #[test]
     fn visuals_follow_the_tokens() {
         for theme in Theme::all() {
+            let t = theme.tokens();
             let v = theme.visuals();
-            assert_eq!(v.dark_mode, theme.mode.is_dark());
-            assert_eq!(v.panel_fill, theme.tokens().panel);
+            let name = theme.label();
+            assert_eq!(v.dark_mode, theme.mode.is_dark(), "{name}: dark_mode");
+            assert_eq!(v.panel_fill, t.panel, "{name}: panel_fill");
+            assert_eq!(v.window_fill, t.surface_elevated, "{name}: window_fill");
+            assert_eq!(v.window_stroke.color, t.border, "{name}: window_stroke");
+            assert_eq!(v.window_corner_radius, egui::CornerRadius::same(RADIUS_MODAL), "{name}: window_corner_radius");
+            assert_eq!(v.window_shadow, t.shadow_floating(), "{name}: window_shadow");
+            assert_eq!(v.menu_corner_radius, egui::CornerRadius::same(RADIUS_POPUP), "{name}: menu_corner_radius");
+            assert_eq!(v.popup_shadow, t.shadow_popup(), "{name}: popup_shadow");
+            assert_eq!(v.selection.bg_fill, t.row_selected, "{name}: selection wash");
+            assert_eq!(v.selection.stroke.color, t.accent, "{name}: selection stroke");
+            assert_eq!(v.text_cursor.stroke.color, t.accent, "{name}: cursor color");
+            assert_eq!(v.weak_text_color, Some(t.muted), "{name}: weak_text_color");
+
+            // All 5 widget states keep readable foreground on their background fills.
+            for (state, w) in [
+                ("noninteractive", &v.widgets.noninteractive),
+                ("inactive", &v.widgets.inactive),
+                ("hovered", &v.widgets.hovered),
+                ("active", &v.widgets.active),
+                ("open", &v.widgets.open),
+            ] {
+                assert!(
+                    contrast(w.fg_stroke.color, w.bg_fill) >= 7.0,
+                    "{name}: widget state {state} fg/bg contrast {:.2}",
+                    contrast(w.fg_stroke.color, w.bg_fill)
+                );
+                assert_eq!(w.corner_radius, egui::CornerRadius::same(RADIUS_CONTROL), "{name}: {state} corner_radius");
+            }
+            assert_eq!(v.widgets.noninteractive.bg_stroke.color, t.border_subtle, "{name}: noninteractive stroke");
+            assert_eq!(v.widgets.inactive.bg_stroke.color, t.border, "{name}: inactive stroke");
+            assert_eq!(v.widgets.hovered.bg_stroke.color, t.accent, "{name}: hovered stroke");
+            assert_eq!(v.widgets.active.bg_stroke.color, t.accent, "{name}: active stroke");
+            assert_eq!(v.widgets.open.bg_stroke.color, t.accent, "{name}: open stroke");
         }
     }
 
