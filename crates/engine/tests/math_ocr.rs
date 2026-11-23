@@ -161,7 +161,8 @@ fn recognition_starts_off_and_while_off_nothing_is_sent() {
     let server = Server::start();
     let mut s = session(&t);
     assert!(!s.ocr_config().enabled, "off until the owner turns it on");
-    assert_eq!(s.ocr_config().provider, OcrProvider::Anthropic);
+    let expected_default = if cfg!(any(target_os = "ios", target_os = "macos")) { OcrProvider::AppleVision } else { OcrProvider::Anthropic };
+    assert_eq!(s.ocr_config().provider, expected_default);
     for id in ["ink.math_ocr_toggle", "ink.math_ocr_configure", "ink.math_ocr_convert"] {
         let spec = registry().iter().find(|c| c.id == id).unwrap_or_else(|| panic!("{id} is a command"));
         assert!(!spec.changes_tree, "{id} does not change the notebooks");

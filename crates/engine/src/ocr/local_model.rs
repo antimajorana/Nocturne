@@ -25,8 +25,10 @@ pub const TOKENIZER_FILE: &str = "tokenizer.json";
 /// Image resolution expected by the Pix2Text MFR 1.5 ViT encoder (`[1, 3, 384, 384]`).
 pub const IMG_SIZE: u32 = 384;
 
+#[cfg(not(target_arch = "wasm32"))]
 const START_TOKEN_ID: u32 = 1;
 const EOS_TOKEN_ID: u32 = 2;
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_DECODE_TOKENS: usize = 256;
 
 /// One pinned file belonging to the downloadable math OCR model.

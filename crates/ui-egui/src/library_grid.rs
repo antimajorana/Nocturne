@@ -471,6 +471,12 @@ fn sidebar_more_menu(ui: &mut Ui, sync_busy: bool, sync_configured: bool, out: &
 /// Opens the native file picker for a library import without creating any page first.
 #[must_use]
 pub fn pick_import_file(kind: ImportKind) -> Option<PathBuf> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = kind;
+        None
+    }
+    #[cfg(not(target_arch = "wasm32"))]
     match kind {
         ImportKind::Document => rfd::FileDialog::new().set_title(crate::tl_id!("ui.choose_a_pdf_or_office_document_to_print_out")).add_filter(
             crate::tl_id!("ui.pdf_and_office_documents"),
