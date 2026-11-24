@@ -71,7 +71,7 @@ LIB="$ROOT/target/$TARGET/release/libnocturne_android.so"
 [[ -s "$LIB" ]] || { echo "missing $LIB; build without --skip-build" >&2; exit 1; }
 
 # 2. The Welcome notebook payload: both generated editions in one asset (android/src/welcome.rs).
-mkdir -p "$WORK/assets"
+bash "$ROOT/packaging/stage-notices.sh" "$WORK/assets/notices"
 python3 - "$ROOT/docs/demo/DemoNotebook" "$WORK/assets/welcome-to-nocturne.zip" <<'PY'
 import os, sys, zipfile
 demo, out = sys.argv[1], sys.argv[2]

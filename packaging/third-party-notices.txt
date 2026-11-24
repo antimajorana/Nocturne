@@ -1,0 +1,9 @@
+assets/fonts/OFL-NotoNaskhArabic.txt OFL-NotoNaskhArabic.txt
+assets/fonts/OFL-NotoSansCJKsc.txt OFL-NotoSansCJKsc.txt
+assets/fonts/OFL-NotoSansDevanagari.txt OFL-NotoSansDevanagari.txt
+assets/fonts/OFL-NotoSansHebrew.txt OFL-NotoSansHebrew.txt
+assets/fonts/katex/OFL-KaTeX.txt OFL-KaTeX.txt
+crates/ui-egui/assets/fluent/FLUENT_UI_SYSTEM_ICONS_LICENSE.txt FLUENT_UI_SYSTEM_ICONS_LICENSE.txt
+vendor/mermaid-rs-renderer/LICENSE mermaid-rs-renderer-MIT.txt
+vendor/eframe/LICENSE-MIT egui-MIT.txt
+vendor/eframe/LICENSE-APACHE egui-Apache-2.0.txt

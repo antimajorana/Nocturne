@@ -96,7 +96,7 @@ for format in html cmgfm; do
   [[ "$languages" = 13 ]] || { echo "$format demo has $languages language folders, expected 13" >&2; exit 1; }
 done
 [[ -s "$MOUNT/Read Me First.txt" ]]
-for doc in licenses/LICENSE-MIT licenses/LICENSE-APACHE licenses/NOTICE ATTRIBUTION.md licenses/PDF-RENDERING-NOTICES.txt; do
+for doc in LICENSE NOTICE ATTRIBUTION.md licenses/PDF-RENDERING-NOTICES.txt licenses/OFL-KaTeX.txt licenses/FLUENT_UI_SYSTEM_ICONS_LICENSE.txt; do
   [[ -s "$APP/Contents/Resources/$doc" ]] || { echo "app notice missing: $doc" >&2; exit 1; }
 done
 diff -rq "$ROOT/docs/demo/DemoNotebook" "$APP/Contents/Resources/demo/welcome-to-nocturne"
@@ -136,7 +136,7 @@ if [[ "$ARCH" = universal || ( "$ARCH" = aarch64 && "$(uname -m)" = arm64 ) || \
       ( "$ARCH" = x86_64 && "$(uname -m)" = x86_64 ) ]]; then
   check_version "$CLI" nocturne-cli
 fi
-for doc in licenses/LICENSE-MIT licenses/LICENSE-APACHE licenses/NOTICE ATTRIBUTION.md licenses/PDF-RENDERING-NOTICES.txt; do
+for doc in LICENSE NOTICE ATTRIBUTION.md licenses/PDF-RENDERING-NOTICES.txt licenses/OFL-KaTeX.txt licenses/FLUENT_UI_SYSTEM_ICONS_LICENSE.txt; do
   [[ -s "${CLI%/*}/$doc" ]] || { echo "CLI notice missing: $doc" >&2; exit 1; }
 done
 echo "verified macOS $ARCH package: $DMG and $ZIP"

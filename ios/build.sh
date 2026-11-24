@@ -100,6 +100,7 @@ WORK="$TARGET_ROOT/ios-ipa"
 APP="$WORK/Payload/Nocturne.app"
 rm -rf "$WORK"
 mkdir -p "$APP" "$DIST"
+bash "$ROOT/packaging/stage-notices.sh" "$APP/notices"
 
 # 1. Native executable (stripped of local symbols on macOS).
 cp "$BIN" "$APP/nocturne-ios"

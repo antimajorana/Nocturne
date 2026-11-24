@@ -29,6 +29,8 @@ lib = apk.getinfo("lib/arm64-v8a/libnocturne_android.so")
 assert lib.file_size > 1_000_000, f"the native library is only {lib.file_size} bytes"
 assert b".symtab" not in apk.read(lib.filename)[-65536:], "the native library still has its symbol table"
 assert not any(n.endswith(".dex") for n in apk.namelist()), "the APK should have no Java code"
+for doc in ("LICENSE", "NOTICE", "ATTRIBUTION.md", "licenses/PDF-RENDERING-NOTICES.txt", "licenses/OFL-KaTeX.txt", "licenses/FLUENT_UI_SYSTEM_ICONS_LICENSE.txt"):
+    assert apk.getinfo(f"assets/notices/{doc}").file_size > 0, f"missing or empty notice: {doc}"
 payload = zipfile.ZipFile(io.BytesIO(apk.read("assets/welcome-to-nocturne.zip")))
 names = payload.namelist()
 for path in ("html/_node.toml", "html/00-start/welcome/index.html", "cmgfm/_node.toml", "cmgfm/00-start/welcome/index.md"):

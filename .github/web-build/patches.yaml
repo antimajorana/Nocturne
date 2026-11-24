@@ -2,8 +2,8 @@
 # .github/workflows/website-pipeline.yml compiles as a pull request check, with wasm-opt (nothing is deployed). No external
 # build service is used or needed — this workflow does the whole build itself, in its own CI run.
 #
-# Recipe origin: adapted from daijro/openplayground's patches/onenote.yaml (SPDX MIT OR Apache-2.0, same as
-# this repo, per the header of the files these patches create). That project's own build pipeline inspired
+# Recipe origin: adapted from daijro/openplayground's patches/onenote.yaml (SPDX MIT OR Apache-2.0,
+# per the headers of the files these patches create). That project's own build pipeline inspired
 # this one; see the website's footer for the credit. Applied here with apply-web-patches.py, a small
 # from-scratch reimplementation of their rule format (not a copy of their build tooling) -- see that
 # script's own header. The live-collaboration rules (Playground session co-editing) are intentionally left

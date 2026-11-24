@@ -159,11 +159,7 @@ for spec in "16:32" "32:64" "128:256" "256:512" "512:1024"; do
 done
 iconutil --convert icns "$ICONSET" --output "$APP/Contents/Resources/nocturne.icns"
 
-for file in LICENSE-MIT LICENSE-APACHE NOTICE; do
-  install -m 644 "$ROOT/$file" "$APP/Contents/Resources/licenses/$file"
-done
-install -m 644 "$ROOT/ATTRIBUTION.md" "$APP/Contents/Resources/ATTRIBUTION.md"
-ditto "$ROOT/licenses" "$APP/Contents/Resources/licenses"
+bash "$ROOT/packaging/stage-notices.sh" "$APP/Contents/Resources"
 
 identity="${APPLE_SIGNING_IDENTITY:-}"
 sign() {
@@ -203,11 +199,7 @@ codesign --verify --strict --verbose=2 "$DMG"
 CLI_DIR="$WORK/Nocturne-cli-$VERSION-macos-$ARCH"
 mkdir -p "$CLI_DIR/licenses"
 install -m 755 "$APP/Contents/MacOS/nocturne-cli" "$CLI_DIR/nocturne-cli"
-for file in LICENSE-MIT LICENSE-APACHE NOTICE; do
-  install -m 644 "$ROOT/$file" "$CLI_DIR/licenses/$file"
-done
-install -m 644 "$ROOT/ATTRIBUTION.md" "$CLI_DIR/ATTRIBUTION.md"
-ditto "$ROOT/licenses" "$CLI_DIR/licenses"
+bash "$ROOT/packaging/stage-notices.sh" "$CLI_DIR"
 sign "$CLI_DIR/nocturne-cli"
 cli_hash="$(sha256 "$CLI_DIR/nocturne-cli")"
 printf '%s\n%s\n%s\n%s\n' "$VERSION" "$ARCH" "$cli_hash" "$build_source" > "$CLI_DIR/BuildProvenance.txt"

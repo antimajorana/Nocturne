@@ -7,7 +7,7 @@ files under `assets/` without a row here, without failing the build. Last review
 
 | File | What | Origin | Licence status |
 |---|---|---|---|
-| `assets/brand/nocturne-source.png` | The Nocturne icon, a sun setting over water on a rounded square, 1024 x 1024, transparent outside the corners | Drawn by `tools/brand/make_icons.py` from the owner's design. Drawn for Nocturne by its owner (antimajorana, 2026-11-18) | Nocturne's own artwork. Kept outside the project's MIT OR Apache-2.0 licence. |
+| `assets/brand/nocturne-source.png` | The Nocturne icon, a sun setting over water on a rounded square, 1024 x 1024, transparent outside the corners | Drawn by `tools/brand/make_icons.py` from the owner's design. Drawn for Nocturne by its owner (antimajorana, 2026-11-18) | Nocturne's own artwork. Kept outside the project's GPL-3.0-only code licence. |
 | `assets/brand/nocturne-512.png` | The same icon drawn at 512 px | Drawn by `tools/brand/make_icons.py` | Same as the source |
 | `assets/brand/nocturne-256.png` | Same, 256 px | Drawn by `tools/brand/make_icons.py` | Same as the source |
 | `assets/brand/nocturne-128.png` | Same, 128 px | Drawn by `tools/brand/make_icons.py` | Same as the source |
@@ -98,12 +98,13 @@ notebooks. They hold no personal data.
 
 - The icons in the tree and toolbar are drawn in code (`crates/ui-egui/src/icons.rs`). No icon
   files are used.
+- The vendored `eframe` and `egui-wgpu` crates retain egui's MIT or Apache-2.0
+  terms. Each crate includes the original notices from [egui 0.37.0](https://github.com/emilk/egui/tree/0.37.0).
 - The UI uses the fonts bundled with egui. They carry their own licences, which ship with the
   egui crates. Their terms were not re-read for this file.
 - Dependencies are listed in `Cargo.lock`. A licence audit of them (for example with
   `cargo deny`) has not been run.
-- Nocturne's own code is dual-licensed under MIT or Apache-2.0, at your option: `LICENSE-MIT`,
-  `LICENSE-APACHE`, `NOTICE`. The rows above are not covered by it where they say so.
+- Nocturne's own code is licensed under GPL-3.0-only. See `LICENSE` and `NOTICE`. The third-party works and brand artwork listed here keep their separate terms.
 - The `.one` file format notes in `docs/research/` paraphrase Microsoft's published
   specifications. No Microsoft text or code is included.
 

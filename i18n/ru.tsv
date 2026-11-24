@@ -372,7 +372,7 @@
 @id	ui.mermaid	Mermaid
 @id	ui.mint	мята
 @id	ui.mit_license	Лицензия MIT
-@id	ui.licence_summary_nocturne	MIT или Apache-2.0, на ваш выбор. Изображение иконки Nocturne не подпадает под него; см. ATTRIBUTION.md.
+@id	ui.licence_summary_nocturne	Код Nocturne распространяется по лицензии GPL-3.0-only. Отдельные условия для изображения значка приведены в ATTRIBUTION.md.
 @id	ui.mode	Режим
 @id	ui.modify_tool	Изменить инструмент
 @id	ui.more	Ещё...

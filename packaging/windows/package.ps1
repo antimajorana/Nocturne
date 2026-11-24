@@ -149,11 +149,15 @@ Copy-Item (Join-Path $BridgeStage 'importers') $Stage -Recurse
 
 # The notices travel with the program: the installer and the portable zip both carry them, and the
 # licence texts they name, so a copy handed on alone still says what it contains.
-Copy-Item (Join-Path $Root 'NOTICE'), (Join-Path $Root 'ATTRIBUTION.md'), (Join-Path $Root 'LICENSE-MIT'), (Join-Path $Root 'LICENSE-APACHE') $Stage
+Copy-Item (Join-Path $Root 'NOTICE'), (Join-Path $Root 'ATTRIBUTION.md'), (Join-Path $Root 'LICENSE') $Stage
 $LicensesStage = Join-Path $Stage 'licenses'
 New-Item -ItemType Directory -Force -Path $LicensesStage | Out-Null
-Copy-Item (Join-Path $Root 'licenses\*') $LicensesStage
-foreach ($notice in 'NOTICE', 'ATTRIBUTION.md', 'LICENSE-MIT', 'LICENSE-APACHE', 'licenses\PDF-RENDERING-NOTICES.txt') {
+Copy-Item (Join-Path $Root 'licenses\*.txt') $LicensesStage
+foreach ($line in Get-Content -LiteralPath (Join-Path $Root 'packaging\third-party-notices.txt')) {
+  $source, $name = $line -split ' ', 2
+  Copy-Item -LiteralPath (Join-Path $Root $source) -Destination (Join-Path $LicensesStage $name)
+}
+foreach ($notice in 'NOTICE', 'ATTRIBUTION.md', 'LICENSE', 'licenses\PDF-RENDERING-NOTICES.txt') {
   if (-not (Test-Path (Join-Path $Stage $notice))) { throw "notice missing from the package stage: $notice" }
 }
 
@@ -161,8 +165,7 @@ $Outputs = @()
 
 # ---- MSI ---------------------------------------------------------------------------------------
 if (-not $ZipOnly) {
-  # The installer's welcome page shows the licence: build its RTF from LICENSE-MIT and
-  # LICENSE-APACHE so it never drifts from them. Hard-wrapped lines are rejoined into paragraphs
+  # Build the installer's RTF from the project licence. Hard-wrapped lines are rejoined into paragraphs
   # so the text wraps to the dialog's width.
   function ConvertTo-RtfText([string] $Text) {
     $sb = [System.Text.StringBuilder]::new()
@@ -176,15 +179,13 @@ if (-not $ZipOnly) {
   }
   $paragraphs = [System.Collections.Generic.List[string]]::new()
   $paragraphs.Add('\b Nocturne\b0')
-  $paragraphs.Add((ConvertTo-RtfText 'Nocturne is dual-licensed under the MIT License or the Apache License, Version 2.0, at your option. Both licence texts follow. Bundled fonts and other third-party material keep their own open licences, listed in NOTICE and ATTRIBUTION.md at https://github.com/antimajorana/Nocturne.'))
-  foreach ($file in 'LICENSE-MIT', 'LICENSE-APACHE') {
-    $title = $true  # each file opens with its licence's name: show it bold
-    foreach ($para in ((Get-Content -Raw (Join-Path $Root $file)) -split '\r?\n\s*\r?\n')) {
-      $joined = (($para -split '\r?\n') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' '
-      if (-not $joined) { continue }
-      $paragraphs.Add($(if ($title) { "\b $(ConvertTo-RtfText $joined)\b0" } else { ConvertTo-RtfText $joined }))
-      $title = $false
-    }
+  $paragraphs.Add((ConvertTo-RtfText 'Nocturne code is licensed under the GNU General Public License, version 3 only. The full licence follows. See NOTICE for source downloads and ATTRIBUTION.md for the terms of third-party material and brand artwork.'))
+  $title = $true  # the licence opens with its name: show it bold
+  foreach ($para in ((Get-Content -Raw (Join-Path $Root 'LICENSE')) -split '\r?\n\s*\r?\n')) {
+    $joined = (($para -split '\r?\n') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' '
+    if (-not $joined) { continue }
+    $paragraphs.Add($(if ($title) { "\b $(ConvertTo-RtfText $joined)\b0" } else { ConvertTo-RtfText $joined }))
+    $title = $false
   }
   $LicenseRtf = Join-Path $Stage 'license.rtf'
   $rtf = '{\rtf1\ansi\ansicpg1252\deff0{\fonttbl{\f0\fswiss\fcharset0 Tahoma;}}\viewkind4\uc1\pard\sa120\f0\fs16 ' +
@@ -213,7 +214,7 @@ Copy-Item (Join-Path $Stage '*.exe') $Portable
 Copy-Item (Join-Path $Stage 'importers') $Portable -Recurse
 Copy-Item (Join-Path $Stage 'licenses') $Portable -Recurse
 Copy-Item (Join-Path $Stage 'demo') $Portable -Recurse
-foreach ($f in 'README.md', 'LICENSE-MIT', 'LICENSE-APACHE', 'NOTICE', 'ATTRIBUTION.md') {
+foreach ($f in 'README.md', 'LICENSE', 'NOTICE', 'ATTRIBUTION.md') {
   $p = Join-Path $Root $f
   if (Test-Path $p) { Copy-Item $p $Portable }
 }

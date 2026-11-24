@@ -372,7 +372,7 @@
 @id	ui.mermaid	Mermaid
 @id	ui.mint	mint
 @id	ui.mit_license	MIT लाइसेंस
-@id	ui.licence_summary_nocturne	MIT या Apache-2.0, आपकी पसंद के अनुसार। Nocturne आइकन की कलाकृति इसके अंतर्गत नहीं है; ATTRIBUTION.md देखें।
+@id	ui.licence_summary_nocturne	Nocturne कोड का लाइसेंस GPL-3.0-only है। आइकन की कलाकृति की अलग शर्तों के लिए ATTRIBUTION.md देखें।
 @id	ui.mode	मोड
 @id	ui.modify_tool	टूल संशोधित करें
 @id	ui.more	अधिक...
