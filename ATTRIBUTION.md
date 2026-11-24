@@ -98,6 +98,8 @@ notebooks. They hold no personal data.
 
 - The icons in the tree and toolbar are drawn in code (`crates/ui-egui/src/icons.rs`). No icon
   files are used.
+- The vendored `eframe` and `egui-wgpu` crates retain egui's MIT or Apache-2.0
+  terms. Each crate includes the original notices from [egui 0.37.0](https://github.com/emilk/egui/tree/0.37.0).
 - The UI uses the fonts bundled with egui. They carry their own licences, which ship with the
   egui crates. Their terms were not re-read for this file.
 - Dependencies are listed in `Cargo.lock`. A licence audit of them (for example with

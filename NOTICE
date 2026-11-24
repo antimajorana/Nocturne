@@ -46,6 +46,9 @@ is, where it came from, its license status) is in ATTRIBUTION.md.
   License (they are MIT OR Apache-2.0), linked into the program. They use brotli-decompressor
   (BSD-3-Clause or MIT) and alloc-no-stdlib and alloc-stdlib (BSD-3-Clause), by Daniel Reiter
   Horn and Dropbox, Inc., linked in the same way.
+- The vendored eframe and egui-wgpu crates are from egui 0.37.0. Their MIT and
+  Apache-2.0 licenses accompany both crate packages and are included in binary
+  distributions as licenses/egui-MIT.txt and licenses/egui-Apache-2.0.txt.
 - The window also uses the fonts bundled with egui, which carry their own licenses; those ship
   with the egui crates.
 - File > Check for updates (desktop builds only) talks to GitHub with the ureq crate (Apache-2.0
