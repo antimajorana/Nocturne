@@ -372,7 +372,7 @@
 @id	ui.mermaid	Mermaid
 @id	ui.mint	ミント
 @id	ui.mit_license	MIT ライセンス
-@id	ui.licence_summary_nocturne	MIT または Apache-2.0、お選びください。Nocturne アイコンのアートワークはこれに含まれません；ATTRIBUTION.md を参照してください。
+@id	ui.licence_summary_nocturne	Nocturne のコードには GPL-3.0-only が適用されます。アイコン画像に適用される個別の条件は ATTRIBUTION.md を参照してください。
 @id	ui.mode	モード
 @id	ui.modify_tool	ツールを編集
 @id	ui.more	その他...

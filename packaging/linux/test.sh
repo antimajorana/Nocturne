@@ -17,6 +17,9 @@ ARCHIVE="$DIST/nocturne-$VERSION-linux-$ARCH.tar.gz"
 [ -s "$ARCHIVE" ] || { echo "missing package: $ARCHIVE" >&2; exit 1; }
 tar -tzf "$ARCHIVE" | grep -Fx "nocturne-$VERSION-linux-$ARCH/bin/nocturne" >/dev/null
 for path in \
+    "share/doc/nocturne/LICENSE" \
+    "share/doc/nocturne/NOTICE" \
+    "share/doc/nocturne/licenses/PDF-RENDERING-NOTICES.txt" \
     "share/nocturne/demo/welcome-to-nocturne/html/_node.toml" \
     "share/nocturne/demo/welcome-to-nocturne/html/00-start/welcome/index.html" \
     "share/nocturne/demo/welcome-to-nocturne/cmgfm/_node.toml" \

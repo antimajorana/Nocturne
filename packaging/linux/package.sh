@@ -59,10 +59,7 @@ for size in 32 64 128 256 512; do
     install -Dm644 "$ROOT/assets/brand/nocturne-$size.png" \
         "$STAGE/usr/share/icons/hicolor/${size}x${size}/apps/io.github.antimajorana.nocturne.png"
 done
-mkdir -p "$STAGE/usr/share/doc/nocturne"
-install -Dm644 "$ROOT/LICENSE-MIT" "$STAGE/usr/share/doc/nocturne/LICENSE-MIT"
-install -Dm644 "$ROOT/LICENSE-APACHE" "$STAGE/usr/share/doc/nocturne/LICENSE-APACHE"
-install -Dm644 "$ROOT/NOTICE" "$STAGE/usr/share/doc/nocturne/NOTICE"
+bash "$ROOT/packaging/stage-notices.sh" "$STAGE/usr/share/doc/nocturne"
 
 # The app offers both generated formats on first launch of each app version.
 DEMO_SOURCE="$ROOT/docs/demo/DemoNotebook"

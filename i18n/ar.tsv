@@ -372,7 +372,7 @@
 @id	ui.mermaid	Mermaid
 @id	ui.mint	نعناع
 @id	ui.mit_license	ترخيص MIT
-@id	ui.licence_summary_nocturne	MIT أو Apache-2.0، حسب اختيارك. لا يغطي هذا العمل الفني لأيقونة Nocturne؛ انظر ATTRIBUTION.md.
+@id	ui.licence_summary_nocturne	شيفرة Nocturne مرخّصة بموجب GPL-3.0-only. راجع ATTRIBUTION.md للاطّلاع على الشروط الخاصة برسوم الأيقونة.
 @id	ui.mode	الوضع
 @id	ui.modify_tool	أداة التعديل
 @id	ui.more	المزيد...

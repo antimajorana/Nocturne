@@ -66,6 +66,8 @@ def parse_png_ihdr(data: bytes) -> tuple[int, int, int, bool]:
 with zipfile.ZipFile(ipa_path, "r") as zf:
     names = set(zf.namelist())
     app = "Payload/Nocturne.app"
+    for doc in ("LICENSE", "NOTICE", "ATTRIBUTION.md", "licenses/PDF-RENDERING-NOTICES.txt", "licenses/OFL-KaTeX.txt", "licenses/FLUENT_UI_SYSTEM_ICONS_LICENSE.txt"):
+        assert zf.getinfo(f"{app}/notices/{doc}").file_size > 0, f"missing or empty notice: {doc}"
 
     # 2. Verify 64-bit arm64 Mach-O executable.
     exe_path = f"{app}/nocturne-ios"

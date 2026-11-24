@@ -1,7 +1,19 @@
 Nocturne
 Copyright (c) 2026 antimajorana.
-Licensed under the MIT License or the Apache License, Version 2.0, at your option
-(LICENSE-MIT, LICENSE-APACHE).
+Project-owned code is licensed under the GNU General Public License, version 3
+only (GPL-3.0-only). The full text accompanies the program in LICENSE.
+
+Source and build instructions
+
+For an official binary, download the source archive from the release matching
+the app version at https://github.com/antimajorana/Nocturne/releases. The tag
+is v followed by the version. README_DEV.md, Cargo.lock and the platform build
+scripts in that source tree describe how the program was built.
+
+Releases through v0.0.17 were offered under MIT or Apache-2.0. Their grants
+continue to apply to the code distributed under them. Copies of those license
+texts are included in licenses/Nocturne-legacy-MIT.txt and
+licenses/Nocturne-legacy-Apache-2.0.txt.
 
 Third-party material
 
@@ -20,13 +32,13 @@ is, where it came from, its license status) is in ATTRIBUTION.md.
   Design Science, Inc. and 2014-2018 Khan Academy, with Reserved Font Names KaTeX_*. Bundled
   unmodified so equations draw in real maths fonts; the licence text is
   assets/fonts/katex/OFL-KaTeX.txt, written from the licence strings inside the fonts.
+- Microsoft Fluent UI System Icons - MIT License. See licenses/FLUENT_UI_SYSTEM_ICONS_LICENSE.txt.
 - mermaid-rs-renderer - MIT License, by its authors, linked into the program to draw Mermaid diagrams.
 - RaTeX (ratex-parser, ratex-layout, ratex-types, ratex-font) - MIT License, by the RaTeX
   authors, linked into the program to typeset equations.
 - PDF printouts are drawn with the hayro crates (Laurenz Stampfl), used under the MIT License,
   and with substitute fonts from PDFium (Foxit Software Inc. copyright) compiled into the program.
-  The notices those licences require are in licenses/PDF-RENDERING-NOTICES.txt, which ships with
-  every build. See ATTRIBUTION.md.
+  The notices are in licenses/PDF-RENDERING-NOTICES.txt. See ATTRIBUTION.md.
 - OneNote packages (.onepkg) are unpacked with the cab crate (Matthew D. Steele, MIT License),
   which uses lzxd (Lonami Exo, MIT OR Apache-2.0) and byteorder (Andrew Gallant, MIT OR
   Unlicense), linked into the nocturne-import crate.
@@ -42,6 +54,9 @@ is, where it came from, its license status) is in ATTRIBUTION.md.
   into the program.
 - Dependencies are listed in Cargo.lock, each under its own license. A license audit of them
   (for example with cargo deny) has not been run.
+
+The OneNote test corpus under crates/import/tests/fixtures/3p/ retains the licenses
+identified in its individual subdirectories and READMEs.
 
 The notes in docs/research/ paraphrase Microsoft's published specifications [MS-ONESTORE] and
 [MS-ONE]. No Microsoft text, code or assets are included.

@@ -88,8 +88,7 @@ Last reviewed: 2026-10-17. Status of the proof of concept, measured where a numb
 | Where and when to push | Nothing is committed or pushed yet. |
 | Commit attribution lines | Two sources disagree. Resolve before the first commit. |
 
-Settled: `.one` support is import only for now, and the code is licensed MIT OR Apache-2.0,
-the same as the sibling Craft apps (owner, 2026-10-17).
+The initial release decision on 2026-10-17 was to support `.one` import and use MIT or Apache-2.0. The current code licence is [GPL-3.0-only](LICENSE).
 
 See [`docs/gaps.md`](docs/gaps.md) for the full list of gaps and
 [`docs/feature-parity.md`](docs/feature-parity.md) for feature parity.

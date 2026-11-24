@@ -429,7 +429,7 @@
 @id	ui.mermaid	[[RLI]]$$$Mermaid@@@[[PDI]]
 @id	ui.mint	[[RLI]]$$$mint@@@[[PDI]]
 @id	ui.mit_license	[[RLI]]$$$MIT license@@@[[PDI]]
-@id	ui.licence_summary_nocturne	[[RLI]]$$$MIT or Apache-2.0, at your option. The Nocturne icon artwork is not covered by it; see ATTRIBUTION.md.@@@[[PDI]]
+@id	ui.licence_summary_nocturne	[[RLI]]$$$Nocturne code: GPL-3.0-only. See ATTRIBUTION.md for the separate icon artwork terms.@@@[[PDI]]
 @id	ui.mode	[[RLI]]$$$Mode@@@[[PDI]]
 @id	ui.modify_tool	[[RLI]]$$$Modify Tool@@@[[PDI]]
 @id	ui.more	[[RLI]]$$$More...@@@[[PDI]]

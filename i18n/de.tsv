@@ -372,7 +372,7 @@
 @id	ui.mermaid	Mermaid
 @id	ui.mint	mint
 @id	ui.mit_license	MIT-Lizenz
-@id	ui.licence_summary_nocturne	MIT oder Apache-2.0, nach Ihrer Wahl. Die Nocturne-Symbolgrafik ist davon nicht abgedeckt; siehe ATTRIBUTION.md.
+@id	ui.licence_summary_nocturne	Für den Nocturne-Code gilt GPL-3.0-only. Die separaten Bedingungen für die Symbolgrafik stehen in ATTRIBUTION.md.
 @id	ui.mode	Modus
 @id	ui.modify_tool	Werkzeug ändern
 @id	ui.more	Mehr...

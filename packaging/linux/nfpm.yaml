@@ -8,7 +8,7 @@ section: utils
 priority: optional
 maintainer: Nocturne maintainers <nocturne@example.invalid>
 homepage: https://github.com/antimajorana/Nocturne
-license: MIT OR Apache-2.0
+license: GPL-3.0-only
 description: |-
   Nocturne is a clean-room note taking app.
   Notes live as plain files in plain folders.
@@ -28,12 +28,9 @@ contents:
     dst: /usr/share/icons/hicolor/256x256/apps/io.github.antimajorana.nocturne.png
   - src: ${STAGE}/usr/share/icons/hicolor/512x512/apps/io.github.antimajorana.nocturne.png
     dst: /usr/share/icons/hicolor/512x512/apps/io.github.antimajorana.nocturne.png
-  - src: ${STAGE}/usr/share/doc/nocturne/LICENSE-MIT
-    dst: /usr/share/doc/nocturne/LICENSE-MIT
-  - src: ${STAGE}/usr/share/doc/nocturne/LICENSE-APACHE
-    dst: /usr/share/doc/nocturne/LICENSE-APACHE
-  - src: ${STAGE}/usr/share/doc/nocturne/NOTICE
-    dst: /usr/share/doc/nocturne/NOTICE
+  - src: ${STAGE}/usr/share/doc/nocturne/
+    dst: /usr/share/doc/nocturne/
+    type: tree
   - src: ${STAGE}/usr/share/nocturne/demo/
     dst: /usr/share/nocturne/demo/
     type: tree
