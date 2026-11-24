@@ -6906,13 +6906,9 @@ fn double_clicking_an_attachment_card_opens_it() {
         .expect("arrange attachment card");
     ask(&mut h, "ui.open", json!({"path": page})).expect("open");
     settle(&mut h);
-    let origin = look_at(&mut h).pointer("/page/origin").and_then(Value::as_array).cloned().unwrap_or_default();
-    let ox = origin.first().and_then(Value::as_f64).unwrap_or(0.0);
-    let oy = origin.get(1).and_then(Value::as_f64).unwrap_or(0.0);
-    // Send one native double-click gesture. The single-click selection path is covered by the
-    // picture-selection test; keeping this test to one gesture avoids coupling two separate
-    // gestures to the runner's frame timing.
-    ask(&mut h, "ui.click", json!({"x": ox + 60.0, "y": oy + 40.0, "count": 2})).expect("double click card");
+    // The stored link makes this a compact inline icon. Click its rendered hit target.
+    let icon_center = rendered_picture_rect(&h, 0).center();
+    ask(&mut h, "ui.click", json!({"x": icon_center.x, "y": icon_center.y, "count": 2})).expect("double click card");
     for _ in 0..6 {
         pump(&mut h);
     }
