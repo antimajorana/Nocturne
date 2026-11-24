@@ -215,10 +215,33 @@ pub(crate) fn save_manifest(path: &Path, target_key: &str, entries: &BTreeMap<St
         "files": files,
     });
     let text = serde_json::to_string_pretty(&doc).map_err(|e| SyncError::Io(e.to_string()))?;
-    let tmp = path.with_extension("tmp-write");
-    std::fs::write(&tmp, text.as_bytes()).map_err(|e| SyncError::Io(format!("write {}: {e}", tmp.display())))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        SyncError::Io(format!("rename {}: {e}", path.display()))
-    })
+    nocturne_store::page::write_atomic(path, &text).map_err(|e| SyncError::Io(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saving_a_manifest_preserves_an_existing_sibling_with_the_same_stem() {
+        let t = nocturne_store::testing::TempDir::new("sync-manifest-save");
+        let path = t.path().join(MANIFEST_FILE);
+        let sibling = path.with_extension("tmp-write");
+        std::fs::write(&sibling, "sibling file").expect("save a sibling file");
+        let entries = BTreeMap::from([(
+            "notebook/note/index.md".to_string(),
+            ManifestEntry {
+                local_sha256: "sha256".to_string(),
+                local_size: 123,
+                remote_id: 7,
+                remote_fingerprint: "fingerprint".to_string(),
+                synced_unix_secs: 456,
+            },
+        )]);
+
+        save_manifest(&path, "target", &entries).expect("save manifest");
+
+        assert_eq!(load_manifest(&path, "target"), entries);
+        assert_eq!(std::fs::read_to_string(sibling).expect("sibling file retained"), "sibling file");
+    }
 }

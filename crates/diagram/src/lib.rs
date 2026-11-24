@@ -176,12 +176,24 @@ fn web_limit_error(source: &str) -> Option<String> {
     if source.chars().count() > WEB_MAX_SOURCE_CHARS || source.lines().count() > WEB_MAX_LINES {
         return Some(format!("This diagram is too large to draw in the browser (up to {WEB_MAX_SOURCE_CHARS} characters and {WEB_MAX_LINES} lines)"));
     }
-    let relationships = ["-->", "---", "==>", "===", "-.->", "-.-", "->>", "-->>", "<--", "<<-", "--o", "--x"]
-        .iter()
-        .map(|arrow| source.matches(arrow).count())
-        .sum::<usize>();
-    (relationships > WEB_MAX_RELATIONSHIPS)
-        .then(|| format!("This diagram has more than {WEB_MAX_RELATIONSHIPS} relationships, which is as much as the browser draws at once"))
+    // Consume the longest arrow first so a sequence reply such as `-->>` counts once.
+    const ARROWS: &[&[u8]] = &[b"-->>", b"-.->", b"-->", b"---", b"==>", b"===", b"-.-", b"->>", b"<--", b"<<-", b"--o", b"--x"];
+    let mut rest = source.as_bytes();
+    let mut relationships = 0;
+    while !rest.is_empty() {
+        if let Some(arrow) = ARROWS.iter().find(|arrow| rest.starts_with(arrow)) {
+            relationships += 1;
+            if relationships > WEB_MAX_RELATIONSHIPS {
+                return Some(format!(
+                    "This diagram has more than {WEB_MAX_RELATIONSHIPS} relationships, which is as much as the browser draws at once"
+                ));
+            }
+            rest = &rest[arrow.len()..];
+        } else {
+            rest = &rest[1..];
+        }
+    }
+    None
 }
 
 /// Every Mermaid diagram in a page's text, in the order they come, as their source.
@@ -438,5 +450,12 @@ mod tests {
         assert!(web_limit_error(&many_relationships).is_some_and(|e| e.contains("relationships")));
         assert!(web_limit_error(&"x".repeat(WEB_MAX_SOURCE_CHARS + 1)).is_some_and(|e| e.contains("too large")));
         assert!(web_limit_error("flowchart TD\n A --> B").is_none());
+    }
+
+    #[test]
+    fn browser_limits_count_each_sequence_reply_once() {
+        let replies = "sequenceDiagram\n".to_string() + &"B-->>A: Saved\n".repeat(40);
+        assert!(web_limit_error(&replies).is_none());
+        assert!(draw(&replies, &Palette::default()).is_ok_and(|svg| svg.contains("Saved")));
     }
 }

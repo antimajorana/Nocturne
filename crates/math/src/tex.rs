@@ -180,13 +180,14 @@ fn via_ratex(tex: &str, size: f32, display: bool, m: &dyn Metrics) -> Option<Typ
                     None => {
                         let ch = char::from_u32(*char_code).unwrap_or('\u{fffd}');
                         let (px, py, fs) = ((x * em) as f32, (y * em) as f32, (scale * em) as f32);
+                        let color = rgba(color);
                         match run.as_mut() {
-                            Some(r) if r.continues(px, py, fs) => r.push(ch, px),
+                            Some(r) if r.continues(px, py, fs, color) => r.push(ch, px),
                             _ => {
                                 if let Some(done) = run.take() {
                                     shapes.push(done.finish());
                                 }
-                                run = Some(Run { x: px, y: py, size: fs, text: ch.to_string(), last_x: px, color: rgba(color) });
+                                run = Some(Run { x: px, y: py, size: fs, text: ch.to_string(), last_x: px, color });
                             }
                         }
                     }
@@ -262,8 +263,12 @@ struct Run {
 }
 
 impl Run {
-    fn continues(&self, x: f32, y: f32, size: f32) -> bool {
-        (y - self.y).abs() < 0.01 * self.size.max(1.0) && (size - self.size).abs() < 0.01 && x > self.last_x - 0.01 && x - self.last_x < 1.6 * size
+    fn continues(&self, x: f32, y: f32, size: f32, color: Option<Rgba>) -> bool {
+        self.color == color
+            && (y - self.y).abs() < 0.01 * self.size.max(1.0)
+            && (size - self.size).abs() < 0.01
+            && x > self.last_x - 0.01
+            && x - self.last_x < 1.6 * size
     }
 
     fn push(&mut self, ch: char, x: f32) {
@@ -433,6 +438,21 @@ mod tests {
             _ => None,
         });
         assert_eq!(run, Some("المعادلة"), "the Arabic is one run, in its own order: {:?}", t.shapes);
+    }
+
+    #[test]
+    fn fallback_letters_keep_their_individual_colours() {
+        let t = set(r"\textcolor{red}{\text{甲}}\textcolor{blue}{\text{乙}}");
+        assert_eq!(t.engine, Engine::Ratex);
+        let runs: Vec<_> = t
+            .shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                Shape::Text { text, color, .. } => Some((text.as_str(), *color)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(runs, [("甲", Some([255, 0, 0, 255])), ("乙", Some([0, 0, 255, 255]))]);
     }
 
     #[test]

@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 
 pub const NOTEBOOK_NAME: &str = "welcome-to-nocturne";
 
+const LANGUAGE_FOLDERS: [&str; 13] =
+    ["10-en", "11-es", "12-fr", "13-de", "14-hi", "15-ru", "16-zh", "17-ja", "18-ko", "20-ar", "21-fa", "22-ur", "23-he"];
+
 /// Finds the separate notebook folder beside the setup app on a mounted macOS DMG.
 pub fn macos_dmg_payload(executable: &Path) -> Option<PathBuf> {
     let dmg_root = executable.parent()?.ancestors().nth(3)?;
@@ -17,9 +20,12 @@ pub fn macos_dmg_payload(executable: &Path) -> Option<PathBuf> {
 pub fn install_edition(payload: &Path, notebooks_root: &Path, format: &str) -> io::Result<PathBuf> {
     validate_edition(payload, format)?;
     let destination = notebooks_root.join(NOTEBOOK_NAME);
-    if std::fs::symlink_metadata(&destination).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to replace a symbolic link at the Welcome notebook path"));
-    }
+    let had_previous = match std::fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.is_dir() => true,
+        Ok(_) => return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to replace a non-directory at the Welcome notebook path")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
     fs_create_dir_all(notebooks_root)?;
     let staging = notebooks_root.join(format!(".{NOTEBOOK_NAME}-installing-{}", unique_suffix()));
     let backup = notebooks_root.join(format!(".{NOTEBOOK_NAME}-backup-{}", unique_suffix()));
@@ -28,15 +34,18 @@ pub fn install_edition(payload: &Path, notebooks_root: &Path, format: &str) -> i
         remove_tree_if_present(&staging);
         return Err(error);
     }
-    let had_previous = destination.exists();
-    if had_previous {
-        fs_rename(&destination, &backup)?;
+    if had_previous && let Err(error) = fs_rename(&destination, &backup) {
+        remove_tree_if_present(&staging);
+        return Err(error);
     }
     if let Err(error) = fs_rename(&staging, &destination) {
-        if had_previous {
-            let _ = fs_rename(&backup, &destination);
-        }
         remove_tree_if_present(&staging);
+        if had_previous && let Err(restore) = fs_rename(&backup, &destination) {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("could not install the Welcome notebook ({error}) or restore it ({restore}); previous copy is at {}", backup.display()),
+            ));
+        }
         return Err(error);
     }
     remove_tree_if_present(&backup);
@@ -61,23 +70,13 @@ fn validate_edition(payload: &Path, format: &str) -> io::Result<()> {
             ));
         }
     }
-    let language_count = std::fs::read_dir(&format_root)?
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                return false;
-            }
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { return false };
-            let Some((number, language)) = name.split_once('-') else { return false };
-            matches!(number.parse::<u8>(), Ok(10..=23)) && language.len() == 2 && language.bytes().all(|byte| byte.is_ascii_lowercase())
-        })
-        .count();
-    if language_count != 13 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("the {format} User Assistance notebook has {language_count} language folders; expected 13"),
-        ));
+    for language in LANGUAGE_FOLDERS {
+        if !std::fs::symlink_metadata(format_root.join(language)).is_ok_and(|metadata| metadata.is_dir()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the User Assistance payload is incomplete: missing language folder {format}/{language}"),
+            ));
+        }
     }
     Ok(())
 }
@@ -250,10 +249,22 @@ mod tests {
         let destination = notebooks.join(NOTEBOOK_NAME);
         fs::create_dir_all(&destination).expect("create current demo");
         fs::write(destination.join("keep.txt"), "current").expect("write current demo");
-        fs::remove_dir_all(source.join("html/23-he")).expect("remove one generated language");
+        fs::rename(source.join("html/23-he"), source.join("html/23-xx")).expect("substitute an unrelated folder");
 
         assert_eq!(install_edition(&source, &notebooks, "html").expect_err("reject incomplete languages").kind(), io::ErrorKind::InvalidData);
         assert_eq!(fs::read(destination.join("keep.txt")).expect("current demo"), b"current");
+    }
+
+    #[test]
+    fn an_existing_file_at_the_notebook_path_is_left_in_place() {
+        let (_temp, source, notebooks) = fixture();
+        fs::create_dir_all(&notebooks).expect("create notebooks folder");
+        let destination = notebooks.join(NOTEBOOK_NAME);
+        fs::write(&destination, "keep this file").expect("create existing file");
+
+        assert_eq!(install_edition(&source, &notebooks, "html").expect_err("reject non-directory destination").kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read(&destination).expect("original still in place"), b"keep this file");
+        assert_eq!(fs::read_dir(&notebooks).expect("read notebooks folder").count(), 1);
     }
 
     #[test]

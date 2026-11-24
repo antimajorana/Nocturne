@@ -13,7 +13,7 @@ use crate::floating::{self, Glyph};
 use crate::icons::Icon;
 use crate::ribbon_icons::Mark;
 use crate::theme::Tokens;
-use egui::{Sense, Ui, vec2};
+use egui::{Key, KeyboardShortcut, Modifiers, Sense, Ui, os::OperatingSystem, vec2};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -35,12 +35,15 @@ impl Command {
         }
     }
 
-    pub fn tip(self) -> &'static str {
+    pub(crate) fn shortcut(self, os: OperatingSystem) -> KeyboardShortcut {
         match self {
-            Command::Back => "Back to the page before (Alt+Left)",
-            Command::Forward => "Forward to the page after (Alt+Right)",
-            Command::Undo => "Undo (Ctrl+Z)",
-            Command::Redo => "Redo (Ctrl+Y)",
+            Command::Back if os.is_mac() => KeyboardShortcut::new(Modifiers::COMMAND, Key::OpenBracket),
+            Command::Forward if os.is_mac() => KeyboardShortcut::new(Modifiers::COMMAND, Key::CloseBracket),
+            Command::Back => KeyboardShortcut::new(Modifiers::ALT, Key::ArrowLeft),
+            Command::Forward => KeyboardShortcut::new(Modifiers::ALT, Key::ArrowRight),
+            Command::Undo => KeyboardShortcut::new(Modifiers::COMMAND, Key::Z),
+            Command::Redo if os.is_mac() => KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z),
+            Command::Redo => KeyboardShortcut::new(Modifiers::COMMAND, Key::Y),
         }
     }
 
@@ -200,8 +203,9 @@ fn button(ui: &mut Ui, cmd: Command, enabled: bool, t: &Tokens) -> egui::Respons
     faint.accent = t.disabled;
     cmd.glyph().paint(&painter, egui::Rect::from_center_size(rect.center(), vec2(16.0, 16.0)), if enabled { t } else { &faint });
     let name = crate::tl!(cmd.label()).to_string();
+    let tip = format!("{name} ({})", ui.ctx().format_shortcut(&cmd.shortcut(ui.ctx().os())));
     resp.widget_info(move || egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, name.clone()));
-    resp.on_hover_text(crate::tl!(cmd.tip()))
+    resp.on_hover_text(tip)
 }
 
 /// The small arrow at the end of the strip, drawn as a triangle pointing down.
@@ -255,11 +259,10 @@ mod tests {
     }
 
     #[test]
-    fn every_command_has_a_name_a_tip_and_its_own_setting() {
+    fn every_command_has_a_name_and_its_own_setting() {
         let labels: std::collections::HashSet<&str> = Command::ALL.iter().map(|c| c.label()).collect();
         let keys: std::collections::HashSet<&str> = Command::ALL.iter().map(|c| c.key()).collect();
         assert_eq!((labels.len(), keys.len()), (4, 4));
-        assert!(Command::ALL.iter().all(|c| !c.tip().is_empty()));
         let on = Enabled { back: true, forward: false, undo: true, redo: false };
         assert!(on.of(Command::Back) && !on.of(Command::Forward) && on.of(Command::Undo) && !on.of(Command::Redo));
     }

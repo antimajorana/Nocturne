@@ -198,7 +198,7 @@ cargo test test_icon_round_trip -- --exact
 
 ### Linting and Formatting
 
-**Format check (pre-commit runs this):**
+**Format check:**
 ```bash
 cargo fmt --all -- --check
 ```
@@ -213,7 +213,7 @@ cargo fmt --all
 cargo clippy --workspace
 ```
 
-**Full pre-commit gate (before you commit):**
+**Full local quality gate:**
 ```bash
 cargo xtask ci
 ```
@@ -236,15 +236,15 @@ cargo xtask ci
 
 ## Quality Levels
 
-Each level includes the ones before it. The hooks run L1 and L2 for you once
-`git config core.hooksPath .githooks` is set (the setup script does it); GitHub PR
-CI runs L3; L4 is the release signoff and delivery process.
+Each level includes the ones before it. The setup script enables the fast Git
+hooks. Run the remaining L1 and L2 checks locally. GitHub PR CI runs L3 and L4
+covers release signoff and delivery.
 
 | Level | When | What runs | Where | Time |
 |---|---|---|---|---|
 | **L0** | After each task | `cargo fmt`, then clippy and the tests of the crates you changed: `cargo clippy -p <crate> --all-targets -- -D warnings`, `cargo test -p <crate>` | by hand | seconds |
-| **L1** | Before a commit | `cargo xtask check-branch`: not on `main`; a branch name starting `feat/ fix/ docs/ test/ chore/ refactor/ perf/ ci/ build/ release/` (a warning otherwise); nothing from `local/`, `target/`, `my-notebooks/` or a `.log` staged; no staged file over 10 MB; a warning when behind `origin/main`. Then PII, fmt, layers, assets, docs links and text. The message: `type(scope): what`, at most 72 characters | `.githooks/pre-commit`, `.githooks/commit-msg` | under 5 s |
-| **L2** | Before a push | `cargo xtask check-branch --push`: fetches `main`; being behind `origin/main` stops the push, while merge commits are allowed to preserve integration provenance. Then PII against `origin/main` and the full `cargo xtask ci` (fmt, clippy `-D warnings`, every test, layers, assets, docs, text, demo check) | `.githooks/pre-push` | 2 to 4 min |
+| **L1** | Before a commit | The hooks block direct commits to `main` and staged scratch paths, scan staged content for PII, and check the commit subject. Run `cargo xtask check-branch` locally for branch naming, branch freshness, and additional staged-file checks. | `.githooks/pre-commit`, `.githooks/commit-msg`, local command | seconds |
+| **L2** | Before a push | The hook scans outgoing files for PII. Run `cargo xtask check-branch --push` locally to fetch `main` and check branch freshness, and `cargo xtask ci` for the full quality gate. | `.githooks/pre-push`, local commands | minutes |
 | **L3** | Pull request | Code quality and cross-platform source validation: split fmt, clippy, static checks, demo checks, tests, and non-blocking coverage, plus build/test jobs for Linux, Windows, and macOS. No installers or publishing. | `.github/workflows/ci.yml`, `.github/pull_request_template.md` | CI |
 | **L4** | Release | Release signoff, packaging, installer validation, release notes, and deployment approval. Packaging and deployment are separate workflow concerns; neither is a shortcut around L3. | `.github/workflows/packaging.yml`, `.github/workflows/release.yml`, `docs/releasing.md` | release/manual |
 
@@ -426,13 +426,10 @@ Hooks are in `.githooks/` and run automatically after `git config core.hooksPath
 
 ### Pre-commit Hook (runs every commit)
 **File:** `.githooks/pre-commit`  
-**Speed:** ~2 seconds  
 **Checks:**
-- `cargo fmt --check` (code style)
-- `cargo xtask layers` (crate boundaries)
-- `cargo xtask assets` (scans `assets/`, non-blocking for `ATTRIBUTION.md` rows)
-- `cargo xtask docs` (link validity)
-- `cargo xtask text` (plain ASCII, no fancy quotes)
+- Blocks direct commits to `main`
+- Blocks staged scratch paths under `local/`, `target/`, and `my-notebooks/`
+- Scans staged file contents for PII
 
 **If it blocks:**
 - Fix the issue and re-stage the files
@@ -440,9 +437,8 @@ Hooks are in `.githooks/` and run automatically after `git config core.hooksPath
 
 ### Pre-push Hook (runs before push to remote)
 **File:** `.githooks/pre-push`  
-**Speed:** ~few minutes  
 **Checks:**
-- Full `cargo xtask ci` (all gates: build, test, lint, layers, text, etc.)
+- Scans changed files at the outgoing commit against the remote commit. For a new ref or an unavailable remote commit, it scans the outgoing tree.
 
 **If it blocks:**
 - Fix the issue locally and test: `cargo xtask ci`
@@ -460,9 +456,9 @@ Hooks are in `.githooks/` and run automatically after `git config core.hooksPath
 - Run: `cargo build -p xtask`
 - Xtask is a dev helper built on first use
 
-### Pre-commit hook blocks on unrelated files
-- Run `cargo xtask text` to see which files have issues
-- Fix them, or use `git commit --no-verify` if they're pre-existing
+### Pre-commit hook reports PII
+- Inspect the staged version of the flagged file with `git diff --cached -- <path>`.
+- Fix the staged content and rerun the hook.
 
 ### Slow build times
 - Debug builds are optimized for speed; release builds take longer

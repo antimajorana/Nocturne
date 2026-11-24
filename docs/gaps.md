@@ -535,13 +535,15 @@ imports shared documents placed in `Documents/Inbox/` (Share > Nocturne), and re
 - **The Quick Access Toolbar is part of OneNote's.** It has Back, Forward, Undo and Redo, a menu to
   choose which show, to put it under the ribbon or to hide it, and the choices are kept. OneNote's
   menu also lists Print, Print Preview, Touch/Mouse Mode and More Commands: none exist here, so they
-  are not listed. Back and Forward are also Alt+Left and Alt+Right and the mouse's side buttons.
+  are not listed. The mouse's side buttons go back and forward. The keyboard shortcuts are
+  `Alt+Left` and `Alt+Right` on Windows and Linux, and `Cmd+[` and `Cmd+]` on macOS.
   Ctrl+Page Up and Ctrl+Page Down open the page above or below in the page list, subpages included
   when their page is expanded, and stop at the first and last page. Undo
-  covers the page's words and boxes (a typing burst is one step); ink keeps its own undo and redo
-  (`Undo stroke` and `Redo stroke`), and Ctrl+Z / Ctrl+Y step whichever changed most recently.
-  In a text box Ctrl+Z is still the text box's own. When the
-  strip is hidden a small arrow stays, so it can be brought back: OneNote hides it completely.
+  covers the page's words and boxes (a typing burst is one step). Ink keeps its own undo and redo
+  (`Undo stroke` and `Redo stroke`). `Ctrl+Z` and `Ctrl+Y` (`Cmd+Z` and `Cmd+Shift+Z` on macOS)
+  step whichever changed most recently. The title field, search, and page source have their own
+  undo and redo while they have keyboard focus. When the strip is hidden a small arrow stays to
+  bring it back.
 - **The mini toolbar and docked mobile formatting bar.** `crates/ui-egui/src/floating.rs` draws
   floating menus and the mini toolbar with `>= 36pt` touch targets when touch/stylus interaction
   is active; on right-click or touch long-press on text, it floats over the page's text menu

@@ -1,6 +1,6 @@
 //! End-to-end integration tests for kDrive free-tier REST sync against a real loopback TCP HTTP server.
 
-use nocturne_engine::sync::{SyncConfig, apply_staged_sync, is_excluded_rel_path, sha256_bytes, stage_sync};
+use nocturne_engine::sync::{SyncConfig, SyncError, apply_staged_sync, is_excluded_rel_path, sha256_bytes, stage_sync};
 use nocturne_engine::{Output, Params, Session};
 use nocturne_store::Settings;
 use nocturne_store::testing::TempDir;
@@ -694,10 +694,8 @@ fn invalid_token_and_local_root_change_and_delete_vs_modify_behave_safely() {
         .expect("remote conflict copy must survive mid-pass failure");
     assert_eq!(std::fs::read_to_string(preserved_conflict.path()).expect("read conflict"), "alpha-remote-h1");
     let stage_parent = s.root().join(".nocturne-sync-stage");
-    let leftover_runs = std::fs::read_dir(&stage_parent)
-        .map(|rd| rd.filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().starts_with("run-")).count())
-        .unwrap_or(0);
-    assert_eq!(leftover_runs, 0, "failed stage_sync must clean up its run-* staging directory");
+    let leftover_runs = std::fs::read_dir(&stage_parent).map(|rd| rd.filter_map(Result::ok).filter(|e| e.path().is_dir()).count()).unwrap_or(0);
+    assert_eq!(leftover_runs, 0, "failed stage_sync must clean up its staging directory");
 
     assert!(s.run("sync.configure", &params(&[("endpoint", "http://localhost.evil.example"), ("token", "good-token")])).is_ok());
     assert!(s.run("sync.now", &params(&[])).is_err(), "http://localhost.evil.example must be rejected");
@@ -985,7 +983,7 @@ fn repeated_conflicts_in_same_second_do_not_overwrite_earlier_conflict_copy_and_
     assert!(conflict_contents.iter().any(|c| c == "remote-1"));
     assert!(conflict_contents.iter().any(|c| c == "remote-2"));
 
-    // Dropping an unapplied StagedSync cleans up its run-* staging directory.
+    // Dropping an unapplied StagedSync cleans up its staging directory.
     {
         let mut st = srv.state.lock().expect("lock");
         let dir_id = st.ensure_dir_chain_under_private("The Oracle/Nocturne/notes");
@@ -995,7 +993,41 @@ fn repeated_conflicts_in_same_second_do_not_overwrite_earlier_conflict_copy_and_
     let staged = stage_sync(s.root(), &s.settings, &cfg, s.sync_http().as_ref(), s.sync_secrets().as_ref(), None).expect("stage");
     drop(staged);
     let leftovers = std::fs::read_dir(s.root().join(".nocturne-sync-stage"))
-        .map(|rd| rd.filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().starts_with("run-")).count())
+        .map(|rd| rd.filter_map(Result::ok).filter(|e| e.path().is_dir()).count())
         .unwrap_or(0);
     assert_eq!(leftovers, 0, "dropping StagedSync must clean up stage_dir");
+}
+
+#[test]
+fn a_staged_sync_holds_its_notebook_roots_lock_until_apply_or_drop() {
+    let srv = LoopbackServer::start("tok-stage-lock", 918);
+    let tmp = TempDir::new("sync-stage-lock");
+    let mut s = Session::new(&tmp.path().join("nb"), Settings::at(tmp.path().join("cfg/s.toml"))).expect("session");
+    s.run("sync.configure", &params(&[("endpoint", &srv.endpoint), ("drive_id", "918"), ("token", "tok-stage-lock")])).expect("configure");
+    {
+        let mut remote = srv.state.lock().expect("server lock");
+        let dir_id = remote.ensure_dir_chain_under_private("The Oracle/Nocturne/notes");
+        remote.put_file(dir_id, "doc.md", b"remote revision", 1_702_000_000);
+    }
+    let parent = s.root().join(".nocturne-sync-stage");
+    let legacy_stage = parent.join("run-1702000000-0-1");
+    let interrupted_stage = parent.join("locked-run-00000000000000000001");
+    std::fs::create_dir_all(&legacy_stage).expect("legacy staging directory");
+    std::fs::create_dir_all(&interrupted_stage).expect("interrupted staging directory");
+
+    let cfg = SyncConfig::load(&s.settings);
+    let sync = |root: &std::path::Path| stage_sync(root, &s.settings, &cfg, s.sync_http().as_ref(), s.sync_secrets().as_ref(), None);
+    let first = sync(s.root()).expect("stage first download");
+    assert_eq!(first.touched_local_paths(), ["notes/doc.md"]);
+    assert!(!interrupted_stage.exists(), "previous interrupted lock-owning run is reclaimed");
+    assert!(legacy_stage.is_dir(), "a run from an older app may still be active");
+    assert!(matches!(sync(s.root()), Err(SyncError::SafetyRefused(_))));
+    drop(sync(&tmp.path().join("other-notebooks")).expect("a different root can sync"));
+
+    let report = apply_staged_sync(first, &s.settings).expect("apply first download");
+    assert_eq!(report.downloaded, ["notes/doc.md"]);
+    assert_eq!(std::fs::read(s.root().join("notes/doc.md")).expect("download survived"), b"remote revision");
+    let second = sync(s.root()).expect("apply released the lock");
+    drop(second);
+    drop(sync(s.root()).expect("dropping an unapplied stage released the lock"));
 }

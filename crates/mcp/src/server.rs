@@ -57,16 +57,25 @@ pub fn handle_line(backend: &mut dyn Backend, line: &str) -> Option<String> {
 
 /// Answers one request object. `None` for a notification, which gets no reply.
 fn handle(backend: &mut dyn Backend, req: &Value) -> Option<Value> {
-    let id = req.get("id").cloned();
+    if req.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Some(error_reply(&Value::Null, INVALID_REQUEST, "a request needs jsonrpc version 2.0"));
+    }
     let Some(method) = req.get("method").and_then(Value::as_str) else {
-        return Some(error_reply(&id.unwrap_or(Value::Null), INVALID_REQUEST, "a request needs a method"));
+        return Some(error_reply(&Value::Null, INVALID_REQUEST, "a request needs a method"));
     };
     // A notification has no id, so it gets no reply, not even for an unknown method.
-    let id = id?;
-    let params = req.get("params").cloned().unwrap_or(json!({}));
-    Some(match request(backend, method, &params) {
+    let id = req.get("id")?;
+    if !(id.is_string() || id.is_i64() || id.is_u64()) {
+        return Some(error_reply(&Value::Null, INVALID_REQUEST, "a request id must be a string or an integer"));
+    }
+    let empty = json!({});
+    let params = req.get("params").unwrap_or(&empty);
+    if !params.is_object() {
+        return Some(error_reply(id, INVALID_PARAMS, "request params must be an object"));
+    }
+    Some(match request(backend, method, params) {
         Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-        Err((code, message)) => error_reply(&id, code, &message),
+        Err((code, message)) => error_reply(id, code, &message),
     })
 }
 
@@ -106,8 +115,8 @@ fn request(backend: &mut dyn Backend, method: &str, params: &Value) -> Result<Va
         "resources/templates/list" => Ok(json!({"resourceTemplates": tools::resource_templates()})),
         "resources/read" => {
             let uri = params.get("uri").and_then(Value::as_str).ok_or((INVALID_PARAMS, "a resource read needs a uri".to_string()))?;
-            let text = tools::read_resource(backend, uri).map_err(|e| (RESOURCE_NOT_FOUND, e))?;
-            Ok(json!({"contents": [{"uri": uri, "mimeType": "text/plain", "text": text}]}))
+            let (mime_type, text) = tools::read_resource(backend, uri).map_err(|e| (RESOURCE_NOT_FOUND, e))?;
+            Ok(json!({"contents": [{"uri": uri, "mimeType": mime_type, "text": text}]}))
         }
         other => Err((METHOD_NOT_FOUND, format!("this server does not have a method '{other}'"))),
     }
@@ -152,12 +161,13 @@ mod tests {
         assert!(instructions.contains("no window is running"), "{instructions}");
 
         // An older client is answered in its own revision; an unknown one in ours.
-        let older = ask(&mut b, &json!({"id": 2, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}}).to_string());
+        let older = ask(&mut b, &json!({"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}}).to_string());
         assert_eq!(older.pointer("/result/protocolVersion").and_then(Value::as_str), Some("2024-11-05"));
-        let future = ask(&mut b, &json!({"id": 3, "method": "initialize", "params": {"protocolVersion": "3000-01-01"}}).to_string());
+        let future =
+            ask(&mut b, &json!({"jsonrpc": "2.0", "id": 3, "method": "initialize", "params": {"protocolVersion": "3000-01-01"}}).to_string());
         assert_eq!(future.pointer("/result/protocolVersion").and_then(Value::as_str), Some(PROTOCOL_VERSION));
 
-        assert_eq!(ask(&mut b, &json!({"id": 4, "method": "ping"}).to_string()).pointer("/result"), Some(&json!({})));
+        assert_eq!(ask(&mut b, &json!({"jsonrpc": "2.0", "id": 4, "method": "ping"}).to_string()).pointer("/result"), Some(&json!({})));
     }
 
     #[test]
@@ -167,16 +177,36 @@ mod tests {
         assert!(handle_line(&mut b, "   ").is_none());
         let junk = ask(&mut b, "{not json");
         assert_eq!(junk.pointer("/error/code").and_then(Value::as_i64), Some(PARSE_ERROR));
-        let no_method = ask(&mut b, &json!({"id": 1}).to_string());
+        let no_method = ask(&mut b, &json!({"jsonrpc": "2.0", "id": 1}).to_string());
         assert_eq!(no_method.pointer("/error/code").and_then(Value::as_i64), Some(INVALID_REQUEST));
-        let unknown = ask(&mut b, &json!({"id": 2, "method": "nope"}).to_string());
+        let unknown = ask(&mut b, &json!({"jsonrpc": "2.0", "id": 2, "method": "nope"}).to_string());
         assert_eq!(unknown.pointer("/error/code").and_then(Value::as_i64), Some(METHOD_NOT_FOUND));
+    }
+
+    #[test]
+    fn invalid_request_envelopes_are_rejected() {
+        let (_t, mut b) = backend("mcp-invalid-envelope");
+        for request in [
+            json!({"id": 1, "method": "ping"}),
+            json!({"jsonrpc": "1.0", "id": 1, "method": "ping"}),
+            json!({"jsonrpc": "2.0", "id": null, "method": "ping"}),
+            json!({"jsonrpc": "2.0", "id": 1.5, "method": "ping"}),
+            json!({"jsonrpc": "2.0", "id": [], "method": "ping"}),
+        ] {
+            let response = ask(&mut b, &request.to_string());
+            assert_eq!(response["error"]["code"], INVALID_REQUEST, "{request}");
+            assert_eq!(response.get("id"), Some(&Value::Null));
+        }
+        let request = json!({"jsonrpc": "2.0", "id": "bad-params", "method": "ping", "params": [1]});
+        let response = ask(&mut b, &request.to_string());
+        assert_eq!(response["error"]["code"], INVALID_PARAMS);
+        assert_eq!(response["id"], "bad-params");
     }
 
     #[test]
     fn the_tools_are_listed_with_schemas() {
         let (_t, mut b) = backend("mcp-server3");
-        let r = ask(&mut b, &json!({"id": 1, "method": "tools/list"}).to_string());
+        let r = ask(&mut b, &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string());
         let list = r.pointer("/result/tools").and_then(Value::as_array).cloned().unwrap_or_default();
         assert!(list.len() >= 9, "{} tools", list.len());
         for t in &list {
@@ -186,6 +216,8 @@ mod tests {
         }
         let names: Vec<&str> = list.iter().filter_map(|t| t.get("name").and_then(Value::as_str)).collect();
         assert!(names.contains(&"tree") && names.contains(&"execute") && names.contains(&"write_page"));
+        let write = list.iter().find(|t| t["name"] == "write_page").expect("write_page tool");
+        assert_eq!(write["annotations"]["destructiveHint"], true);
         // Without a window, the window-only tools are not offered.
         assert!(!names.contains(&"inspect"), "{names:?}");
     }
@@ -233,10 +265,30 @@ mod tests {
     }
 
     #[test]
+    fn malformed_page_body_does_not_replace_existing_notes() {
+        let (_t, mut b) = backend("mcp-invalid-body");
+        let made = call(&mut b, 1, "new_notebook", json!({"name": "Work", "format": "cmgfm"}));
+        assert_eq!(made["result"]["isError"], false);
+        let path = "work/new-section-1/untitled-page";
+        let written = call(&mut b, 2, "write_page", json!({"path": path, "body": "Original notes"}));
+        assert_eq!(written["result"]["isError"], false);
+        let before = text_of(&call(&mut b, 3, "read_page", json!({"path": path})));
+        assert!(before.contains("Original notes"), "{before}");
+
+        for (id, body) in [(4, Value::Null), (5, json!({"text": "Replace it"}))] {
+            let reply = call(&mut b, id, "write_page", json!({"path": path, "body": body}));
+            assert_eq!(reply["result"]["isError"], true);
+            assert!(text_of(&reply).contains("body"), "{reply}");
+        }
+        let after = text_of(&call(&mut b, 6, "read_page", json!({"path": path})));
+        assert_eq!(after, before);
+    }
+
+    #[test]
     fn the_resources_are_the_tree_and_the_commands() {
         let (_t, mut b) = backend("mcp-server6");
         call(&mut b, 1, "new_notebook", json!({"name": "Work"}));
-        let list = ask(&mut b, &json!({"id": 2, "method": "resources/list"}).to_string());
+        let list = ask(&mut b, &json!({"jsonrpc": "2.0", "id": 2, "method": "resources/list"}).to_string());
         let uris: Vec<String> = list
             .pointer("/result/resources")
             .and_then(Value::as_array)
@@ -244,19 +296,31 @@ mod tests {
             .unwrap_or_default();
         assert!(uris.contains(&"nocturne://tree".to_string()) && uris.contains(&"nocturne://commands".to_string()), "{uris:?}");
 
-        let read = ask(&mut b, &json!({"id": 3, "method": "resources/read", "params": {"uri": "nocturne://tree"}}).to_string());
+        let read = ask(&mut b, &json!({"jsonrpc": "2.0", "id": 3, "method": "resources/read", "params": {"uri": "nocturne://tree"}}).to_string());
         assert!(read.pointer("/result/contents/0/text").and_then(Value::as_str).is_some_and(|t| t.contains("Work")));
+        let commands =
+            ask(&mut b, &json!({"jsonrpc": "2.0", "id": 7, "method": "resources/read", "params": {"uri": "nocturne://commands"}}).to_string());
+        assert_eq!(commands.pointer("/result/contents/0/mimeType").and_then(Value::as_str), Some("application/json"));
+        let registry = commands.pointer("/result/contents/0/text").and_then(Value::as_str).expect("registry content");
+        assert!(serde_json::from_str::<Value>(registry).expect("registry JSON").is_array());
 
         let page = ask(
             &mut b,
-            &json!({"id": 4, "method": "resources/read", "params": {"uri": "nocturne://page/work/new-section-1/untitled-page"}}).to_string(),
+            &json!({"jsonrpc": "2.0", "id": 4, "method": "resources/read", "params": {"uri": "nocturne://page/work/new-section-1/untitled-page"}})
+                .to_string(),
         );
         assert!(page.pointer("/result/contents/0/text").is_some(), "{page}");
+        let encoded = ask(
+            &mut b,
+            &json!({"jsonrpc": "2.0", "id": 8, "method": "resources/read", "params": {"uri": "nocturne://page/work%2Fnew-section-1%2Funtitled-page"}})
+                .to_string(),
+        );
+        assert_eq!(encoded.pointer("/result/contents/0/text"), page.pointer("/result/contents/0/text"));
 
-        let missing = ask(&mut b, &json!({"id": 5, "method": "resources/read", "params": {"uri": "nocturne://nope"}}).to_string());
+        let missing = ask(&mut b, &json!({"jsonrpc": "2.0", "id": 5, "method": "resources/read", "params": {"uri": "nocturne://nope"}}).to_string());
         assert_eq!(missing.pointer("/error/code").and_then(Value::as_i64), Some(RESOURCE_NOT_FOUND));
 
-        let templates = ask(&mut b, &json!({"id": 6, "method": "resources/templates/list"}).to_string());
+        let templates = ask(&mut b, &json!({"jsonrpc": "2.0", "id": 6, "method": "resources/templates/list"}).to_string());
         assert!(templates.pointer("/result/resourceTemplates/0/uriTemplate").and_then(Value::as_str).is_some_and(|u| u.contains("{")));
     }
 

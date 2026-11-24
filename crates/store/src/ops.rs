@@ -1,7 +1,7 @@
 //! Creating, renaming and deleting nodes.
 
 use crate::error::{Result, StoreError};
-use crate::page::write_atomic;
+use crate::page::{with_id, write_atomic};
 use crate::settings::{FormatSource, Settings};
 use crate::tree::{self, child_dirs, page_file, read_node};
 use nocturne_formats::{frontmatter, html, templates};
@@ -230,22 +230,24 @@ pub fn move_node(path: &Path, dest: &Path) -> Result<PathBuf> {
     }
     let order = next_order(&dest);
     let target = unique_child(&dest, &tree::folder_name(&path));
-    if fs::rename(&path, &target).is_err() {
-        // Another drive, for a notebook opened from elsewhere: copied over, then the old one
-        // taken away once the copy is whole.
-        copy_and_remove_tree(&path, &target)?;
+    match fs::rename(&path, &target) {
+        Ok(()) => set_node_order(&target, order)?,
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            copy_and_remove_tree(&path, &target, order)?;
+        }
+        Err(e) => return Err(StoreError::io("move", &target, e)),
     }
-    set_node_order(&target, order)?;
     if let Some(from) = from {
         compact_orders(&from)?;
     }
     Ok(target)
 }
 
-fn copy_and_remove_tree(from: &Path, to: &Path) -> Result<()> {
-    if let Err(err) = copy_tree(from, to) {
+fn copy_and_remove_tree(from: &Path, to: &Path, order: u32) -> Result<()> {
+    copy_tree(from, to).map_err(|e| StoreError::io("copy", to, e))?;
+    if let Err(e) = set_node_order(to, order) {
         let _ = remove_tree(to);
-        return Err(StoreError::io("copy", to, err));
+        return Err(e);
     }
     remove_tree(from).map_err(|e| StoreError::io("delete", from, e))
 }
@@ -259,12 +261,11 @@ pub fn copy_node(path: &Path, dest: &Path) -> Result<PathBuf> {
     check_destination(&path, &dest)?;
     let order = next_order(&dest);
     let target = unique_child(&dest, &tree::folder_name(&path));
-    if let Err(e) = copy_tree(&path, &target) {
-        let _ = fs::remove_dir_all(&target);
-        return Err(StoreError::io("copy", &target, e));
+    copy_tree(&path, &target).map_err(|e| StoreError::io("copy", &target, e))?;
+    if let Err(e) = renew_ids(&target).and_then(|()| set_node_order(&target, order)) {
+        let _ = remove_tree(&target);
+        return Err(e);
     }
-    renew_ids(&target)?;
-    set_node_order(&target, order)?;
     Ok(target)
 }
 
@@ -273,17 +274,28 @@ fn next_order(parent: &Path) -> u32 {
     node_children(parent).iter().filter_map(|c| read_node(c).map(|n| n.order)).max().unwrap_or(0).saturating_add(10)
 }
 
-/// Copies a folder and everything in it.
+/// Copies a folder, cleaning up a partial copy only after creating its destination.
 fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     fs::create_dir(to)?;
+    let result = copy_tree_contents(from, to);
+    if result.is_err() {
+        let _ = remove_tree(to);
+    }
+    result
+}
+
+fn copy_tree_contents(from: &Path, to: &Path) -> std::io::Result<()> {
     for entry in fs::read_dir(from)? {
         let entry = entry?;
         let kind = entry.file_type()?;
         let target = to.join(entry.file_name());
         if kind.is_dir() {
-            copy_tree(&entry.path(), &target)?;
+            fs::create_dir(&target)?;
+            copy_tree_contents(&entry.path(), &target)?;
         } else if kind.is_file() {
             fs::copy(entry.path(), &target)?;
+        } else {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, format!("cannot copy {}", entry.path().display())));
         }
     }
     Ok(())
@@ -293,15 +305,7 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
 fn renew_ids(dir: &Path) -> Result<()> {
     if let Some((format, file)) = page_file(dir) {
         let text = fs::read_to_string(&file).map_err(|e| StoreError::io("read", &file, e))?;
-        let id = new_id();
-        let updated = match format {
-            PageFormat::Html => html::set_meta(&text, "nocturne:id", &id),
-            PageFormat::Cmgfm => {
-                let (front, body) = frontmatter::split_front(&text);
-                format!("{}{body}", frontmatter::set_value(&front, "id", &id))
-            }
-        };
-        write_atomic(&file, &updated)?;
+        write_atomic(&file, &with_id(format, &text, &new_id()))?;
     } else if dir.join("_node.toml").is_file() {
         let file = dir.join("_node.toml");
         let text = fs::read_to_string(&file).map_err(|e| StoreError::io("read", &file, e))?;
@@ -780,6 +784,61 @@ mod tests {
     }
 
     #[test]
+    fn restoring_a_copied_pages_history_keeps_the_copys_id() {
+        for format in PageFormat::ALL {
+            let t = TempDir::new("ops-copy-history");
+            let settings = settings(&t);
+            let notebook = create_notebook(&root(&t), "Notebook", Some(format), &settings).expect("notebook");
+            let page = create_node(&notebook, "Page", NodeKind::Page, None, &settings).expect("page");
+            crate::page::save_body(&page, "a later version").expect("save original");
+            let copy = copy_node(&page, &notebook).expect("copy");
+            let copy_id = read_node(&copy).expect("copy node").id;
+            let versions = crate::page::versions(&copy).expect("versions");
+            let version = versions.first().expect("copied history");
+
+            crate::page::restore_version(&copy, &version.id).expect("restore copied history");
+
+            assert_eq!(read_node(&copy).expect("restored copy").id, copy_id);
+            assert_ne!(read_node(&page).expect("original").id, copy_id);
+            assert!(!crate::page::load_page(&copy).expect("restored page").body.contains("a later version"));
+        }
+    }
+
+    #[test]
+    fn the_cross_volume_move_fallback_preserves_an_existing_destination() {
+        let t = TempDir::new("ops-move-existing-target");
+        let from = t.path().join("source");
+        let to = t.path().join("target");
+        fs::create_dir(&from).expect("source folder");
+        fs::create_dir(&to).expect("existing destination folder");
+        fs::write(from.join("source.txt"), "source").expect("source file");
+        fs::write(to.join("target.txt"), "target").expect("destination file");
+
+        assert!(copy_and_remove_tree(&from, &to, 10).is_err());
+        assert_eq!(fs::read_to_string(from.join("source.txt")).expect("source file remains"), "source");
+        assert_eq!(fs::read_to_string(to.join("target.txt")).expect("destination file remains"), "target");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_cross_volume_move_fallback_keeps_the_source_if_it_cannot_copy_an_entry() {
+        let t = TempDir::new("ops-move-incomplete-copy");
+        let s = settings(&t);
+        let notebook = create_notebook(&root(&t), "Notebook", None, &s).expect("notebook");
+        let source = create_node(&notebook, "Page", NodeKind::Page, None, &s).expect("page");
+        let note = source.join("note.txt");
+        let link = source.join("shortcut.txt");
+        let to = t.path().join("target");
+        fs::write(&note, "kept").expect("note");
+        std::os::unix::fs::symlink(&note, &link).expect("link");
+
+        assert!(copy_and_remove_tree(&source, &to, 10).is_err());
+        assert!(!to.exists());
+        assert_eq!(fs::read_link(link).expect("source link remains"), note);
+        assert_eq!(fs::read_to_string(note).expect("source file remains"), "kept");
+    }
+
+    #[test]
     fn move_and_copy_refuse_a_place_that_cannot_hold_the_node() {
         let t = TempDir::new("ops-move-refuse");
         let s = settings(&t);
@@ -1024,7 +1083,7 @@ mod tests {
 
         // Error when destination parent does not exist leaves source intact.
         let bad_dst = t.path().join("missing-parent").join("dst");
-        assert!(copy_and_remove_tree(&src, &bad_dst).is_err());
+        assert!(copy_and_remove_tree(&src, &bad_dst, 10).is_err());
         assert!(!bad_dst.exists());
         assert!(src.join("a-copied-first.txt").is_file());
 
@@ -1037,7 +1096,7 @@ mod tests {
             fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).expect("chmod 000");
             let unreadable = fs::read(&blocked).is_err();
             if unreadable {
-                let res = copy_and_remove_tree(&src, &dst);
+                let res = copy_and_remove_tree(&src, &dst, 10);
                 fs::set_permissions(&blocked, fs::Permissions::from_mode(0o644)).expect("restore perms");
                 assert!(res.is_err(), "copying an unreadable file must fail");
                 assert!(!dst.exists(), "partial destination tree must be removed on copy failure");

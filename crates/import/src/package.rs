@@ -42,7 +42,8 @@ pub fn safe_name(name: &str) -> Option<PathBuf> {
 
 /// Unpacks the package at `package` into the folder `into`, which is made. Returns how many
 /// files were written. Fails, having written what it had, when the package cannot be read,
-/// holds a name that is not a safe path, or holds more than [`MAX_FILES`] or [`MAX_BYTES`].
+/// holds a name that is not a safe path, would overwrite an existing file, or holds more than
+/// [`MAX_FILES`] or [`MAX_BYTES`].
 pub fn unpack(package: &Path, into: &Path) -> Result<usize, String> {
     let file = fs::File::open(package).map_err(|e| format!("cannot open the package: {e}"))?;
     let mut cabinet = cab::Cabinet::new(file).map_err(|e| format!("not a OneNote package: {e}"))?;
@@ -68,7 +69,7 @@ pub fn unpack(package: &Path, into: &Path) -> Result<usize, String> {
             fs::create_dir_all(parent).map_err(|e| format!("cannot make {}: {e}", parent.display()))?;
         }
         let reader = cabinet.read_file(&name).map_err(|e| format!("cannot read {name:?} from the package: {e}"))?;
-        let mut out = fs::File::create(&target).map_err(|e| format!("cannot write {}: {e}", target.display()))?;
+        let mut out = fs::File::create_new(&target).map_err(|e| format!("cannot create {}: {e}", target.display()))?;
         // No more than the package says the file holds, whatever its compressed data claims.
         let mut limited = reader.take(size);
         let mut buf = vec![0_u8; 64 * 1024];
@@ -178,6 +179,25 @@ mod tests {
         assert!(unpack(&package, &into).is_err());
         assert!(!t.path().join("inside").join("escaped.one").exists(), "nothing escaped");
         assert!(!into.exists(), "and nothing was written at all");
+    }
+
+    #[test]
+    fn distinct_cabinet_names_cannot_overwrite_the_same_output_file() {
+        let temp = TempDir::new("package-duplicate-output");
+        let package = temp.path().join("Duplicate.onepkg");
+        let into = temp.path().join("Unpacked");
+        let mut builder = cab::CabinetBuilder::new();
+        let folder = builder.add_folder(cab::CompressionType::None);
+        folder.add_file("Group\\Notes.one");
+        folder.add_file("Group/Notes.one");
+        let mut writer = builder.build(fs::File::create(&package).expect("create package")).expect("build cabinet");
+        for data in [b"first", b"other"] {
+            writer.next_file().expect("cabinet writer").expect("entry").write_all(data).expect("write data");
+        }
+        writer.finish().expect("finish cabinet");
+
+        assert!(unpack(&package, &into).is_err());
+        assert_eq!(fs::read(into.join("Group").join("Notes.one")).expect("first entry"), b"first");
     }
 
     #[test]

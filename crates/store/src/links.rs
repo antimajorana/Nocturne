@@ -9,6 +9,7 @@
 //! looks at the disk only at the end, to tell a node from a file from nothing.
 
 use crate::tree::read_node;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 /// The scheme a link to a page of one's own carries: `nocturne:/notebook/section/page`,
@@ -137,12 +138,22 @@ pub fn resolve_in(roots: &[PathBuf], page_dir: &Path, href: &str) -> Link {
     if !roots.iter().any(|r| full.starts_with(r)) {
         return Link::Outside;
     }
-    if full.is_dir() {
-        if read_node(&full).is_some() { Link::Node(full) } else { Link::File(full) }
-    } else if full.is_file() {
-        Link::File(full)
-    } else {
-        Link::Missing(full)
+    local_link(roots, full)
+}
+
+fn local_link(roots: &[PathBuf], path: PathBuf) -> Link {
+    let resolved = match fs::canonicalize(&path) {
+        Ok(resolved) => resolved,
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => return Link::Missing(path),
+        Err(_) => return Link::Outside,
+    };
+    if !roots.iter().filter_map(|root| fs::canonicalize(root).ok()).any(|root| resolved.starts_with(root)) {
+        return Link::Outside;
+    }
+    match fs::metadata(&resolved) {
+        Ok(meta) if meta.is_dir() && read_node(&resolved).is_some() => Link::Node(path),
+        Ok(meta) if meta.is_dir() || meta.is_file() => Link::File(path),
+        _ => Link::Missing(path),
     }
 }
 
@@ -163,13 +174,13 @@ fn resolve_scheme_path(roots: &[PathBuf], decoded: &str) -> Link {
                 // A link that climbs out of this notebook; it may still be in another.
                 continue;
             }
-            if full.is_dir() {
-                return if read_node(&full).is_some() { Link::Node(full) } else { Link::File(full) };
+            match local_link(roots, full) {
+                Link::Outside => {}
+                Link::Missing(path) => {
+                    inside_somewhere.get_or_insert(path);
+                }
+                link => return link,
             }
-            if full.is_file() {
-                return Link::File(full);
-            }
-            inside_somewhere.get_or_insert(full);
         }
     }
     // Nothing of that name: missing when the path at least stayed inside a notebook,
@@ -243,7 +254,7 @@ fn normalise(path: PathBuf) -> Option<PathBuf> {
 
 /// `%20` and friends turned back into their bytes; anything that is not valid UTF-8 after
 /// that, or not a percent escape, is kept as written.
-fn percent_decode(s: &str) -> String {
+pub fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -344,6 +355,21 @@ mod tests {
         // link is: it is the page's own folder. With backslashes it is not a link at all.
         let forward = a.to_string_lossy().replace('\\', "/");
         assert_eq!(resolve(&root, &a, &forward), Link::Node(a.clone()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_must_resolve_inside_an_open_notebook() {
+        let (t, root, a, _) = fixture("links-linked-folder");
+        let outside = t.path().join("elsewhere");
+        std::fs::create_dir(&outside).expect("outside folder");
+        std::fs::write(outside.join("note.pdf"), b"elsewhere").expect("outside file");
+        std::os::unix::fs::symlink(&outside, a.join("assets/elsewhere")).expect("link to the outside folder");
+        std::os::unix::fs::symlink(a.join("assets/my notes.pdf"), a.join("assets/alias.pdf")).expect("link to an inside file");
+
+        assert_eq!(resolve(&root, &a, "assets/elsewhere/note.pdf"), Link::Outside);
+        assert_eq!(resolve(&root, &a, "nocturne:/book/section/page-a/assets/elsewhere/note.pdf"), Link::Outside);
+        assert_eq!(resolve(&root, &a, "assets/alias.pdf"), Link::File(a.join("assets/alias.pdf")));
     }
 
     #[test]

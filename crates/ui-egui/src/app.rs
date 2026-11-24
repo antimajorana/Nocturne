@@ -552,6 +552,12 @@ impl Editor {
         }
     }
 
+    /// Moves the box count and indexed layout marks after removing the block at `at`.
+    fn block_removed(&mut self, at: usize) -> (bool, bool) {
+        self.count_removed_from_boxes(at);
+        (self.columns.remove_blocks(at..at + 1), self.justified.remove_blocks(at..at + 1))
+    }
+
     /// [`Editor::count_inserted_in_boxes`], and justified paragraphs and table widths after the
     /// new blocks move down with their blocks. Returns whether the widths and the justified
     /// paragraphs changed, for [`NocturneApp::save_block_marks`].
@@ -1014,6 +1020,10 @@ fn ink_mode_for_pointer(pointer: ribbon::Pointer) -> nocturne_engine::InkActiveM
     }
 }
 
+struct KeyboardPaste {
+    fallback_text: Option<String>,
+}
+
 pub struct NocturneApp {
     session: Session,
     /// Writes autosaves off the window's thread (see [`crate::saver`]).
@@ -1183,7 +1193,7 @@ pub struct NocturneApp {
     pending_copy: Option<String>,
     /// Matching HTML flavor for the same copied item, when one is available.
     pending_copy_html: Option<String>,
-    keyboard_paste_requested: bool,
+    keyboard_paste: Option<KeyboardPaste>,
     /// The File screen, when it is open, and which of its pages.
     backstage: Option<&'static str>,
     /// The page fills the window: the notebooks are hidden until it is turned off.
@@ -1242,10 +1252,30 @@ impl NocturneApp {
         self
     }
 
-    /// Queues a native keyboard paste captured before egui processes the shortcut.
-    pub fn queue_keyboard_paste(&mut self) {
-        log::debug!("queued native keyboard paste");
-        self.keyboard_paste_requested = true;
+    /// Routes native paste events for the page body through Nocturne's clipboard.
+    pub fn capture_page_paste(&mut self, ctx: &Context, events: &mut Vec<egui::Event>) {
+        if !self.page_owns_clipboard_input(ctx) {
+            return;
+        }
+        let mut captured = false;
+        let mut fallback_text = None;
+        events.retain_mut(|event| {
+            let is_paste = match event {
+                egui::Event::Paste(text) => {
+                    // egui-winit emits this event in place of Ctrl/Cmd+V when it has text.
+                    fallback_text = Some(std::mem::take(text));
+                    true
+                }
+                egui::Event::PasteImage(_) => true,
+                egui::Event::Key { key: Key::V, pressed: true, modifiers, .. } => modifiers.ctrl || modifiers.command,
+                _ => false,
+            };
+            captured |= is_paste;
+            !is_paste
+        });
+        if captured {
+            self.keyboard_paste = Some(KeyboardPaste { fallback_text });
+        }
     }
 
     pub fn new(session: Session) -> NocturneApp {
@@ -1404,7 +1434,7 @@ impl NocturneApp {
             theme_window: false,
             pending_copy: None,
             pending_copy_html: None,
-            keyboard_paste_requested: false,
+            keyboard_paste: None,
             backstage: None,
             full_page: false,
             compact: false,
@@ -1936,10 +1966,27 @@ impl NocturneApp {
     /// The keys and buttons that move through the pages that were opened. Undo and Redo keys
     /// are the page history's own, taken below.
     fn nav_keys(&mut self, ctx: &Context) {
-        if ctx.input_mut(|i| i.consume_key(Modifiers::ALT, Key::ArrowLeft)) || ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1)) {
+        use crate::quickaccess::Command;
+
+        let navigate = |command: Command, mouse| {
+            let shortcut = command.shortcut(ctx.os());
+            ctx.input_mut(|input| {
+                let mut pressed = input.pointer.button_pressed(mouse);
+                // Match Alt and Shift exactly so Cmd+Option+bracket still reaches page hierarchy.
+                input.events.retain(|event| {
+                    let matched = matches!(event,
+                        egui::Event::Key { key, pressed: true, modifiers, .. }
+                            if *key == shortcut.logical_key && modifiers.matches_exact(shortcut.modifiers));
+                    pressed |= matched;
+                    !matched
+                });
+                pressed
+            })
+        };
+        if navigate(Command::Back, egui::PointerButton::Extra1) {
             self.go_back();
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::ALT, Key::ArrowRight)) || ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra2)) {
+        if navigate(Command::Forward, egui::PointerButton::Extra2) {
             self.go_forward();
         }
         // OneNote's Ctrl+Page Up and Ctrl+Page Down: the page above or below in the page list,
@@ -2366,7 +2413,7 @@ impl NocturneApp {
                 self.clipboard("cut");
                 self.flush_pending_copy(None);
             }
-            PlatformEditAction::Paste => self.paste_here(),
+            PlatformEditAction::Paste => self.paste_here(None),
             PlatformEditAction::SelectAll => {
                 self.select_all_in_block();
                 if let Some(ed) = self.editor.as_mut()
@@ -2598,8 +2645,7 @@ impl NocturneApp {
         }
         let mut marks = (false, false);
         if ed.blocks.len() < before {
-            ed.count_removed_from_boxes(at);
-            marks = (ed.columns.remove_blocks(at..at + 1), ed.justified.remove_blocks(at..at + 1));
+            marks = ed.block_removed(at);
             // A box that held only the joined line is left with nothing in it, and goes.
             if ed.arranged && ed.boxes.len() > 1 {
                 let caret_box = nocturne_model::container::place(&ed.boxes, at.saturating_sub(1)).map(|(i, _)| i);
@@ -5668,7 +5714,7 @@ impl NocturneApp {
             }
             ribbon::Act::Tag(tag) => self.apply_tag(tag),
             ribbon::Act::Clipboard(which) => self.clipboard(which),
-            ribbon::Act::Paste => self.paste_here(),
+            ribbon::Act::Paste => self.paste_here(None),
             ribbon::Act::Indent(deeper) => self.indent_block(deeper),
             ribbon::Act::ClearFormatting => self.clear_formatting(),
             ribbon::Act::Direction(d) => self.apply_direction(d),
@@ -5853,7 +5899,7 @@ impl NocturneApp {
         (true, cols_changed, justified_changed)
     }
 
-    fn paste_here(&mut self) {
+    fn paste_here(&mut self, fallback_text: Option<String>) {
         let Some(ed) = self.editor.as_ref() else {
             self.say(crate::tl_id!("ui.open_a_page_first"));
             return;
@@ -5876,7 +5922,7 @@ impl NocturneApp {
                 return;
             }
         }
-        match self.clipboard.text() {
+        match fallback_text.or_else(|| self.clipboard.text()) {
             Some(text) => {
                 let new = pageedit::blocks_to_paste(&text);
                 if !self.paste_blocks(new) {
@@ -5971,8 +6017,12 @@ impl NocturneApp {
         let Some(ed) = self.editor.as_mut() else { return };
         // The folder is asked again: the pen has just written or deleted a file.
         ed.ink_files = nocturne_store::page::ink_files(&ed.dir);
-        if Self::name_ink(ed) {
+        let (changed, cols_moved, justified_moved) = Self::name_ink(ed);
+        if changed {
             Self::mark_dirty_from_blocks(ed);
+        }
+        if cols_moved || justified_moved {
+            self.save_block_marks((cols_moved, justified_moved));
         }
     }
 
@@ -5984,11 +6034,11 @@ impl NocturneApp {
     /// be lost - deleting the box that held it took it out - and nothing put it back until
     /// the pen next moved, so a page could say nothing about ink that was still there.
     ///
-    /// Returns true when the page's text had to be changed.
-    fn name_ink(ed: &mut Editor) -> bool {
+    /// Returns whether the page's text, table widths, and justification changed.
+    fn name_ink(ed: &mut Editor) -> (bool, bool, bool) {
         use nocturne_formats::markdown::Block;
         let files = ed.ink_files.clone();
-        let mut changed = false;
+        let (mut changed, mut cols_moved, mut justified_moved) = (false, false, false);
         // A line that names an ink file that is no longer in the folder goes.
         // One at a time, from the end, so each box that held one counts one fewer.
         let gone: Vec<usize> = ed
@@ -6003,7 +6053,9 @@ impl NocturneApp {
             .collect();
         for &at in gone.iter().rev() {
             ed.blocks.remove(at);
-            ed.count_removed_from_boxes(at);
+            let (cols, justified) = ed.block_removed(at);
+            cols_moved |= cols;
+            justified_moved |= justified;
             changed = true;
         }
         // An ink file the page does not name is adopted: it is drawn, so it is named. The line
@@ -6019,7 +6071,7 @@ impl NocturneApp {
         if changed {
             ed.rebuild_body();
         }
-        changed
+        (changed, cols_moved, justified_moved)
     }
 
     /// Writes the rack and which tool is in hand into the settings, so the next run opens
@@ -6609,9 +6661,7 @@ impl NocturneApp {
         Self::remember_step(ed);
         ed.caret = None;
         ed.blocks.remove(at);
-        ed.count_removed_from_boxes(at);
-        let cols = ed.columns.remove_blocks(at..at + 1);
-        let justified = ed.justified.remove_blocks(at..at + 1);
+        let marks = ed.block_removed(at);
         if ed.blocks.is_empty() {
             ed.blocks.push(Block::Paragraph(Vec::new()));
             ed.count_inserted_in_boxes(0, 1);
@@ -6623,7 +6673,7 @@ impl NocturneApp {
         ed.caret = Some(pageedit::Caret { block: to, text, focus: true, selection: (0, 0), place: Some(0), cell: None, span: None, inline: None });
         Self::mark_dirty_from_blocks(ed);
         Self::remember_edit(ed);
-        self.save_block_marks((cols, justified));
+        self.save_block_marks(marks);
         self.say(crate::tl_id!("ui.deleted_the_table"));
     }
 
@@ -6851,11 +6901,9 @@ impl NocturneApp {
         Some(PlatformTextField { text: text.to_string(), selection: (a.min(b), a.max(b)) })
     }
 
-    /// True ONLY when a desktop/hardware `Ctrl+V` / `Cmd+V` belongs to the open page body rather
-    /// than Backstage, a modal dialog, the theme chooser, CodeView, the library grid, or any
-    /// non-body `TextEdit` (Search, Page Title, Rename, Link, Cloud Sync, Math OCR, ribbon combo
-    /// boxes, template name, etc.).
-    pub fn should_intercept_page_paste(&self, ctx: &Context) -> bool {
+    /// Whether clipboard input belongs to the open page body. Dialogs, Backstage, Code View
+    /// and focused fields like Search or Page Title handle their own clipboard events.
+    fn page_owns_clipboard_input(&self, ctx: &Context) -> bool {
         if self.backstage.is_some()
             || self.dialog.is_some()
             || self.theme_window
@@ -7917,33 +7965,33 @@ impl NocturneApp {
                         matches!(e, egui::Event::Key { key, pressed: true, modifiers, .. } if *key == want && (modifiers.command || modifiers.ctrl))
                     })
             };
-            (hit(egui::Key::C), hit(egui::Key::X), hit(egui::Key::V), hit(egui::Key::A))
+            let copy = hit(Key::C) || i.events.iter().any(|event| matches!(event, egui::Event::Copy));
+            let cut = hit(Key::X) || i.events.iter().any(|event| matches!(event, egui::Event::Cut));
+            (copy, cut, hit(Key::V), hit(Key::A))
         });
         if !(copy || cut || paste || all) {
             return;
         }
         let ours = self.words_are_ours();
-        if copy && ours {
-            self.clipboard("copy");
-        }
-        if cut && ours {
-            self.clipboard("cut");
+        if (copy || cut) && ours && self.page_owns_clipboard_input(ctx) {
+            ctx.input_mut(|i| i.events.retain(|event| !matches!(event, egui::Event::Copy | egui::Event::Cut)));
+            if copy {
+                self.clipboard("copy");
+            }
+            if cut && self.editor.as_ref().is_some_and(|ed| ed.writable) {
+                self.clipboard("cut");
+            }
         }
         // A screenshot has no text for egui's text widget to consume. Route every Ctrl+V
         // through the same paste path; it reads the image clipboard exactly once. Probing
         // with has_picture() first was racy with VirtualBox clipboard synchronisation and
         // could make the actual image read miss the clipboard handoff.
-        if paste && self.should_intercept_page_paste(ctx) {
+        if paste && self.page_owns_clipboard_input(ctx) {
             // Consume the shortcut before the text widgets draw. Otherwise an LTR TextEdit
             // handles Ctrl+V itself while the page menu goes through `paste_here`, giving the
             // two entry points different behavior.
             ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::V) || i.consume_key(Modifiers::CTRL, Key::V));
-            let picture = self.clipboard.picture();
-            if let (Some(picture), Some(dir)) = (picture, self.editor.as_ref().map(|e| e.dir.clone())) {
-                self.paste_picture(&dir, picture);
-            } else {
-                self.paste_here();
-            }
+            self.paste_here(None);
         }
         if all && ours {
             self.select_all_in_block();
@@ -9399,7 +9447,9 @@ impl NocturneApp {
                 self.apply_external_pan(pan);
             }
             if let Some(scale) = zoom_scale_delta {
-                self.apply_external_pinch_zoom(scale, Some(touch.center_pos));
+                // The page origin is still from the last frame, when the fingers were at
+                // their previous center. The pan carries that anchored point to the new center.
+                self.apply_external_pinch_zoom(scale, Some(touch.center_pos - pan));
             }
         }
         if self.fit_page_width {
@@ -10091,8 +10141,14 @@ impl NocturneApp {
             // Before the step is remembered, so the page in the history is one that
             // names its ink: a box deleted with the ink line in it is repaired at once
             // rather than at the next open.
-            if (changed || from_blocks) && Self::name_ink(ed) {
-                from_blocks = true;
+            if changed || from_blocks {
+                let (ink_named, cols, justified) = Self::name_ink(ed);
+                from_blocks |= ink_named;
+                cols_moved |= cols;
+                justified_moved |= justified;
+                if ink_named {
+                    Self::mark_dirty_from_blocks(ed);
+                }
             }
             if changed || from_blocks || boxes_moved {
                 Self::remember_step(ed);
@@ -11827,58 +11883,110 @@ impl NocturneApp {
                 lines
             }
         };
-        if !self.editor.as_ref().is_some_and(|ed| ed.writable && ed.dir == conv.page) {
+        self.take_saves(true);
+        let Some(ed) = self.editor.as_mut().filter(|ed| ed.writable && ed.dir == conv.page) else {
             return;
-        }
+        };
         let Some(pad) = self.pad.as_mut() else { return };
-        pad.settle();
-        if !pad.remove_exact_strokes(&conv.strokes) {
+        let Some(targets) = pad.exact_stroke_indices(&conv.strokes) else {
             self.save_now();
             self.complain(crate::tl_id!("ui.ink_changed_not_converted"));
             return;
+        };
+
+        let mut boxes = if ed.blocks.is_empty() {
+            Vec::new()
+        } else {
+            let occupied: Vec<_> = ed.boxes.iter().filter(|c| c.blocks > 0).cloned().collect();
+            let default_width = occupied.first().map_or(360.0, |c| c.width);
+            nocturne_model::container::fit(&occupied, ed.blocks.len(), default_width)
+        };
+        let [x0, y0, x1, _y1] = conv.bounds;
+        let x = (x0 - 6.0).max(0.0).round();
+        let y = (y0 - 14.0).max(0.0).round();
+        let box_width = ((x1 - x0) + 24.0).clamp(nocturne_model::container::MIN_WIDTH, 360.0).round();
+        boxes.push(nocturne_model::container::Container::new(x, y, box_width, new_blocks.len()));
+        let mut blocks = ed.blocks.clone();
+        blocks.extend(new_blocks);
+        let body = nocturne_formats::boxes::write(ed.format, &blocks, Some(&boxes));
+
+        let page_file = conv.page.join(ed.format.page_file());
+        let previous = match std::fs::read_to_string(&page_file) {
+            Ok(previous) => previous,
+            Err(e) => {
+                self.fail(&nocturne_store::StoreError::io("read", &page_file, e).into());
+                return;
+            }
+        };
+        // Keep the original drawing on disk until the recognized content has been saved.
+        let timestamp = match self.session.run("page.save", &params(&[("path", &path_str(&conv.page)), ("body", &body)])) {
+            Ok(Output::Text(timestamp)) => timestamp,
+            Ok(_) => return,
+            Err(e) => {
+                self.fail(&e);
+                return;
+            }
+        };
+        let mut ink_error = pad
+            .save_removing_strokes_at(targets)
+            .err()
+            .map(|e| crate::i18n::format_message_id("ui.cannot_write_the_drawing_error", &[("error", &e.to_string())]));
+        if let Some(message) = &mut ink_error {
+            // Ink is still present. Restore the previous saved text so the same selection can
+            // be converted again, leaving any unsaved editor changes and undo steps intact.
+            match nocturne_store::page::write_atomic(&page_file, &previous) {
+                Ok(()) => {
+                    self.complain(message);
+                    return;
+                }
+                Err(e) => {
+                    let restore_error = crate::i18n::format_message_id("ui.could_not_complete_the_action_error", &[("error", &e.to_string())]);
+                    message.push(' ');
+                    message.push_str(&restore_error);
+                }
+            }
         }
-        pad.settle();
-        if let Err(e) = pad.save() {
-            // Roll back the in-memory stroke removal so a failed save never leaves lost or
-            // unsettled ink.
-            let _ = pad.undo();
-            self.complain(&crate::i18n::format_message_id("ui.cannot_write_the_drawing_error", &[("error", &e.to_string())]));
+
+        Self::remember_step(ed);
+        ed.blocks = blocks;
+        ed.boxes = boxes;
+        ed.arranged = true;
+        ed.across = None;
+        ed.saved_body = body.clone();
+        ed.body = body;
+        ed.dirty_since = None;
+        ed.last_saved = Some(timestamp);
+        self.undone.clear();
+        self.library_grid.invalidate_page(&conv.page);
+        self.sync_dirty_since_last = true;
+        self.last_local_edit_at = Some(Instant::now());
+
+        // If restoring the previous text also failed, the recognized text is still on disk
+        // alongside the original ink. Reflect that saved page in the editor.
+        if let Some(message) = ink_error {
+            Self::remember_edit(ed);
+            self.complain(&message);
             return;
-        }
-        if let Some(ed) = self.editor.as_mut() {
-            Self::remember_step(ed);
         }
         let now = Instant::now();
         self.last_ink_change = Some(now);
         self.last_local_edit_at = Some(now);
-        self.sync_dirty_since_last = true;
         self.tell_kept_ink();
         self.sync_ink_reference();
         if let Some(ed) = self.editor.as_mut() {
+            // When all the ink went, its former container might now be empty.
             ed.boxes.retain(|c| c.blocks > 0);
-            let default_width = ed.boxes.first().map_or(360.0, |c| c.width);
-            let before = ed.blocks.len();
-            // Do not fabricate a 0-block ghost container when inserting onto an empty page.
-            ed.boxes = if before == 0 { Vec::new() } else { nocturne_model::container::fit(&ed.boxes, before, default_width) };
-            let [x0, y0, x1, _y1] = conv.bounds;
-            let x = (x0 - 6.0).max(0.0).round();
-            let y = (y0 - 14.0).max(0.0).round();
-            let box_width = ((x1 - x0) + 24.0).clamp(nocturne_model::container::MIN_WIDTH, 360.0).round();
-            let added = new_blocks.len();
-            ed.blocks.extend(new_blocks);
-            ed.boxes.push(nocturne_model::container::Container::new(x, y, box_width, added));
-            ed.arranged = true;
             if ed.caret.as_ref().is_some_and(|c| c.block >= ed.blocks.len()) {
                 ed.caret = None;
             }
-            ed.across = None;
             ed.rebuild_body();
             Self::mark_dirty_from_blocks(ed);
             Self::remember_edit(ed);
         }
         self.save_now();
-        self.undone.clear();
-        self.library_grid.invalidate_page(&conv.page);
+        if self.editor.as_ref().is_some_and(|ed| ed.dirty_since.is_some()) {
+            return;
+        }
         let msg = match conv.mode {
             nocturne_engine::OcrMode::MathLatex => crate::tl_id!("ui.equation_inserted"),
             nocturne_engine::OcrMode::HandwritingText => crate::tl_id!("ui.ocr_insert_text"),
@@ -12425,7 +12533,7 @@ impl NocturneApp {
         // Run before page keyboard shortcuts and file drops so nothing behind Backstage can
         // mutate or absorb dropped files while Backstage is showing.
         if self.backstage.is_some() {
-            self.keyboard_paste_requested = false;
+            self.keyboard_paste = None;
             // No page is drawn under it, so the last page's rect is dropped: the platform's pan
             // and pinch take only touches on a page that is on the screen.
             self.page_rect = None;
@@ -12448,11 +12556,11 @@ impl NocturneApp {
             }
             return;
         }
-        if self.keyboard_paste_requested {
-            self.keyboard_paste_requested = false;
-            if self.should_intercept_page_paste(ctx) {
-                log::debug!("queued keyboard paste dispatched to paste_here");
-                self.paste_here();
+        if let Some(paste) = self.keyboard_paste.take() {
+            if self.page_owns_clipboard_input(ctx) {
+                self.paste_here(paste.fallback_text);
+            } else if let Some(text) = paste.fallback_text {
+                ctx.input_mut(|i| i.events.push(egui::Event::Paste(text)));
             }
         }
         self.clipboard_keys(ctx);
@@ -12471,10 +12579,12 @@ impl NocturneApp {
         // text box in the dialog keeps its own undo.
         let math_preview_open = matches!(self.math_ocr.as_ref().map(|c| &c.stage), Some(crate::math_ocr::Stage::Preview { .. }));
         let page_keys = self.dialog.is_none() && !self.theme_window && !math_preview_open && self.backstage.is_none();
-        if page_keys && ctx.input_mut(|i| i.consume_key(cmd_shift, Key::Z) || i.consume_key(Modifiers::COMMAND, Key::Y)) {
+        // The title, search, and source editors keep their own history.
+        let page_history_keys = page_keys && !self.title_is_focused() && (!ctx.egui_wants_keyboard_input() || self.page_text_has_focus(ctx));
+        if page_history_keys && ctx.input_mut(|i| i.consume_key(cmd_shift, Key::Z) || i.consume_key(Modifiers::COMMAND, Key::Y)) {
             // The ink's as well as the page's, whichever Undo took back.
             self.redo();
-        } else if page_keys && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Z)) {
+        } else if page_history_keys && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Z)) {
             // The ink's changes as well as the page's: whichever was last, or both when one
             // press made them together.
             self.undo();
@@ -14689,6 +14799,131 @@ mod m2_regression_tests {
             app.apply_external_pinch_zoom(1.004, None);
         }
         assert_eq!(app.zoom_percent(), 125);
+    }
+
+    #[test]
+    fn simultaneous_touch_pan_and_pinch_keeps_the_point_between_the_fingers() {
+        let (_t, mut app, _s) = setup_app("m2-reg-pinch-and-pan", "Zoom\n");
+        app.hide_title = true;
+        app.ribbon_act(ribbon::Act::InkPointer(ribbon::Pointer::Pan));
+        let mut h: H = egui_kittest::Harness::builder()
+            .with_size(vec2(1180.0, 820.0))
+            .with_accessibility_check(false)
+            .build_ui_state(|ui, app| app.show(ui), app);
+        settle(&mut h);
+
+        let old_center = h.state().page_view_rect.expect("page view").center();
+        let touch = |id, phase, pos| egui::Event::Touch { device_id: egui::TouchDeviceId(1), id: egui::TouchId(id), phase, pos, force: None };
+        h.input_mut().events.push(egui::Event::PointerMoved(old_center - vec2(40.0, 0.0)));
+        h.step();
+        h.input_mut().events.extend([
+            touch(1, egui::TouchPhase::Start, old_center - vec2(40.0, 0.0)),
+            touch(2, egui::TouchPhase::Start, old_center + vec2(40.0, 0.0)),
+        ]);
+        h.step();
+        let old_origin = h.state().editor.as_ref().expect("editor").origin;
+        let new_center = old_center + vec2(45.0, 30.0);
+        h.input_mut()
+            .events
+            .extend([touch(1, egui::TouchPhase::Move, new_center - vec2(60.0, 0.0)), touch(2, egui::TouchPhase::Move, new_center + vec2(60.0, 0.0))]);
+        h.step();
+
+        assert_eq!(h.state().zoom_percent(), 150);
+        let new_origin = h.state().editor.as_ref().expect("editor").origin;
+        let anchored = new_origin + (old_center - old_origin) * 1.5;
+        assert!(anchored.distance(new_center) < 2.0, "{anchored:?} should follow {new_center:?}");
+    }
+
+    #[test]
+    fn ocr_preserves_the_original_page_and_ink_after_either_save_fails() {
+        use nocturne_ink::{Dab, Drawing, Rgb, Stroke, Tool, svg};
+
+        let (t, mut app, sample) = setup_app("m2-reg-ocr-page-save", "Original text\n");
+        let mut stroke = Stroke::new(Tool::Pen, Rgb::BLACK, 2.0);
+        stroke.add(Dab::new(20.0, 20.0, 1.0));
+        stroke.add(Dab::new(40.0, 40.0, 1.0));
+        let mut drawing = Drawing::new(800.0, 600.0);
+        drawing.add(stroke);
+        let ink_path = sample.md_page.join("ink.svg");
+        let ink = svg::write(&drawing, svg::Flavour::Editable);
+        std::fs::write(&ink_path, &ink).expect("fixture ink");
+        let mut pad = crate::inkpad::Pad::of_page(&sample.md_page);
+        pad.hold_touching((0.0, 0.0, 100.0, 100.0));
+        let bounds = pad.held_bounds().expect("selected ink");
+        let strokes = pad.held_strokes();
+        app.pad = Some(pad);
+        app.sync_ink_reference();
+        app.save_now();
+
+        let page_file = sample.md_page.join(PageFormat::Cmgfm.page_file());
+        let before = std::fs::read_to_string(&page_file).expect("page before OCR");
+        let versions = sample.md_page.join(".nocturne/versions");
+        let version_backup = t.path().join("versions-before-ocr");
+        std::fs::rename(&versions, &version_backup).expect("temporarily move the versions folder");
+        std::fs::write(&versions, "blocks version snapshots").expect("prevent page saves");
+        let conversion = || crate::math_ocr::Conversion {
+            page: sample.md_page.clone(),
+            strokes: strokes.clone(),
+            bounds,
+            mode: nocturne_engine::OcrMode::HandwritingText,
+            stage: crate::math_ocr::Stage::Preview { tex: "Recognized text".into(), opened: true },
+        };
+        app.confirm_math_ocr(conversion());
+
+        assert!(app.status_is_error);
+        assert_eq!(app.held_ink_count(), 1);
+        assert_eq!(std::fs::read_to_string(&ink_path).expect("preserved ink"), ink);
+        assert_eq!(std::fs::read_to_string(&page_file).expect("preserved page"), before);
+        assert!(!app.body().expect("editor body").contains("Recognized text"));
+
+        std::fs::remove_file(&versions).expect("unblock page saves");
+        std::fs::rename(&version_backup, &versions).expect("restore the versions folder for a retry");
+        let ink_backup = t.path().join("ink-before-ocr.svg");
+        std::fs::rename(&ink_path, &ink_backup).expect("temporarily move the ink file");
+        std::fs::create_dir(&ink_path).expect("prevent ink removal");
+        let undo_before = app.editor.as_ref().expect("editor").history.can_undo();
+        app.confirm_math_ocr(conversion());
+        assert!(app.status_is_error);
+        assert_eq!(app.held_ink_count(), 1);
+        assert_eq!(app.editor.as_ref().expect("editor").history.can_undo(), undo_before);
+        assert!(!app.pad.as_ref().expect("ink pad").can_redo());
+        let rolled_back = std::fs::read_to_string(&page_file).expect("page after rollback");
+        assert_eq!(rolled_back, before);
+
+        std::fs::remove_dir(&ink_path).expect("unblock writing ink");
+        std::fs::rename(&ink_backup, &ink_path).expect("restore the ink file for a retry");
+        app.confirm_math_ocr(conversion());
+        assert!(!app.status_is_error);
+        let body = nocturne_store::page::load_page(&sample.md_page).expect("saved page").body;
+        assert!(body.contains("Original text") && body.contains("Recognized text"));
+        assert!(!body.contains("ink.svg") && !ink_path.exists());
+    }
+
+    #[test]
+    fn removing_a_stale_ink_reference_keeps_layout_with_its_blocks_after_saving() {
+        use nocturne_model::justify::{Justified, Strength};
+        use nocturne_model::tablecols::Widths;
+
+        let (_t, mut app, sample) = setup_app("m2-reg-ink-layout-marks", "Original text\n");
+        let page = sample.md_page;
+        let body = "![Ink](ink.svg)\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nA justified paragraph\n";
+        nocturne_store::page::save_body(&page, body).expect("fixture page");
+        let mut widths = Widths::default();
+        widths.set(1, 0, 180.0, &[100.0, 110.0]);
+        nocturne_store::page::set_table_columns(&page, &widths).expect("fixture widths");
+        let mut justified = Justified::default();
+        justified.set(2, Some(Strength::High));
+        nocturne_store::page::set_justified(&page, &justified).expect("fixture justification");
+
+        app.open_path(&path_str(&page));
+        app.save();
+
+        assert!(!nocturne_store::page::load_page(&page).expect("saved page").body.contains("ink.svg"));
+        let widths = nocturne_store::page::table_columns(&page).expect("saved widths");
+        assert_eq!(widths.of(0), Some([180.0, 110.0].as_slice()));
+        assert!(widths.of(1).is_none());
+        let justified = nocturne_store::page::justified(&page).expect("saved justification");
+        assert_eq!(justified.blocks(), &[(1, Strength::High)]);
     }
 
     #[test]

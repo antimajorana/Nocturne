@@ -277,7 +277,7 @@ impl Pad {
                 Err(e) => return Err(e),
             }
         } else {
-            std::fs::write(&self.file, svg::write(&self.drawing, svg::Flavour::Editable))?;
+            nocturne_store::page::write_atomic(&self.file, &svg::write(&self.drawing, svg::Flavour::Editable)).map_err(std::io::Error::other)?;
         }
         self.dirty = false;
         Ok(())
@@ -541,21 +541,10 @@ impl Pad {
         pick::bounds(&self.drawing, &self.held).map(|(x0, y0, x1, y1)| [x0, y0, x1, y1])
     }
 
-    /// Removes every stroke in `snapshot` one-for-one if all of them are still in the drawing
-    /// untouched. If `snapshot` is empty or any stroke was rubbed out, cut, moved, stretched or
-    /// undone in the meantime, removes nothing and returns `false`.
+    /// Removes every stroke in `snapshot` one-for-one if all of them are still in the drawing.
+    /// If the snapshot is empty or any stroke changed in the meantime, removes nothing.
     pub fn remove_exact_strokes(&mut self, snapshot: &[Stroke]) -> bool {
-        if snapshot.is_empty() {
-            return false;
-        }
-        let mut targets: Vec<usize> = Vec::with_capacity(snapshot.len());
-        for want in snapshot {
-            let Some(idx) = self.drawing.strokes.iter().enumerate().position(|(i, have)| !targets.contains(&i) && have == want) else {
-                return false;
-            };
-            targets.push(idx);
-        }
-        targets.sort_unstable();
+        let Some(targets) = self.exact_stroke_indices(snapshot) else { return false };
         for idx in targets.into_iter().rev() {
             self.drawing.strokes.remove(idx);
         }
@@ -563,6 +552,38 @@ impl Pad {
         self.dirty = true;
         self.touched = true;
         true
+    }
+
+    /// Finds each stroke in `snapshot` one-for-one if all of them are still in the drawing
+    /// untouched. An empty snapshot or a changed stroke means there is nothing to remove.
+    pub(crate) fn exact_stroke_indices(&self, snapshot: &[Stroke]) -> Option<Vec<usize>> {
+        if snapshot.is_empty() {
+            return None;
+        }
+        let mut targets: Vec<usize> = Vec::with_capacity(snapshot.len());
+        for want in snapshot {
+            let idx = self.drawing.strokes.iter().enumerate().position(|(i, have)| !targets.contains(&i) && have == want)?;
+            targets.push(idx);
+        }
+        targets.sort_unstable();
+        Some(targets)
+    }
+
+    /// Saves the drawing without the strokes found by `exact_stroke_indices`. An unsuccessful
+    /// save restores those strokes in their original order and leaves the selection intact.
+    pub(crate) fn save_removing_strokes_at(&mut self, targets: Vec<usize>) -> std::io::Result<()> {
+        self.settle();
+        let removed: Vec<_> = targets.into_iter().rev().map(|idx| (idx, self.drawing.strokes.remove(idx))).collect();
+        if let Err(e) = self.save() {
+            for (idx, stroke) in removed.into_iter().rev() {
+                self.drawing.strokes.insert(idx, stroke);
+            }
+            return Err(e);
+        }
+        self.let_go();
+        self.touched = true;
+        self.settle();
+        Ok(())
     }
 }
 

@@ -168,7 +168,10 @@ impl Widths {
     /// A row was put into the table at block `block`, at row `at`. The rows from there on keep
     /// their cells' alignments, moved down one. True when anything changed.
     pub fn insert_row(&mut self, block: usize, at: usize) -> bool {
-        self.move_cells(block, |(r, c)| Some((if r >= at { r + 1 } else { r }, c)))
+        self.move_cells(block, |(row, column)| {
+            let row = row.checked_add(usize::from(row >= at))?;
+            Some((row, column))
+        })
     }
 
     /// Row `at` was taken out of the table at block `block`. Its cells' alignments go with it,
@@ -257,12 +260,15 @@ impl Widths {
     /// down one with it, so it stays on the same table. True when anything changed.
     pub fn insert_block(&mut self, at: usize) -> bool {
         let mut moved = false;
-        for layout in &mut self.tables {
-            if layout.block >= at {
-                layout.block += 1;
-                moved = true;
+        self.tables.retain_mut(|layout| {
+            if layout.block < at {
+                return true;
             }
-        }
+            moved = true;
+            let Some(next) = layout.block.checked_add(1) else { return false };
+            layout.block = next;
+            true
+        });
         moved
     }
 
@@ -275,7 +281,10 @@ impl Widths {
             return false;
         }
         // An aligned cell keeps its alignment, moved along with its column (issue #170).
-        let cells = self.move_cells(block, |(r, c)| Some((r, if c >= at { c + 1 } else { c })));
+        let cells = self.move_cells(block, |(row, column)| {
+            let column = column.checked_add(usize::from(column >= at))?;
+            Some((row, column))
+        });
         let Some(layout) = self.tables.iter_mut().find(|l| l.block == block) else { return cells };
         if layout.widths.is_empty() || layout.widths.len() >= MAX_COLUMNS {
             return cells;
@@ -682,5 +691,15 @@ mod tests {
         assert!(!widths.insert_column(1, 1, f32::NAN));
         assert!(!widths.insert_column(1, 1, f32::NEG_INFINITY));
         assert_eq!(widths.of(1), Some([140.0, 160.0].as_slice()));
+    }
+
+    #[test]
+    fn unrepresentable_table_indices_do_not_block_edits() {
+        let last = usize::MAX;
+        let mut widths = parse(&format!("1:100; 1@0.0=c,{last}.0=r,0.{last}=l; {last}:80"));
+        assert!(widths.insert_row(1, 0));
+        assert!(widths.insert_column(1, 0, 110.0));
+        assert!(widths.insert_block(0));
+        assert_eq!(write(&widths), "2:110,100; 2@1.1=c");
     }
 }

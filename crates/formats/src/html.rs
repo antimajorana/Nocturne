@@ -79,7 +79,7 @@ pub fn escape(s: &str) -> String {
 }
 
 pub fn unescape(s: &str) -> String {
-    let named = s.replace("&nbsp;", " ").replace("&quot;", "\"").replace("&gt;", ">").replace("&lt;", "<");
+    let named = s.replace("&nbsp;", "\u{a0}").replace("&quot;", "\"").replace("&gt;", ">").replace("&lt;", "<");
     // Numeric references (&#9744; and &#x2610;), then &amp; last so "&amp;#9744;" stays literal.
     let mut out = String::with_capacity(named.len());
     let mut rest = named.as_str();
@@ -350,7 +350,7 @@ fn font_family(attrs: &str) -> Option<String> {
 #[derive(Default)]
 struct Writer {
     out: String,
-    lists: Vec<(bool, usize)>, // (ordered, counter)
+    lists: Vec<Option<usize>>, // Next ordinal, or None for an unordered list.
     in_pre: bool,
     in_code: bool,
     /// Where the open inline code's text starts, in `cell` inside a table and `out` elsewhere.
@@ -386,6 +386,9 @@ impl Writer {
         if let Some(at) = self.fence_at.take().filter(|&at| self.out.is_char_boundary(at)) {
             let code_from = self.out[at..].find('\n').map_or(self.out.len(), |n| at + n + 1);
             fence = crate::markdown::code_fence(&self.out[code_from..]);
+            if code_from < self.out.len() {
+                self.out.push('\n');
+            }
             if fence.len() > 3 {
                 self.out.insert_str(at, &fence[3..]);
             }
@@ -425,6 +428,14 @@ impl Writer {
         }
     }
 
+    fn trim_list_line(&mut self) {
+        let line = self.out.rsplit('\n').next().unwrap_or_default();
+        // The space after a bare list marker tells the Markdown reader that it is an item.
+        if !crate::markdown::list_marker(line).is_some_and(|(_, _, _, rest)| rest.trim().is_empty()) {
+            self.out.truncate(self.out.trim_end_matches([' ', '\t']).len());
+        }
+    }
+
     fn line_break(&mut self, attrs: &str) {
         if self.in_cell {
             let newline = match attr(attrs, "data-nc-break").as_deref() {
@@ -445,15 +456,20 @@ impl Writer {
 
     fn text(&mut self, t: &str) {
         if self.in_pre || self.in_math_block {
-            let s = t.to_string();
-            self.push(&s);
+            self.push(t);
+            return;
+        }
+        if self.in_code {
+            // Markdown code spans read line endings as spaces while keeping other spacing.
+            self.push(&t.replace("\r\n", " ").replace(['\r', '\n'], " "));
             return;
         }
         let mut s = String::new();
         let mut last_space =
             if self.in_cell { self.cell.ends_with(' ') } else { self.out.ends_with(' ') || self.out.ends_with('\n') || self.out.is_empty() };
         for c in t.chars() {
-            if c.is_whitespace() {
+            // HTML collapses only these characters. A no-break or ideographic space is content.
+            if matches!(c, ' ' | '\t' | '\n' | '\x0c' | '\r') {
                 if !last_space {
                     s.push(' ');
                     last_space = true;
@@ -463,14 +479,37 @@ impl Writer {
                 last_space = false;
             }
         }
-        if self.math_depth > 0 || self.in_code {
+        if self.math_depth > 0 {
             // Keep the TeX as written between dollar signs.
             self.push(&s);
         } else {
-            let quoted = crate::render::escape_markdown(&s);
+            let text = self.task_text(&s);
+            let quoted = crate::render::escape_markdown(text);
             let quoted = if self.out.is_empty() || self.out.ends_with('\n') { crate::render::escape_block_start(&quoted) } else { quoted };
             self.push(&quoted);
         }
+    }
+
+    /// A ballot box can start a task in a paragraph or supply the checkbox of a list item.
+    fn task_text<'a>(&mut self, text: &'a str) -> &'a str {
+        if self.in_cell {
+            return text;
+        }
+        let (marker, rest) = if let Some(rest) = text.strip_prefix("\u{2610} ") {
+            ("[ ] ", rest)
+        } else if let Some(rest) = text.strip_prefix("\u{2611} ").or_else(|| text.strip_prefix("\u{2612} ")) {
+            ("[x] ", rest)
+        } else {
+            return text;
+        };
+        let line = self.out.rsplit('\n').next().unwrap_or_default();
+        if line.trim().is_empty() {
+            self.push("- ");
+        } else if !crate::markdown::list_marker(line).is_some_and(|(_, _, _, rest)| rest.is_empty()) {
+            return text;
+        }
+        self.push(marker);
+        rest
     }
 
     fn tag(&mut self, name: &str, closing: bool, attrs: &str) {
@@ -492,9 +531,6 @@ impl Writer {
             ("div", true) if self.div_diagram => {
                 self.div_diagram = false;
                 self.in_pre = false;
-                if !self.out.ends_with('\n') {
-                    self.out.push('\n');
-                }
                 self.close_fence();
                 self.block_break();
             }
@@ -535,10 +571,10 @@ impl Writer {
             }
             ("ul" | "ol", false) => {
                 if !self.lists.is_empty() {
-                    let trimmed = self.out.trim_end_matches([' ', '\t']).len();
-                    self.out.truncate(trimmed);
+                    self.trim_list_line();
                 }
-                self.lists.push((name == "ol", 0));
+                let start = (name == "ol").then(|| attr(attrs, "start").and_then(|start| start.parse().ok()).unwrap_or(1));
+                self.lists.push(start);
                 if !self.out.is_empty() && !self.out.ends_with('\n') {
                     self.out.push('\n');
                 }
@@ -555,17 +591,17 @@ impl Writer {
                 }
                 let depth = self.lists.len().saturating_sub(1);
                 let marker = match self.lists.last_mut() {
-                    Some((true, n)) => {
-                        *n += 1;
-                        format!("{n}. ")
+                    Some(Some(next)) => {
+                        let number = attr(attrs, "value").and_then(|value| value.parse().ok()).unwrap_or(*next);
+                        *next = number.saturating_add(1);
+                        format!("{number}. ")
                     }
                     _ => "- ".to_string(),
                 };
                 self.out.push_str(&format!("{}{marker}", "  ".repeat(depth)));
             }
             ("li", true) => {
-                let trimmed = self.out.trim_end_matches([' ', '\t']).len();
-                self.out.truncate(trimmed);
+                self.trim_list_line();
                 self.line_break("");
             }
             ("b" | "strong", _) => self.push("**"),
@@ -603,9 +639,6 @@ impl Writer {
             }
             ("pre", true) => {
                 self.in_pre = false;
-                if !self.out.ends_with('\n') {
-                    self.out.push('\n');
-                }
                 self.close_fence();
                 self.block_break();
             }
@@ -670,7 +703,7 @@ impl Writer {
                     self.push(&img_tag);
                     self.block_break();
                 } else {
-                    self.push(&format!("![{alt}]({})", crate::render::destination(&src)));
+                    self.push(&crate::render::image_link(&alt, &src));
                 }
             }
             ("video" | "audio", false) => {
@@ -707,36 +740,10 @@ impl Writer {
         }
     }
 
-    fn finish(self) -> String {
-        let mut s = self
-            .out
-            .lines()
-            .map(|l| {
-                // A ballot box starts a to-do, whether it is a paragraph of its own or a
-                // list item: "&#9744; buy milk" and "<li>&#9744; buy milk</li>" both mean
-                // the same thing, and Nocturne writes the second one.
-                let (prefix, rest) = match l.find(['\u{2610}', '\u{2611}', '\u{2612}']) {
-                    Some(at) if l.get(..at).is_some_and(|p| p.trim_end().is_empty() || p.trim_end().ends_with('-')) => {
-                        (l.get(..at).unwrap_or(""), l.get(at..).unwrap_or(""))
-                    }
-                    _ => return l.to_string(),
-                };
-                let indent = prefix.trim_end_matches("- ").trim_end_matches('-');
-                if let Some(rest) = rest.strip_prefix("\u{2610} ") {
-                    format!("{indent}- [ ] {rest}")
-                } else if let Some(rest) = rest.strip_prefix("\u{2611} ").or_else(|| rest.strip_prefix("\u{2612} ")) {
-                    format!("{indent}- [x] {rest}")
-                } else {
-                    l.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        while s.ends_with('\n') || s.ends_with(' ') {
-            s.pop();
-        }
-        s.push('\n');
-        s
+    fn finish(mut self) -> String {
+        self.out.truncate(self.out.trim_end_matches('\n').len());
+        self.out.push('\n');
+        self.out
     }
 }
 

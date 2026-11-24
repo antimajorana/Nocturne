@@ -180,6 +180,24 @@ fn every_page_model_block_round_trips_through_both_formats_and_boxes() {
 }
 
 #[test]
+fn empty_headings_and_significant_spaces_survive_in_both_formats() {
+    use nocturne_formats::markdown::Span;
+
+    let spaced = Block::Paragraph(vec![Span { text: "one\u{a0}two\u{3000}three".into(), ..Span::default() }]);
+    let expected = vec![
+        Block::Heading { level: 2, spans: Vec::new() },
+        Block::Paragraph(vec![Span { text: "##".into(), ..Span::default() }]),
+        Block::Paragraph(vec![Span { text: "  let  n = 2  ".into(), code: true, ..Span::default() }]),
+        spaced.clone(),
+    ];
+    for format in [PageFormat::Cmgfm, PageFormat::Html] {
+        let body = boxes::write(format, &expected, None);
+        assert_eq!(boxes::read(format, &body).0, expected, "{format:?} must retain both structure and significant spaces:\n{body}");
+    }
+    assert_eq!(boxes::read(PageFormat::Html, "<p>one&nbsp;two&#12288;three</p>").0, vec![spaced]);
+}
+
+#[test]
 fn all_demo_pages_keep_their_model_across_repeated_saves() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/demo/DemoNotebook");
     for notebook in ["html", "cmgfm"] {

@@ -450,7 +450,7 @@ fn inline(chars: &[char], st: Style, link: Option<String>, depth: usize, cell_br
                     // Preserve the surrounding link when an image is nested in one. This is
                     // how attachment cards (`[![icon](icon) name](file)`) retain their target.
                     out.push(Span {
-                        text: alt,
+                        text: image_label(&alt),
                         image: Some(url),
                         font_size: st.font_size,
                         font_family: st.font_family.clone(),
@@ -486,6 +486,19 @@ fn inline(chars: &[char], st: Style, link: Option<String>, depth: usize, cell_br
     }
     push_text(&mut out, &mut buf, &st, &link);
     out
+}
+
+fn image_label(label: &str) -> String {
+    let mut text = String::new();
+    let mut chars = label.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek().is_some_and(|next| matches!(next, '\\' | '[' | ']')) {
+            text.extend(chars.next());
+        } else {
+            text.push(c);
+        }
+    }
+    text
 }
 
 /// `[label](url)` starting at `start` (the `[`). Returns label, url and the index after `)`.
@@ -596,7 +609,7 @@ fn cells(line: &str) -> Vec<String> {
     cells
 }
 
-fn list_marker(line: &str) -> Option<(bool, usize, usize, &str)> {
+pub(crate) fn list_marker(line: &str) -> Option<(bool, usize, usize, &str)> {
     // Returns (ordered, number, indent width, rest after the marker).
     let indent = line.len() - line.trim_start().len();
     let t = line.trim_start();
@@ -615,9 +628,29 @@ fn list_marker(line: &str) -> Option<(bool, usize, usize, &str)> {
     None
 }
 
+pub(crate) fn task_marker(text: &str) -> Option<(bool, &str)> {
+    let done = match text.get(..3)? {
+        "[ ]" => false,
+        "[x]" | "[X]" => true,
+        _ => return None,
+    };
+    let rest = text.get(3..)?;
+    let rest = if rest.is_empty() { rest } else { rest.strip_prefix(' ')? };
+    Some((done, rest))
+}
+
 fn starts_block(line: &str) -> bool {
     let t = line.trim_start();
     t.starts_with('#') || backtick_fence_open(t).is_some() || t.starts_with('>') || t.starts_with("$$") || list_marker(line).is_some()
+}
+
+pub(crate) fn heading_marker(line: &str) -> Option<(u8, &str)> {
+    let level = line.bytes().take_while(|&byte| byte == b'#').count();
+    let rest = line.get(level..)?;
+    if !(1..=6).contains(&level) || !(rest.is_empty() || rest.starts_with([' ', '\t'])) {
+        return None;
+    }
+    Some((u8::try_from(level).ok()?, rest.trim()))
 }
 
 fn parse_attr(tag: &str, name: &str) -> Option<String> {
@@ -709,10 +742,8 @@ pub fn parse(src: &str) -> Vec<Block> {
         } else if let Some(img_block) = try_parse_img_block(line) {
             out.push(img_block);
             i += 1;
-        } else if t.starts_with('#') && t.trim_start_matches('#').starts_with(' ') && t.chars().take_while(|&c| c == '#').count() <= 6 {
-            let level = t.chars().take_while(|&c| c == '#').count();
-            let rest = t.trim_start_matches('#').trim();
-            out.push(Block::Heading { level: u8::try_from(level).unwrap_or(6), spans: parse_inline(rest) });
+        } else if let Some((level, rest)) = heading_marker(t) {
+            out.push(Block::Heading { level, spans: parse_inline(rest) });
             i += 1;
         } else if t.len() >= 3 && (t.chars().all(|c| c == '-') || t.chars().all(|c| c == '*') || t.chars().all(|c| c == '_')) {
             out.push(Block::Rule);
@@ -734,13 +765,7 @@ pub fn parse(src: &str) -> Vec<Block> {
             }
             out.push(Block::Table { head, rows });
         } else if let Some((ordered, number, indent, rest)) = list_marker(line) {
-            let (task, rest) = if let Some(r) = rest.strip_prefix("[ ] ") {
-                (Some(false), r)
-            } else if let Some(r) = rest.strip_prefix("[x] ").or_else(|| rest.strip_prefix("[X] ")) {
-                (Some(true), r)
-            } else {
-                (None, rest)
-            };
+            let (task, rest) = task_marker(rest).map_or((None, rest), |(done, after)| (Some(done), after));
             out.push(Block::Item { ordered, number, task, depth: indent / 2, spans: parse_inline(rest) });
             i += 1;
         } else {
@@ -756,9 +781,14 @@ pub fn parse(src: &str) -> Vec<Block> {
             }
             let joined = parts.join(" ");
             let spans = parse_inline(&joined);
-            // A line that is only an image becomes an image block.
+            // An image block has no place to store the link or the span's styling.
             if let [only] = spans.as_slice()
                 && let Some(src) = &only.image
+                && only.link.is_none()
+                && only.font_size.is_none()
+                && only.font_family.is_none()
+                && !only.underline
+                && only.script.is_none()
             {
                 out.push(Block::Image { alt: only.text.clone(), src: src.clone(), width: None, height: None });
                 continue;

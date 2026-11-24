@@ -51,8 +51,14 @@ const MAX_DEPTH: usize = 48;
 pub fn parse(src: &str) -> Node {
     let chars: Vec<char> = src.chars().take(MAX_LEN).collect();
     let mut p = Parser { chars, pos: 0, depth: 0 };
-    let nodes = p.row(None);
+    let nodes = p.row(RowEnd::Input);
     Node::Row(nodes)
+}
+
+enum RowEnd {
+    Input,
+    Character(char),
+    Right,
 }
 
 struct Parser {
@@ -170,19 +176,21 @@ impl Parser {
         }
     }
 
-    /// Parses items until `end` (a closing brace, or `\right`) or the end of the input.
-    fn row(&mut self, end: Option<char>) -> Vec<Node> {
+    /// Parses items up to a delimiter or the end of the input.
+    fn row(&mut self, end: RowEnd) -> Vec<Node> {
         let mut out: Vec<Node> = Vec::new();
         loop {
             self.skip_space();
             let Some(c) = self.peek() else { break };
-            if Some(c) == end {
+            let closes = match end {
+                RowEnd::Input => false,
+                RowEnd::Character(close) => c == close,
+                RowEnd::Right => c == '}' || (c == '\\' && self.at_command("right")),
+            };
+            if closes {
                 break;
             }
-            if c == '\\' && self.at_command("right") {
-                break;
-            }
-            let Some(atom) = self.atom() else { continue };
+            let Some(atom) = self.atom(false) else { break };
             out.push(self.scripts(atom));
         }
         out
@@ -223,28 +231,13 @@ impl Parser {
     /// The argument of `^`, `_` or a command: a group, or one token.
     fn operand(&mut self) -> Node {
         self.skip_space();
-        match self.peek() {
-            Some('{') => {
-                self.pos += 1;
-                self.group_body()
-            }
-            Some(_) => match self.atom() {
-                Some(n) => n,
-                None => Node::Row(Vec::new()),
-            },
-            None => Node::Row(Vec::new()),
-        }
+        self.atom(true).unwrap_or_else(|| Node::Row(Vec::new()))
     }
 
-    /// After an opening brace: the contents, consuming the closing brace.
-    fn group_body(&mut self) -> Node {
-        if self.depth >= MAX_DEPTH {
-            return Node::Text(String::new());
-        }
-        self.depth += 1;
-        let nodes = self.row(Some('}'));
-        self.depth -= 1;
-        if self.peek() == Some('}') {
+    /// After an opening delimiter, parses its contents and consumes the closing delimiter.
+    fn delimited_row(&mut self, close: char) -> Node {
+        let nodes = self.row(RowEnd::Character(close));
+        if self.peek() == Some(close) {
             self.pos += 1;
         }
         Node::Row(nodes)
@@ -284,14 +277,20 @@ impl Parser {
         s
     }
 
-    fn atom(&mut self) -> Option<Node> {
+    fn atom(&mut self, single_token: bool) -> Option<Node> {
         let c = self.peek()?;
         self.pos += 1;
-        Some(match c {
-            '{' => self.group_body(),
+        // Commands can nest through unbraced operands as well as through groups.
+        if self.depth >= MAX_DEPTH {
+            return Some(Node::Text(c.to_string()));
+        }
+        self.depth += 1;
+        let node = match c {
+            '{' => self.delimited_row('}'),
             '\\' => self.command(),
             '}' | '^' | '_' => Node::Text(c.to_string()),
-            c if c.is_ascii_digit() || (c == '.' && self.peek().is_some_and(|n| n.is_ascii_digit())) => {
+            c if single_token && c.is_ascii_digit() => Node::Number(c.to_string()),
+            c if !single_token && (c.is_ascii_digit() || (c == '.' && self.peek().is_some_and(|n| n.is_ascii_digit()))) => {
                 let mut s = c.to_string();
                 while let Some(n) = self.peek() {
                     if n.is_ascii_digit() || n == '.' {
@@ -309,7 +308,9 @@ impl Parser {
             '*' => Node::Op { text: "\u{2217}".to_string(), binary: true },
             ',' | ';' => Node::Op { text: c.to_string(), binary: false },
             c => Node::Op { text: c.to_string(), binary: false },
-        })
+        };
+        self.depth -= 1;
+        Some(node)
     }
 
     fn command(&mut self) -> Node {
@@ -356,15 +357,7 @@ impl Parser {
                 self.skip_space();
                 let index = if self.peek() == Some('[') {
                     self.pos += 1;
-                    let mut s = String::new();
-                    while let Some(c) = self.peek() {
-                        self.pos += 1;
-                        if c == ']' {
-                            break;
-                        }
-                        s.push(c);
-                    }
-                    Some(Box::new(parse(&s)))
+                    Some(Box::new(self.delimited_row(']')))
                 } else {
                     None
                 };
@@ -377,12 +370,7 @@ impl Parser {
             "text" | "mathrm" | "textrm" | "mathbf" | "mathbb" | "mathcal" | "operatorname" | "mbox" => Node::Text(self.raw_group()),
             "left" => {
                 let open = self.delimiter();
-                if self.depth >= MAX_DEPTH {
-                    return Node::Text(String::new());
-                }
-                self.depth += 1;
-                let body = self.row(None);
-                self.depth -= 1;
+                let body = self.row(RowEnd::Right);
                 let close = if self.at_command("right") {
                     self.pos += "\\right".chars().count();
                     self.delimiter()
@@ -483,6 +471,50 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(matches!(&row("\\sum_{i=1}^{n} i")[0], Node::Big { kind: BigKind::Sum, .. }));
+    }
+
+    #[test]
+    fn unbraced_operands_consume_one_digit_but_braced_numbers_stay_together() {
+        assert_eq!(row(r"\frac12"), vec![Node::Frac(Box::new(Node::Number("1".into())), Box::new(Node::Number("2".into())))]);
+        assert_eq!(
+            row("x^12"),
+            vec![
+                Node::Script { base: Box::new(Node::Ident("x".into())), sub: None, sup: Some(Box::new(Node::Number("1".into()))) },
+                Node::Number("2".into()),
+            ]
+        );
+        assert!(matches!(&row("x^{12}")[..], [Node::Script { sup: Some(s), .. }] if **s == Node::Row(vec![Node::Number("12".into())])));
+    }
+
+    #[test]
+    fn an_unmatched_right_delimiter_keeps_the_rest_of_the_formula() {
+        let nodes = row(r"x \right) + y");
+        assert_eq!(nodes.get(1), Some(&Node::Text(r"\right".into())));
+        assert_eq!(nodes.last(), Some(&Node::Ident("y".into())));
+        let nodes = row(r"{\left(x} + y");
+        assert_eq!(nodes.last(), Some(&Node::Ident("y".into())));
+    }
+
+    #[test]
+    fn nested_roots_in_an_optional_index_keep_the_outer_closing_bracket() {
+        let nodes = row(r"\sqrt[\sqrt[2]{3}]{4} + x");
+        let [Node::Sqrt { index: Some(index), body }, _, Node::Ident(_)] = &nodes[..] else { panic!("{nodes:?}") };
+        assert!(matches!(index.as_ref(), Node::Row(items) if matches!(&items[..], [Node::Sqrt { index: Some(_), .. }])));
+        assert_eq!(**body, Node::Row(vec![Node::Number("4".into())]));
+    }
+
+    #[test]
+    fn unbraced_commands_share_the_parser_depth_limit() {
+        let input = [r"\sqrt".repeat(MAX_DEPTH + 20), "x + y".into()].join(" ");
+        let nodes = row(&input);
+        let mut at = &nodes[0];
+        let mut depth = 0;
+        while let Node::Sqrt { body, .. } = at {
+            depth += 1;
+            at = body;
+        }
+        assert_eq!(depth, MAX_DEPTH);
+        assert_eq!(nodes.last(), Some(&Node::Ident("y".into())));
     }
 
     #[test]

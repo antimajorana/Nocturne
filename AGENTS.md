@@ -112,8 +112,8 @@ Each level includes the ones before it. The detail, with every check, is in
 | Level | When | What runs |
 |---|---|---|
 | **L0** | After each task | `cargo fmt`, clippy and tests for the crates changed |
-| **L1** | Before a commit (pre-commit and commit-msg hooks) | `cargo xtask check-branch` (not on `main`, branch prefix, nothing stray or huge staged, warns when behind `origin/main`), PII, fmt, layers, assets, docs, text; subject `type(scope): what` |
-| **L2** | Before a push (pre-push hook) | `cargo xtask check-branch --push` (up to date with the newest `origin/main`; merge commits allowed), PII, the full `cargo xtask ci` |
+| **L1** | Before a commit | Hooks check for commits on `main`, staged scratch paths, staged PII, and subject format. Run `cargo xtask check-branch` for branch and staged-file checks. |
+| **L2** | Before a push | The pre-push hook scans outgoing PII. Run `cargo xtask check-branch --push` for branch freshness and `cargo xtask ci` for the full gate. |
 | **L3** | Pull request (CI) | L2 on Linux, branch name check, coverage compared per platform (warns, never blocks), the pull request template's checklist |
 | **L4** | Release | `nc-reelase-signoff`; by hand today, automation planned, starting with the installer smoke test |
 

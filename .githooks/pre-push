@@ -1,14 +1,20 @@
 #!/bin/sh
-# Fast pre-push guard (< 1s): PII scan only; full CI runs on GitHub Actions.
-# Skip once:        git push --no-verify
-# Turn off for good: git config --unset core.hooksPath
+# Fast pre-push guard: scan the outgoing file contents for PII.
 set -e
 
-cat > /dev/null
-exec < /dev/null
-
-if ! bash SKILLS/nc-devx/scripts/check-pii.sh origin/main; then
-    echo
-    echo "pre-push: PII check failed. Remove sensitive data before pushing."
-    exit 1
-fi
+export GIT_NO_REPLACE_OBJECTS=1
+scanner=SKILLS/nc-devx/scripts/check-pii.sh
+while read -r local_ref local_oid remote_ref remote_oid; do
+    case "$local_oid" in
+        *[!0]*) ;;
+        *) continue ;;  # This ref is being deleted.
+    esac
+    if ! git cat-file -e "$local_oid^{commit}" 2>/dev/null; then
+        continue  # The ref does not point to a commit.
+    fi
+    if git cat-file -e "$remote_oid^{commit}" 2>/dev/null; then
+        bash "$scanner" --range "$remote_oid" "$local_oid"
+    else
+        bash "$scanner" --all "$local_oid"
+    fi
+done

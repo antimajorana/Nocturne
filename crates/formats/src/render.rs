@@ -53,9 +53,7 @@ pub fn blocks_to_markdown(blocks: &[Block]) -> String {
                 out.push_str(lang);
                 out.push('\n');
                 out.push_str(text);
-                if !text.ends_with('\n') {
-                    out.push('\n');
-                }
+                out.push('\n');
                 out.push_str(&fence);
                 out.push('\n');
             }
@@ -85,7 +83,8 @@ pub fn blocks_to_markdown(blocks: &[Block]) -> String {
                     img_tag.push_str(">\n");
                     out.push_str(&img_tag);
                 } else {
-                    out.push_str(&format!("![{alt}]({})\n", destination(src)));
+                    out.push_str(&image_link(alt, src));
+                    out.push('\n');
                 }
             }
         }
@@ -268,7 +267,7 @@ pub(crate) fn code_span(text: &str) -> String {
 fn leaf(s: &Span, literal: &Literal) -> String {
     let styled = |text: String| inline_style(s, inline_marks(s, text));
     if let Some(src) = &s.image {
-        let image = format!("![{}]({})", s.text, destination(src));
+        let image = image_link(&s.text, src);
         let image = match &s.link {
             Some(target) => format!("[{image}]({})", destination(target)),
             None => image,
@@ -284,6 +283,18 @@ fn leaf(s: &Span, literal: &Literal) -> String {
         None => text,
     };
     styled(text)
+}
+
+/// Image labels are plain text. Quote the characters that could end or nest the label.
+pub(crate) fn image_link(alt: &str, src: &str) -> String {
+    let mut label = String::new();
+    for c in alt.chars() {
+        if matches!(c, '\\' | '[' | ']') {
+            label.push('\\');
+        }
+        label.push(c);
+    }
+    format!("![{label}]({})", destination(src))
 }
 
 /// A link or picture address as it is written between `(` and `)`. Balanced parentheses are
@@ -396,15 +407,14 @@ pub(crate) fn escape_markdown(text: &str) -> String {
 
 /// Words at the start of a list item that read like a task box (`[x] shipped`) stay words.
 pub(crate) fn escape_task_box(text: &str) -> String {
-    if ["[ ] ", "[x] ", "[X] "].iter().any(|m| text.starts_with(m)) { format!("\\{text}") } else { text.into() }
+    if crate::markdown::task_marker(text).is_some() { format!("\\{text}") } else { text.into() }
 }
 
 /// A paragraph must not turn into a heading, list, quote, rule or picture when serialized.
 pub(crate) fn escape_block_start(text: &str) -> String {
     let t = text.trim_start();
     let rule = t.trim_end();
-    let hashes = t.bytes().take_while(|c| *c == b'#').count();
-    let heading = (1..=6).contains(&hashes) && t.as_bytes().get(hashes) == Some(&b' ');
+    let heading = crate::markdown::heading_marker(rule).is_some();
     let digits = t.bytes().take_while(u8::is_ascii_digit).count();
     let ordered = digits > 0 && t.get(digits..).is_some_and(|s| s.starts_with(". ") || s.starts_with(") "));
     let bullet = ["- ", "+ ", "* "].iter().any(|m| t.starts_with(m));
@@ -472,7 +482,13 @@ pub fn blocks_to_html(blocks: &[Block]) -> String {
                     "mermaid" => " class=\"diagram\"".to_string(),
                     other => format!(" class=\"{}\"", escape(other)),
                 };
-                out.push_str(&format!("<pre{class}>{}</pre>\n", escape(text.trim_end_matches('\n'))));
+                let code = escape(text);
+                // HTML ignores a newline immediately inside <pre>.
+                if text.starts_with('\n') {
+                    out.push_str(&format!("<pre{class}><code>{code}</code></pre>\n"));
+                } else {
+                    out.push_str(&format!("<pre{class}>{code}</pre>\n"));
+                }
             }
             Block::MathBlock(tex) => out.push_str(&format!("<p class=\"math\">{}</p>\n", escape(tex.trim_end_matches('\n')))),
             Block::Table { head, rows } => {
@@ -514,7 +530,8 @@ pub fn blocks_to_html(blocks: &[Block]) -> String {
 /// Writes one contiguous list level, nesting child items inside their parent list item.
 fn render_html_list(blocks: &[Block], at: &mut usize, depth: usize, ordered: bool, out: &mut String) {
     out.push_str(if ordered { "<ol>\n" } else { "<ul>\n" });
-    while let Some(Block::Item { ordered: item_ordered, task, depth: item_depth, spans, .. }) = blocks.get(*at) {
+    let mut next = 1;
+    while let Some(Block::Item { ordered: item_ordered, number, task, depth: item_depth, spans }) = blocks.get(*at) {
         if *item_depth < depth {
             break;
         }
@@ -530,7 +547,14 @@ fn render_html_list(blocks: &[Block], at: &mut usize, depth: usize, ordered: boo
             Some(false) => "&#9744; ",
             None => "",
         };
-        out.push_str(&format!("<li>{box_text}{}", spans_to_html(spans)));
+        if ordered && *number != next {
+            out.push_str(&format!("<li value=\"{number}\">"));
+        } else {
+            out.push_str("<li>");
+        }
+        next = number.saturating_add(1);
+        out.push_str(box_text);
+        out.push_str(&spans_to_html(spans));
         *at += 1;
         while let Some(Block::Item { depth: child_depth, ordered: child_ordered, .. }) = blocks.get(*at)
             && *child_depth > depth
@@ -707,6 +731,15 @@ fn b() {}"
         }
     }
 
+    #[test]
+    fn code_keeps_blank_lines_and_literal_ballot_boxes_in_both_formats() {
+        for text in ["", "\n", "let x = 1;\n", "\n☐ keep this text\n  - ☑ keep this too\n\n"] {
+            let original = [Block::Code { lang: "text".into(), text: text.into() }];
+            assert_eq!(parse(&blocks_to_markdown(&original)), original);
+            assert_eq!(parse(&html::to_markdown(&blocks_to_html(&original))), original);
+        }
+    }
+
     /// Issue #106: code that holds a fence line of its own stays one block, in both formats.
     /// The fence written round it is longer than any run of backticks starting one of its
     /// lines, and only a fence at least as long as the opening one closes the block.
@@ -844,6 +877,25 @@ fn b() {}"
     }
 
     #[test]
+    fn image_labels_keep_delimiters_and_standalone_linked_images_keep_their_target() {
+        let alt = r"Caption ] [ ending in \";
+        let src = "assets/image.png";
+        let target = "other-page.md";
+        let cases = [
+            Block::Image { alt: alt.into(), src: src.into(), width: None, height: None },
+            Block::Paragraph(vec![Span { text: alt.into(), image: Some(src.into()), link: Some(target.into()), ..Span::default() }]),
+            Block::Paragraph(vec![Span { text: alt.into(), image: Some(src.into()), underline: true, font_size: Some(18), ..Span::default() }]),
+        ];
+        for block in cases {
+            let original = [block];
+            assert_eq!(parse(&blocks_to_markdown(&original)), original);
+            assert_eq!(parse(&html::to_markdown(&blocks_to_html(&original))), original);
+        }
+        let authored = parse("[![a](image.png)](target.md)\n");
+        assert!(matches!(&authored[..], [Block::Paragraph(spans)] if spans[0].link.as_deref() == Some("target.md")));
+    }
+
+    #[test]
     fn html_escapes_everything_that_matters() {
         let blocks = parse("A <script> & \"quotes\" in **bold**\n");
         let html = blocks_to_html(&blocks);
@@ -867,6 +919,32 @@ fn b() {}"
         assert!(html.ends_with("<p>text</p>\n"), "{html}");
         // A list at the very end is still closed.
         assert!(blocks_to_html(&parse("- a\n")).ends_with("</ul>\n"));
+    }
+
+    #[test]
+    fn lists_keep_explicit_ordinals_and_ordered_tasks_across_formats() {
+        let blocks = parse("7. first\n  3. nested\n10. [x] completed\n11. next\n");
+        let written = blocks_to_html(&blocks);
+        assert!(written.contains("<li value=\"7\">first"), "{written}");
+        assert!(written.contains("<li value=\"10\">&#9745; completed"), "{written}");
+        assert_eq!(parse(&html::to_markdown(&written)), blocks);
+        assert_eq!(parse(&blocks_to_markdown(&blocks)), blocks);
+
+        let authored = "<ol start=\"7\"><li>first<ol start=\"3\"><li>nested</li></ol></li><li value=\"10\">&#9745; completed</li><li>next</li></ol>";
+        assert_eq!(parse(&html::to_markdown(authored)), blocks);
+    }
+
+    #[test]
+    fn lists_keep_empty_items_tasks_and_nested_parents() {
+        let blocks = parse("- \n  - [ ]\n- \\[x]\n- \n9. \n10. [x]\n11. \n");
+        assert_eq!(blocks.len(), 7);
+        assert!(matches!(&blocks[1], Block::Item { task: Some(false), spans, .. } if spans.is_empty()));
+        assert!(matches!(&blocks[2], Block::Item { task: None, spans, .. } if spans[0].text == "[x]"));
+        assert!(matches!(&blocks[5], Block::Item { task: Some(true), spans, .. } if spans.is_empty()));
+        let html = blocks_to_html(&blocks);
+        let reread = html::to_markdown(&html);
+        assert_eq!(parse(&reread), blocks, "HTML:\n{html}\n--- read as ---\n{reread}");
+        assert_eq!(parse(&blocks_to_markdown(&blocks)), blocks);
     }
 
     #[test]

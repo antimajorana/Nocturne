@@ -22,8 +22,8 @@
 #                                browser's clipboard (arboard has none for the browser).
 # The modules that use files or the clock take `std` from crates/model/src/playground.rs on wasm through ONE `use`
 # line at their end (a local `std` shadows the standard library's name in that module; everything else in it still
-# comes from the real std). Path::is_file / is_dir ask the real file system, so the three calls the tree needs read
-# the same through `fs::metadata` (what those methods do). Native builds see none of this: every rule adds wasm-only
+# comes from the real std). Path::is_file / is_dir ask the host file system, so patched callers use
+# `fs::metadata` in those places. Native builds see none of this: every rule adds wasm-only
 # lines, or an expression that does exactly what it replaces.
 # If upstream starts using std::fs or Instant in another module, give that module the same one-line rule.
 
@@ -91,10 +91,85 @@
   find: '(?![\s\S])'
   after: "\n// Playground's browser build: files (patches/onenote.yaml).\n#[cfg(target_arch = \"wasm32\")] use nocturne_model::playground::std;\n"
 
-# File::open in the browser must read from the same in-memory notebook as read_to_string and read_dir.
+# File handles in the browser use the same in-memory notebook as read_to_string and read_dir.
 - file: crates/model/src/playground.rs
   find: 'pub\s+mod\s+fs\s*\{'
-  after: "\n        /// A read handle into one file in the browser's in-memory notebook.\n        pub struct File { path: PathBuf, position: usize }\n\n        impl File {\n            pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {\n                let path = key(path.as_ref());\n                if !metadata(&path)?.is_file() {\n                    return Err(io::Error::new(io::ErrorKind::InvalidInput, \"not a file\"));\n                }\n                Ok(Self { path, position: 0 })\n            }\n        }\n\n        impl io::Read for File {\n            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {\n                let path = self.path.clone();\n                let position = self.position;\n                let count = TREE.with(|tree| match tree.borrow().entries.get(&path) {\n                    Some(Entry::File(bytes, _)) => {\n                        let start = position.min(bytes.len());\n                        let rest = &bytes[start..];\n                        let count = rest.len().min(buffer.len());\n                        buffer[..count].copy_from_slice(&rest[..count]);\n                        Ok(count)\n                    }\n                    _ => Err(missing(&path)),\n                })?;\n                self.position += count;\n                Ok(count)\n            }\n        }\n"
+  after: |2
+
+            /// A handle into one file in the browser's in-memory notebook.
+            pub struct File { path: PathBuf, position: usize, writable: bool }
+
+            impl File {
+                pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+                    let path = key(path.as_ref());
+                    if !metadata(&path)?.is_file() {
+                        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a file"));
+                    }
+                    Ok(Self { path, position: 0, writable: false })
+                }
+
+                pub fn create_new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+                    let path = key(path.as_ref());
+                    with(|tree| {
+                        if tree.entries.contains_key(&path) {
+                            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} exists", path.display())));
+                        }
+                        if !path.parent().is_some_and(|parent| matches!(tree.entries.get(parent), Some(Entry::Dir))) {
+                            return Err(missing(&path));
+                        }
+                        tree.put(path.clone(), Vec::new());
+                        tree.mark(path.clone());
+                        Ok(Self { path, position: 0, writable: true })
+                    })
+                }
+
+                pub fn set_permissions(&self, _: Permissions) -> io::Result<()> {
+                    Ok(())
+                }
+            }
+
+            impl io::Read for File {
+                fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                    let path = self.path.clone();
+                    let position = self.position;
+                    let count = TREE.with(|tree| match tree.borrow().entries.get(&path) {
+                        Some(Entry::File(bytes, _)) => {
+                            let start = position.min(bytes.len());
+                            let rest = &bytes[start..];
+                            let count = rest.len().min(buffer.len());
+                            buffer[..count].copy_from_slice(&rest[..count]);
+                            Ok(count)
+                        }
+                        _ => Err(missing(&path)),
+                    })?;
+                    self.position += count;
+                    Ok(count)
+                }
+            }
+
+            impl io::Write for File {
+                fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                    if !self.writable {
+                        return Err(io::ErrorKind::PermissionDenied.into());
+                    }
+                    let end = self.position.checked_add(bytes.len()).ok_or(io::ErrorKind::InvalidInput)?;
+                    with(|tree| {
+                        let Some(Entry::File(data, id)) = tree.entries.get_mut(&self.path) else {
+                            return Err(missing(&self.path));
+                        };
+                        data.resize(data.len().max(end), 0);
+                        data[self.position..end].copy_from_slice(bytes);
+                        *id = content_id(data);
+                        tree.mark(self.path.clone());
+                        self.position = end;
+                        Ok(bytes.len())
+                    })
+                }
+
+                fn flush(&mut self) -> io::Result<()> {
+                    Ok(())
+                }
+            }
 
 # Add Seek to the browser File shim so ZIP-backed imports can read through the virtual notebook.
 - file: crates/model/src/playground.rs
@@ -108,9 +183,6 @@
 - file: crates/store/src/tree.rs
   find: '\|\(_,\s*p\)\|\s*p\.is_file\(\)'
   replace: '|(_, p)| fs::metadata(p).is_ok_and(|m| m.is_file())'
-- file: crates/store/src/tree.rs
-  find: '\.filter\(\|p\|\s*p\.is_dir\(\)\)'
-  replace: '.filter(|p| fs::metadata(p).is_ok_and(|m| m.is_dir()))'
 - file: crates/store/src/assets.rs
   find: '\.filter\(\|e\|\s*e\.path\(\)\.is_file\(\)\)'
   replace: '.filter(|e| fs::metadata(e.path()).is_ok_and(|m| m.is_file()))'
@@ -188,12 +260,6 @@
 - file: crates/store/src/links.rs
   find: '(?![\s\S])'
   after: "\n// Playground's browser build: files (patches/onenote.yaml).\n#[cfg(target_arch = \"wasm32\")] use nocturne_model::playground::std;\n"
-- file: crates/store/src/links.rs
-  find: '\bif\s+full\.is_dir\(\)'
-  replace: 'if std::fs::metadata(&full).is_ok_and(|m| m.is_dir())'
-- file: crates/store/src/links.rs
-  find: '\bif\s+full\.is_file\(\)'
-  replace: 'if std::fs::metadata(&full).is_ok_and(|m| m.is_file())'
 
 # Rules 25-28/28: the clipboard. crates/ui-egui/src/clipboard.rs reads pictures and words through arboard, which has
 # no browser clipboard (it does not compile for wasm32: "cannot find `Clipboard` in `platform`"). The web build drops
@@ -213,10 +279,10 @@
   after: "\n// Playground's browser build: the browser's clipboard (patches/onenote.yaml).\n#[cfg(target_arch = \"wasm32\")] #[path = \"playground_clipboard.rs\"] pub(crate) mod arboard;\n"
 # The Paste waits for the browser's clipboard, then runs again with it.
 - file: crates/ui-egui/src/app.rs
-  find: '\bfn\s+paste_here\s*\(\s*&mut\s+self\s*\)\s*\{'
-  after: "\n        #[cfg(target_arch = \"wasm32\")] if let Some(note) = crate::clipboard::arboard::ask() { return self.say(note); }"
+  find: '\bfn\s+paste_here\s*\(\s*&mut\s+self,\s*fallback_text:\s*Option<String>\s*\)\s*\{'
+  after: "\n        #[cfg(target_arch = \"wasm32\")] if fallback_text.is_none() && let Some(note) = crate::clipboard::arboard::ask() { return self.say(note); }"
 # Anchored on the once-a-frame copy in `update`, where `ctx` is a `&Context`, not on
 # `flush_pending_copy`, which comes first in the file and takes an `Option<&Context>`.
 - file: crates/ui-egui/src/app.rs
   find: 'if\s+let\s+Some\(\s*text\s*\)\s*=\s*self\.pending_copy\.take\(\)\s*\{\s*if\s+let\s+Some\(\s*html\s*\)\s*=\s*self\.pending_copy_html\.take\(\)'
-  before: "#[cfg(target_arch = \"wasm32\")] if crate::clipboard::arboard::arrived(ctx) { self.paste_here(); }\n        "
+  before: "#[cfg(target_arch = \"wasm32\")] if crate::clipboard::arboard::arrived(ctx) { self.paste_here(None); }\n        "

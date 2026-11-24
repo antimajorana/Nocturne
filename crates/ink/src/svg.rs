@@ -176,8 +176,10 @@ pub fn read(text: &str) -> Result<(Drawing, usize), InkError> {
         return Err(InkError::TooBig(text.len()));
     }
     let Some(open) = find_tag(text, "<svg") else { return Err(InkError::NotSvg) };
-    let width = attr(open, "width").and_then(|v| v.trim().parse().ok()).unwrap_or(600.0);
-    let height = attr(open, "height").and_then(|v| v.trim().parse().ok()).unwrap_or(400.0);
+    let dimension =
+        |name, default| attr(open, name).and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| v.is_finite() && *v > 0.0).unwrap_or(default);
+    let width = dimension("width", 600.0);
+    let height = dimension("height", 400.0);
     let view_box = attr(open, "viewBox").as_deref().and_then(parse_view_box).unwrap_or([0.0, 0.0, width, height]);
     let mut drawing = Drawing::new(view_box[2], view_box[3]);
     drawing.set_view_box(view_box[0], view_box[1], view_box[2], view_box[3]);
@@ -280,6 +282,16 @@ fn unescape(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invalid_svg_dimensions_use_a_finite_fallback() {
+        for invalid in ["inf", "NaN", "-10", "0"] {
+            let (drawing, _) = super::read(&format!(r#"<svg width="{invalid}" height="50"></svg>"#)).expect("SVG drawing");
+            assert_eq!((drawing.width, drawing.height), (600.0, 50.0), "width {invalid}");
+        }
+        let (drawing, _) = super::read(r#"<svg width="250" height="inf" viewBox="10 20 300 200"></svg>"#).expect("SVG drawing with view box");
+        assert_eq!((drawing.view_x, drawing.view_y, drawing.width, drawing.height), (10.0, 20.0, 300.0, 200.0));
+    }
+
     #[test]
     fn an_ink_file_is_known_by_its_namespace_not_its_name() {
         let drawing = {

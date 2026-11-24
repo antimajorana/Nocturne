@@ -83,7 +83,7 @@ Use `cargo xtask demo` only after changing authored demo content under `docs/dem
 
 ## 4. Run the full local gate
 
-Before requesting review, run the same full quality gate used by the local pre-push hook:
+Before requesting review, run the full local quality gate:
 
 ```bash
 cargo xtask ci
@@ -96,7 +96,7 @@ git diff --check
 git config core.hooksPath .githooks
 ```
 
-The pre-commit gate checks branch naming, staged content, PII, formatting, crate layers, assets, docs, and text. The pre-push gate checks that the branch is current with `origin/main`, scans PII, and runs the full CI gate. Fix a failing check and rerun it; do not bypass hooks.
+The pre-commit hook blocks commits on `main`, checks for staged scratch paths, and scans staged content for PII. The pre-push hook scans outgoing files for PII. Before pushing, run `cargo xtask check-branch --push` to check branch freshness and `cargo xtask ci` for the full gate. Fix and rerun failing checks.
 
 ## 5. Commit and open a pull request
 

@@ -421,11 +421,14 @@ impl eframe::App for Shell {
                 zoom,
                 !frame_stylus_ids.is_empty(),
             );
-            if let Some(delta) = bridge.gestures.drain_pan_delta() {
+            let pan = bridge.gestures.drain_pan_delta();
+            if let Some(delta) = pan {
                 self.app.apply_external_pan(delta);
             }
             if let Some((scale, focal)) = bridge.gestures.drain_pinch() {
-                self.app.apply_external_pinch_zoom(scale, focal);
+                // The canvas origin still describes the previous frame. Anchor the zoom at
+                // the previous finger center, then let the pan carry it to the current one.
+                self.app.apply_external_pinch_zoom(scale, focal.map(|pos| pos - pan.unwrap_or_default()));
             }
             for action in bridge.gestures.drain_history_actions() {
                 let key = match action {
@@ -450,21 +453,8 @@ impl eframe::App for Shell {
             bridge.gestures.filter_raw_input(raw_input, pointer_was_down, &frame_stylus_ids);
         }
 
-        let mut keyboard_paste = false;
         if !self.egui_wants_ime {
-            raw_input.events.retain(|event| {
-                let is_paste = matches!(
-                    event,
-                    egui::Event::Key { key: egui::Key::V, pressed: true, modifiers, .. }
-                        if modifiers.ctrl || modifiers.command
-                ) || matches!(event, egui::Event::PasteImage(_));
-                keyboard_paste |= is_paste;
-                !is_paste
-            });
-            if keyboard_paste {
-                log::debug!("raw keyboard paste captured before egui clipboard handling");
-                self.app.queue_keyboard_paste();
-            }
+            self.app.capture_page_paste(ctx, &mut raw_input.events);
         }
 
         let now_secs = raw_input.time.unwrap_or_else(|| ctx.input(|i| i.time));

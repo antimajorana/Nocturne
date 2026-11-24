@@ -10,8 +10,6 @@ use nocturne_onenote::{Content, List, Page, Run, Store};
 /// What the conversion could not carry over, counted for the report.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Loss {
-    /// Runs that were underlined. Neither format here has an underline mark.
-    pub underlined_runs: usize,
     /// Runs OneNote marked as math. The file keeps no structure for them, so they are text.
     pub math_runs: usize,
     /// Pictures or files whose bytes are not in the section file.
@@ -22,7 +20,6 @@ pub struct Loss {
 
 impl Loss {
     pub fn add(&mut self, other: Loss) {
-        self.underlined_runs += other.underlined_runs;
         self.math_runs += other.math_runs;
         self.missing_data += other.missing_data;
         self.unviewable_images += other.unviewable_images;
@@ -127,24 +124,19 @@ impl Ctx<'_, '_> {
                     Piece::Text(t) => t,
                 };
                 let text = clean_text(body);
-                if text.trim().is_empty() {
-                    // Spaces between words stay; a bare field code leaves nothing.
-                    if !text.is_empty() && pending.is_none() {
-                        spans.push(Span { text, bold: run.bold, italic: run.italic, strike: run.strike, link: run.link.clone(), ..Span::default() });
-                    }
+                // Spaces between words stay; a bare field code leaves nothing.
+                let blank = text.trim().is_empty();
+                if text.is_empty() || (blank && pending.is_some()) {
                     continue;
                 }
-                if !counted {
+                if !blank && !counted {
                     counted = true;
-                    if run.underline {
-                        self.out.loss.underlined_runs += 1;
-                    }
                     if run.math {
                         self.out.loss.math_runs += 1;
                     }
                 }
                 let link = run.link.clone().or_else(|| pending.take());
-                spans.push(Span { text, bold: run.bold, italic: run.italic, strike: run.strike, link, ..Span::default() });
+                spans.push(Span { text, bold: run.bold, italic: run.italic, underline: run.underline, strike: run.strike, link, ..Span::default() });
             }
         }
         spans
@@ -159,15 +151,19 @@ impl Ctx<'_, '_> {
                     return None;
                 };
                 let kind = sniff(bytes, ext);
-                if !kind.viewable {
-                    self.out.loss.unviewable_images += 1;
-                }
                 let file_name = if has_extension(name) { name.clone() } else { format!("image-{}.{}", self.next_image, kind.ext) };
                 self.next_image += 1;
                 let link = (self.attach)(&file_name, bytes)?;
-                self.out.images += 1;
                 let alt = if alt.trim().is_empty() { String::new() } else { clean_text(alt) };
-                Some(Span { text: alt, image: Some(link), ..Span::default() })
+                if kind.viewable {
+                    self.out.images += 1;
+                    Some(Span { text: alt, image: Some(link), ..Span::default() })
+                } else {
+                    self.out.loss.unviewable_images += 1;
+                    self.out.files += 1;
+                    let label = if alt.trim().is_empty() { clean_text(&file_name) } else { alt };
+                    Some(Span { text: label, link: Some(link), ..Span::default() })
+                }
             }
             Content::File { name, file, ext } => {
                 let Some(bytes) = file.as_deref().and_then(|r| self.store.file_bytes(self.data, r)) else {
@@ -332,6 +328,8 @@ pub fn sniff(bytes: &[u8], recorded: &str) -> ImageKind {
             "png" => kind("png", true),
             "jpg" | "jpeg" => kind("jpg", true),
             "gif" => kind("gif", true),
+            "svg" => kind("svg", true),
+            "tif" | "tiff" => kind("tif", false),
             "emf" => kind("emf", false),
             "wmf" => kind("wmf", false),
             _ => kind("bin", false),
@@ -373,6 +371,28 @@ mod tests {
         let linked: Vec<&str> = spans.iter().filter(|s| s.link.is_some()).map(|s| s.text.as_str()).collect();
         assert_eq!(linked, ["the page"]);
         assert_eq!(spans.iter().find_map(|s| s.link.as_deref()), Some("http://x.example/a"));
+    }
+
+    #[test]
+    fn one_note_underline_round_trips_in_both_formats() {
+        use nocturne_formats::{html, markdown, render};
+
+        let page = Page {
+            title: "Formatting".into(),
+            level: 1,
+            blocks: vec![Content::Text {
+                runs: vec![Run { text: "marked text".into(), bold: true, underline: true, ..Run::default() }],
+                list: None,
+                depth: 0,
+            }],
+        };
+        let store = empty_store();
+        let mut attach = |_: &str, _: &[u8]| None;
+        let out = convert_page(&store, &[], &page, false, &mut attach);
+        let expected = vec![Block::Paragraph(vec![Span { text: "marked text".into(), bold: true, underline: true, ..Span::default() }])];
+        assert_eq!(out.blocks, expected);
+        assert_eq!(markdown::parse(&render::blocks_to_markdown(&out.blocks)), expected);
+        assert_eq!(markdown::parse(&html::to_markdown(&render::blocks_to_html(&out.blocks))), expected);
     }
 
     #[test]

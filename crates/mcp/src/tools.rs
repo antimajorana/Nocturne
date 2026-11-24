@@ -5,6 +5,7 @@
 //! but a model has to mean it.
 
 use crate::backend::Backend;
+use nocturne_store::links::percent_decode;
 use serde_json::{Value, json};
 
 /// One parameter of a tool: name, JSON type, required, what it means.
@@ -111,7 +112,7 @@ pub static TOOLS: &[Tool] = &[
         description: "A picture of the running window, saved to a file. Needs a running window.",
         params: &[("path", "string", false, "where to save the PNG; without it the picture comes back as base64")],
         needs_window: true,
-        writes: false,
+        writes: true,
     },
 ];
 
@@ -133,7 +134,7 @@ pub fn definitions(has_window: bool) -> Vec<Value> {
                 "name": t.name,
                 "description": t.description,
                 "inputSchema": {"type": "object", "properties": properties, "required": required},
-                "annotations": {"readOnlyHint": !t.writes, "destructiveHint": t.name == "execute"},
+                "annotations": {"readOnlyHint": !t.writes, "destructiveHint": matches!(t.name, "execute" | "write_page" | "screenshot")},
             })
         })
         .collect()
@@ -207,7 +208,8 @@ pub fn call(backend: &mut dyn Backend, name: &str, args: &Value) -> Result<Strin
         }
         "write_page" => {
             let path = text(args, "path")?;
-            execute(backend, "page.save", json!({"path": path.clone(), "body": text(args, "body")?}))?;
+            let body = args.get("body").and_then(Value::as_str).ok_or("this tool needs a 'body' string")?;
+            execute(backend, "page.save", json!({"path": path, "body": body}))?;
             Ok(format!("saved {path}"))
         }
         "new_notebook" => {
@@ -251,11 +253,13 @@ pub fn call(backend: &mut dyn Backend, name: &str, args: &Value) -> Result<Strin
 const TREE_URI: &str = "nocturne://tree";
 const COMMANDS_URI: &str = "nocturne://commands";
 const PAGE_PREFIX: &str = "nocturne://page/";
+const PLAIN_TEXT: &str = "text/plain";
+const JSON: &str = "application/json";
 
 pub fn resources() -> Vec<Value> {
     vec![
-        json!({"uri": TREE_URI, "name": "Notebook tree", "description": "Every notebook, section and page, with its path", "mimeType": "text/plain"}),
-        json!({"uri": COMMANDS_URI, "name": "Commands", "description": "Every Nocturne command and its parameters", "mimeType": "application/json"}),
+        json!({"uri": TREE_URI, "name": "Notebook tree", "description": "Every notebook, section and page, with its path", "mimeType": PLAIN_TEXT}),
+        json!({"uri": COMMANDS_URI, "name": "Commands", "description": "Every Nocturne command and its parameters", "mimeType": JSON}),
     ]
 }
 
@@ -264,17 +268,18 @@ pub fn resource_templates() -> Vec<Value> {
         "uriTemplate": "nocturne://page/{path}",
         "name": "Page",
         "description": "One page's body, by its path, for example nocturne://page/work/projects/kickoff",
-        "mimeType": "text/plain",
+        "mimeType": PLAIN_TEXT,
     })]
 }
 
-pub fn read_resource(backend: &mut dyn Backend, uri: &str) -> Result<String, String> {
+pub fn read_resource(backend: &mut dyn Backend, uri: &str) -> Result<(&'static str, String), String> {
     match uri {
-        TREE_URI => execute(backend, "tree.read", json!({})),
-        COMMANDS_URI => backend.call("engine.commands", &json!({})).map(|v| render(&v)),
+        TREE_URI => execute(backend, "tree.read", json!({})).map(|text| (PLAIN_TEXT, text)),
+        COMMANDS_URI => backend.call("engine.commands", &json!({})).map(|v| (JSON, render(&v))),
         _ => match uri.strip_prefix(PAGE_PREFIX) {
             Some(path) if !path.is_empty() => {
-                backend.call("engine.execute", &json!({"command": "page.load", "params": {"path": path}})).map(|v| render_page(&v))
+                let path = percent_decode(path);
+                backend.call("engine.execute", &json!({"command": "page.load", "params": {"path": path}})).map(|v| (PLAIN_TEXT, render_page(&v)))
             }
             _ => Err(format!("there is no resource at '{uri}'")),
         },
@@ -302,10 +307,12 @@ mod tests {
     #[test]
     fn the_window_tools_appear_only_with_a_window() {
         let without = definitions(false).len();
-        let with = definitions(true).len();
-        assert_eq!(with, TOOLS.len());
-        assert_eq!(with - without, TOOLS.iter().filter(|t| t.needs_window).count());
+        let with = definitions(true);
+        assert_eq!(with.len(), TOOLS.len());
+        assert_eq!(with.len() - without, TOOLS.iter().filter(|t| t.needs_window).count());
         assert!(without > 0);
+        let screenshot = with.iter().find(|tool| tool["name"] == "screenshot").expect("screenshot tool");
+        assert_eq!(screenshot["annotations"], json!({"readOnlyHint": false, "destructiveHint": true}));
     }
 
     #[test]

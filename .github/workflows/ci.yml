@@ -174,7 +174,7 @@ jobs:
       - name: Branch check
         run: cargo xtask check-branch
       - name: PII scanner
-        run: bash SKILLS/nc-devx/scripts/check-pii.sh
+        run: bash SKILLS/nc-devx/scripts/check-pii.sh --all
       - name: Layers
         run: cargo xtask layers
       - name: Assets

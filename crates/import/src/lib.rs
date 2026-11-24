@@ -19,11 +19,13 @@ use convert::{Loss, convert_page};
 use discover::{Planned, Scan};
 use nocturne_formats::markdown::Block;
 use nocturne_formats::render::{blocks_to_html, blocks_to_markdown};
+use nocturne_model::id::new_id;
 use nocturne_model::text::{Dir, direction};
 use nocturne_model::{NodeKind, PageFormat};
 use nocturne_onenote::{OneError, Page, Section, Store, Toc};
 use nocturne_store::tree::{child_dirs, read_node};
 use nocturne_store::{Settings, assets, ops, page};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -37,7 +39,7 @@ pub enum Existing {
     Skip,
     /// Import beside it, under a name made unique by the store.
     Keep,
-    /// Delete it and import again.
+    /// Replace it with the completed import.
     Replace,
 }
 
@@ -119,6 +121,20 @@ pub struct Report {
     pub elapsed: Duration,
 }
 
+impl Report {
+    fn add_pages(&mut self, written: Self) {
+        self.pages += written.pages;
+        self.subpages += written.subpages;
+        self.deepest = self.deepest.max(written.deepest);
+        self.empty_pages_left += written.empty_pages_left;
+        self.rtl_pages += written.rtl_pages;
+        self.images += written.images;
+        self.files += written.files;
+        self.tables += written.tables;
+        self.loss.add(written.loss);
+    }
+}
+
 impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mode = if self.dry_run { " (dry run, nothing written)" } else { "" };
@@ -155,11 +171,11 @@ impl fmt::Display for Report {
                 writeln!(f, "  blank untitled pages left out: {}", self.empty_pages_left)?;
             }
             let l = &self.loss;
-            if l.underlined_runs + l.math_runs + l.missing_data + l.unviewable_images > 0 {
+            if l.math_runs + l.missing_data + l.unviewable_images > 0 {
                 writeln!(
                     f,
-                    "  not carried over: underline {} runs, math marks {} runs, missing picture or file data {}, pictures a browser cannot show {} (kept as files)",
-                    l.underlined_runs, l.math_runs, l.missing_data, l.unviewable_images
+                    "  math marks left out: {}, missing picture or file data: {}, pictures kept as file links: {}",
+                    l.math_runs, l.missing_data, l.unviewable_images
                 )?;
             }
         }
@@ -183,6 +199,7 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&Event)) -> Result<Report
     if !options.source.exists() {
         return Err(format!("the source {} does not exist", options.source.display()));
     }
+    let fallback = loose_notebook_name(&options.source);
     // A package given on its own is not a section file: what is inside it is scanned instead.
     let mut scan: Scan = if package::is_package(&options.source) { Scan::default() } else { discover::scan(&options.source) };
     // OneNote packages: each is unpacked into a folder named after it, and what is inside is
@@ -191,15 +208,26 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&Event)) -> Result<Report
     let scratch = if packages.is_empty() { None } else { Some(package::Scratch::new()?) };
     let mut unpacked = 0;
     let mut failed: Vec<Skipped> = Vec::new();
+    let mut notebook_names: BTreeSet<String> =
+        scan.files.iter().map(|file| clean_title(file.folders.first().unwrap_or(&fallback), "Notebook").to_lowercase()).collect();
     for (i, pkg) in packages.iter().enumerate() {
         let Some(scratch) = scratch.as_ref() else { break };
         let name = clean_title(&pkg.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(), "OneNote package");
-        // The notebook's name is the folder's: one folder per package, under a root of its own,
-        // so two packages never share a notebook folder however they are named.
+        let base = package::safe_name(&name)
+            .filter(|path| path.file_name() == Some(path.as_os_str()))
+            .and_then(|path| path.into_os_string().into_string().ok())
+            .unwrap_or_else(|| "OneNote package".to_string());
+        let mut name = base.clone();
+        let mut copy = 2;
+        while notebook_names.contains(&name.to_lowercase()) {
+            name = titled_copy(&base, &copy.to_string());
+            copy += 1;
+        }
+        // Give same-named packages distinct notebook titles before planning their sections.
         let root = scratch.path.join(i.to_string());
-        let folder = package::safe_name(&name).map_or_else(|| root.join("OneNote package"), |rel| root.join(rel));
-        match package::unpack(pkg, &folder) {
+        match package::unpack(pkg, &root.join(&name)) {
             Ok(_) => {
+                notebook_names.insert(name.to_lowercase());
                 let inner = discover::scan(&root);
                 scan.files.extend(inner.files);
                 scan.tocs.extend(inner.tocs);
@@ -242,7 +270,6 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&Event)) -> Result<Report
         ignored: report.ignored,
     });
 
-    let fallback = loose_notebook_name(&options.source);
     let settings = Settings::default_location();
     if !options.dry_run {
         fs::create_dir_all(&options.dest).map_err(|e| format!("cannot create {}: {e}", options.dest.display()))?;
@@ -295,6 +322,13 @@ pub fn clean_title(text: &str, fallback: &str) -> String {
     if t.is_empty() { fallback.to_string() } else { t }
 }
 
+fn titled_copy(name: &str, label: &str) -> String {
+    let suffix = format!(" ({label})");
+    let room = ops::MAX_TITLE.saturating_sub(suffix.chars().count());
+    let stem: String = name.chars().take(room).collect();
+    format!("{}{suffix}", stem.trim_end())
+}
+
 fn child_by_title(parent: &Path, title: &str, kind: NodeKind) -> Option<PathBuf> {
     child_dirs(parent).into_iter().find(|d| read_node(d).is_some_and(|n| n.kind == kind && n.title == title))
 }
@@ -333,8 +367,9 @@ fn import_section(
     let notebook = match child_by_title(&options.dest, &notebook_title, NodeKind::Notebook) {
         Some(p) => p,
         None => {
+            let notebook = ops::create_notebook(&options.dest, &notebook_title, Some(options.format), settings).map_err(|e| e.to_string())?;
             report.notebooks_made += 1;
-            ops::create_notebook(&options.dest, &notebook_title, Some(options.format), settings).map_err(|e| e.to_string())?
+            notebook
         }
     };
     if read_node(&notebook).is_some_and(|node| node.color.is_none())
@@ -354,23 +389,35 @@ fn import_section(
     // The section itself.
     let mut name = clean_title(&item.file.name, "Section");
     if let Some(label) = &item.version_label {
-        name = format!("{name} ({label})");
+        name = titled_copy(&name, label);
     }
-    if let Some(existing) = child_by_title(&parent, &name, NodeKind::Section) {
-        match options.existing {
-            Existing::Skip => return Err("already in the destination".to_string()),
-            Existing::Replace => {
-                ops::delete_node(&options.dest, &existing).map_err(|e| e.to_string())?;
-            }
-            Existing::Keep => {}
-        }
-    }
-    let section_dir = ops::create_node(&parent, &name, NodeKind::Section, None, settings).map_err(|e| e.to_string())?;
+    let replacing = match (options.existing, child_by_title(&parent, &name, NodeKind::Section)) {
+        (Existing::Skip, Some(_)) => return Err("already in the destination".to_string()),
+        (Existing::Replace, existing) => existing,
+        _ => None,
+    };
     let raw_section_color = section_color_for(&item.file, store.header.file, tocs).or(section.color);
-    if let Some(color) = raw_section_color.and_then(node_color) {
-        ops::set_color(&section_dir, Some(color)).map_err(|e| e.to_string())?;
+    let mut written = Report::default();
+    let mut write_section = |target: &Path, order: Option<u32>| {
+        let dir = ops::create_node_at(target, &name, NodeKind::Section, None, settings, order).map_err(|e| e.to_string())?;
+        let result = (|| {
+            if let Some(color) = raw_section_color.and_then(node_color) {
+                ops::set_color(&dir, Some(color)).map_err(|e| e.to_string())?;
+            }
+            write_pages(options, settings, &store, &data, &section, &dir, &mut written)
+        })();
+        if let Err(error) = result {
+            let _ = ops::remove_tree(&dir);
+            return Err(error);
+        }
+        Ok(dir)
+    };
+    if let Some(existing) = replacing {
+        replace_section(&parent, &existing, options.format, settings, write_section)?;
+    } else {
+        write_section(&parent, None)?;
     }
-    write_pages(options, settings, &store, &data, &section, &section_dir, report)?;
+    report.add_pages(written);
     report.sections_imported += 1;
     if section.recovered {
         report.sections_recovered += 1;
@@ -380,6 +427,44 @@ fn import_section(
             label: format!("{} / {}", item.file.folders.join(" / "), item.file.name),
             reason: format!("{encrypted} password protected pages left out"),
         });
+    }
+    Ok(())
+}
+
+fn replace_section(
+    parent: &Path,
+    existing: &Path,
+    format: PageFormat,
+    settings: &Settings,
+    write_section: impl FnOnce(&Path, Option<u32>) -> Result<PathBuf, String>,
+) -> Result<(), String> {
+    let original = read_node(existing).ok_or_else(|| format!("cannot read the section at {}", existing.display()))?;
+    let staging = parent.join(format!(".nocturne-import-{}", new_id()));
+    fs::create_dir(&staging).map_err(|e| format!("cannot create {}: {e}", staging.display()))?;
+    let backup = staging.join(".original");
+    let result = (|| {
+        ops::initialize_notebook(&staging, "Import staging", Some(format), settings).map_err(|e| e.to_string())?;
+        let replacement = write_section(&staging, Some(original.order))?;
+        if read_node(existing).is_none_or(|node| node.id != original.id || node.order != original.order) {
+            return Err(format!("the section changed during import at {}", existing.display()));
+        }
+        swap_section(&replacement, existing, &backup)
+    })();
+    // If rollback also failed, this folder still contains the previous section.
+    if result.is_ok() || fs::symlink_metadata(&backup).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) {
+        let _ = ops::remove_tree(&staging);
+    }
+    result
+}
+
+fn swap_section(replacement: &Path, existing: &Path, backup: &Path) -> Result<(), String> {
+    fs::rename(existing, backup).map_err(|e| format!("cannot move the previous section at {}: {e}", existing.display()))?;
+    if let Err(error) = fs::rename(replacement, existing) {
+        let message = format!("cannot install the replacement at {}: {error}", existing.display());
+        return match fs::rename(backup, existing) {
+            Ok(()) => Err(message),
+            Err(rollback) => Err(format!("{message}. The previous section is at {} because restoring it failed: {rollback}", backup.display())),
+        };
     }
     Ok(())
 }
@@ -464,25 +549,27 @@ fn write_pages(
     section_dir: &Path,
     report: &mut Report,
 ) -> Result<(), String> {
-    // The folder each level's latest page lives in; index 0 is the section.
-    let mut stack: Vec<PathBuf> = vec![section_dir.to_path_buf()];
+    // Keep the declared level with each ancestor because some source levels are missing.
+    let mut ancestors: Vec<(u8, PathBuf)> = Vec::new();
     for p in &section.pages {
+        while ancestors.last().is_some_and(|(level, _)| *level >= p.level) {
+            ancestors.pop();
+        }
         if p.blocks.is_empty() && (p.title.is_empty() || p.title == "Untitled page") {
             report.empty_pages_left += 1;
             continue;
         }
-        let level = usize::from(p.level.clamp(1, 3));
-        let parent = stack.get(level - 1).or_else(|| stack.last()).cloned().unwrap_or_else(|| section_dir.to_path_buf());
+        let parent = ancestors.last().map_or(section_dir, |(_, path)| path.as_path());
         let title = clean_title(&p.title, "Untitled page");
-        let dir = ops::create_node(&parent, &title, NodeKind::Page, Some(options.format), settings).map_err(|e| e.to_string())?;
-        stack.truncate(level);
-        stack.push(dir.clone());
+        let dir = ops::create_node(parent, &title, NodeKind::Page, Some(options.format), settings).map_err(|e| e.to_string())?;
+        write_page(options.format, store, data, p, &dir, report)?;
+        ancestors.push((p.level, dir));
+        let depth = ancestors.len();
         report.pages += 1;
-        if level > 1 {
+        if depth > 1 {
             report.subpages += 1;
         }
-        report.deepest = report.deepest.max(level);
-        write_page(options.format, store, data, p, &dir, report)?;
+        report.deepest = report.deepest.max(depth);
     }
     Ok(())
 }
@@ -607,6 +694,27 @@ mod tests {
     }
 
     #[test]
+    fn skipped_blank_pages_do_not_change_the_ancestry_of_other_pages() {
+        let t = TempDir::new("import-missing-parent");
+        let (src, dest) = (t.path().join("src"), t.path().join("dest"));
+        let mut one = OneNote::new();
+        one.page("Parent", 1, &[]);
+        one.page("", 2, &[]);
+        one.page("First", 3, &[]);
+        one.page("Second", 3, &[]);
+        one.page("", 1, &[]);
+        one.page("Orphan", 2, &[]);
+        section_file(&src, &["Work"], "Notes.one", one);
+
+        let report = run(&Options::new(&src, &dest), &mut quiet).expect("import");
+        let section = dest.join("work").join("notes");
+        for path in ["parent/first", "parent/second", "orphan"] {
+            assert!(section.join(path).join("index.html").is_file(), "missing page {path}");
+        }
+        assert_eq!((report.pages, report.empty_pages_left, report.subpages, report.deepest), (4, 2, 2, 2), "{report}");
+    }
+
+    #[test]
     fn text_and_marks_reach_the_page_in_both_formats() {
         for (format, file, want) in [(PageFormat::Html, "index.html", "<b>bold words</b>"), (PageFormat::Cmgfm, "index.md", "**bold words**")] {
             let t = TempDir::new("import-format");
@@ -625,6 +733,7 @@ mod tests {
     fn synthetic_images_and_attachments_survive_import_in_both_page_formats() {
         let png = include_bytes!("../tests/fixtures/synthetic-pixel.png");
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><path d="M0 0L2 2" stroke="#000"/></svg>"##;
+        let tiff = b"II*\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00";
         let document = b"synthetic attachment bytes";
 
         for (format, page_file) in [(PageFormat::Html, "index.html"), (PageFormat::Cmgfm, "index.md")] {
@@ -638,6 +747,7 @@ mod tests {
                 &[
                     OneNote::picture("sample.png", "Synthetic raster", "png", png),
                     OneNote::picture("sample.svg", "Synthetic vector sketch", "svg", svg),
+                    OneNote::picture("sample.tif", "Synthetic TIFF picture", "tif", tiff),
                     OneNote::picture_without_data("missing.png", "Missing synthetic image", "png"),
                     OneNote::file("sample.txt", "txt", document),
                 ],
@@ -649,15 +759,21 @@ mod tests {
             options.format = format;
             let report = run(&options, &mut quiet).expect("import synthetic section");
             assert_eq!((report.sections_imported, report.skipped.len()), (1, 1), "{report}");
-            assert_eq!((report.images, report.files, report.loss.missing_data), (2, 1, 1), "{report}");
+            assert_eq!((report.images, report.files, report.loss.missing_data, report.loss.unviewable_images), (2, 2, 1, 1), "{report}");
 
             let page_dir = dest.join("work").join("assets").join("assets");
             let page = fs::read_to_string(page_dir.join(page_file)).expect("imported page");
             assert!(page.contains("Synthetic assets stay attached"), "{page}");
             assert!(page.contains("sample.png") && page.contains("sample.svg") && page.contains("sample.txt"), "{page}");
+            let (svg_image, tiff_link) = match format {
+                PageFormat::Html => ("<img src=\"assets/sample.svg\"", "<a href=\"assets/sample.tif\">Synthetic TIFF picture</a>"),
+                PageFormat::Cmgfm => ("![Synthetic vector sketch](assets/sample.svg)", "[Synthetic TIFF picture](assets/sample.tif)"),
+            };
+            assert!(page.contains(svg_image) && page.contains(tiff_link), "{page}");
             assert!(!page.contains("missing.png"), "a picture with missing data is not linked: {page}");
             assert_eq!(fs::read(page_dir.join("assets").join("sample.png")).expect("PNG asset"), png);
             assert_eq!(fs::read(page_dir.join("assets").join("sample.svg")).expect("SVG asset"), svg);
+            assert_eq!(fs::read(page_dir.join("assets").join("sample.tif")).expect("TIFF asset"), tiff);
             assert_eq!(fs::read(page_dir.join("assets").join("sample.txt")).expect("file asset"), document);
         }
     }
@@ -671,11 +787,30 @@ mod tests {
         let again = run(&Options::new(&src, &dest), &mut quiet).expect("again");
         assert_eq!((first.pages, again.pages, again.sections_imported), (5, 0, 0), "{again}");
         assert_eq!(again.skipped.len(), 2);
+        let work = dest.join("work");
+        let original_sections = [work.join("loose"), work.join("projects/plan")];
+        let original_orders = original_sections.each_ref().map(|path| read_node(path).expect("original section").order);
         let mut o = Options::new(&src, &dest);
         o.existing = Existing::Replace;
         let replaced = run(&o, &mut quiet).expect("replace");
         assert_eq!(replaced.pages, 5);
+        assert_eq!(original_sections.each_ref().map(|path| read_node(path).expect("replacement section").order), original_orders);
         assert_eq!(load_tree(&dest.join("work")).map(|n| format!("{n:?}").matches("Start").count()), Some(1), "no duplicate page");
+    }
+
+    #[test]
+    fn a_failed_section_swap_restores_the_original_tree() {
+        let temp = TempDir::new("import-section-rollback");
+        let settings = Settings::default_location();
+        let notebook = ops::create_notebook(temp.path(), "Work", Some(PageFormat::Html), &settings).expect("create notebook");
+        let section = ops::create_node(&notebook, "Notes", NodeKind::Section, None, &settings).expect("create original section");
+        let original = ops::create_node(&section, "Original", NodeKind::Page, None, &settings).expect("create original page");
+        page::save_body(&original, "<p>Preserve this content</p>").expect("write original page");
+        let backup = notebook.join(".backup");
+
+        assert!(swap_section(&notebook.join("missing-replacement"), &section, &backup).is_err());
+        assert!(page::load_page(&original).expect("reopen original page").body.contains("Preserve this content"));
+        assert!(!backup.exists());
     }
 
     #[test]
@@ -693,6 +828,58 @@ mod tests {
         let r = run(&o, &mut quiet).expect("all");
         assert_eq!(r.sections_imported, 3, "{r}");
         assert!(format!("{:?}", load_tree(&dest.join("work"))).contains("Plan (2023-01-01)"));
+    }
+
+    #[test]
+    fn all_versions_retains_same_day_copies_of_long_section_names() {
+        let t = TempDir::new("import-same-day-copies");
+        let (src, dest) = (t.path().join("src"), t.path().join("dest"));
+        let title = "q".repeat(ops::MAX_TITLE);
+        for (suffix, page) in [(" (On 1-2-2025).one", "Newest"), (" (On 1-1-2025).one", "First"), (".one (On 1-1-2025)", "Second")] {
+            section_file(&src, &["Work"], &format!("{title}{suffix}"), OneNote::new().with_page(page, &[]));
+        }
+        let mut options = Options::new(&src, &dest);
+        options.all_versions = true;
+        let report = run(&options, &mut quiet).expect("import all copies");
+        assert_eq!((report.sections_planned, report.sections_imported, report.pages), (3, 3, 3), "{report}");
+        assert!(report.skipped.is_empty(), "{report}");
+        let notebook = dest.join("work");
+        let titles: Vec<_> = child_dirs(&notebook).iter().filter_map(|dir| read_node(dir).map(|node| node.title)).collect();
+        assert!(titles.iter().all(|title| title.chars().count() <= ops::MAX_TITLE));
+        for suffix in [" (2025-01-01)", " (2025-01-01, copy 2)"] {
+            assert!(titles.iter().any(|title| title.ends_with(suffix)), "missing {suffix} in {titles:?}");
+        }
+        let repeat = run(&options, &mut quiet).expect("repeat import");
+        assert_eq!((repeat.sections_imported, repeat.skipped.len()), (0, 3), "{repeat}");
+    }
+
+    #[test]
+    fn same_named_packages_keep_independent_notebooks() {
+        use std::io::Write;
+
+        let t = TempDir::new("import-same-named-packages");
+        let (src, dest) = (t.path().join("src"), t.path().join("dest"));
+        for (folder, page) in [("first", "First"), ("second", "Second")] {
+            let parent = src.join(folder);
+            fs::create_dir_all(&parent).expect("package directory");
+            let mut cabinet = cab::CabinetBuilder::new();
+            cabinet.add_folder(cab::CompressionType::None).add_file("Notes.one");
+            let mut writer = cabinet.build(fs::File::create(parent.join("Work.onepkg")).expect("package file")).expect("cabinet writer");
+            writer
+                .next_file()
+                .expect("cabinet entry")
+                .expect("one section")
+                .write_all(&OneNote::new().with_page(page, &[]).finish())
+                .expect("write section");
+            writer.finish().expect("finish package");
+        }
+        let options = Options::new(&src, &dest);
+        let report = run(&options, &mut quiet).expect("import packages");
+        assert_eq!((report.packages, report.notebooks_made, report.sections_imported), (2, 2, 2), "{report}");
+        assert!(dest.join("work/notes/first/index.html").is_file());
+        assert!(dest.join("work-2/notes/second/index.html").is_file());
+        let repeat = run(&options, &mut quiet).expect("repeat import");
+        assert_eq!((repeat.sections_imported, repeat.skipped.len()), (0, 2), "{repeat}");
     }
 
     #[test]

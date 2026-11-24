@@ -1923,7 +1923,7 @@ fn size_of(block: &Block) -> (f32, bool) {
 pub fn next_block(after: &Block) -> Block {
     match after {
         Block::Item { ordered, number, task, depth, .. } => {
-            Block::Item { ordered: *ordered, number: *number + 1, task: task.map(|_| false), depth: *depth, spans: Vec::new() }
+            Block::Item { ordered: *ordered, number: number.saturating_add(1), task: task.map(|_| false), depth: *depth, spans: Vec::new() }
         }
         _ => Block::Paragraph(Vec::new()),
     }
@@ -3490,13 +3490,12 @@ fn apply(action: Action, blocks: &mut Vec<Block>, caret: &mut Option<Caret>, cha
                         block: at - 1,
                         text: joined,
                         focus: true,
-                        selection: (0, 0),
-                        place: None,
+                        selection: (at_end, at_end),
+                        place: Some(at_end),
                         cell: None,
                         span: None,
                         inline: Some(source),
                     });
-                    let _ = at_end;
                     changed.blocks = true;
                     changed.caret = true;
                 }
@@ -4506,6 +4505,8 @@ A note to self.
             Block::Item { ordered, number, depth, .. } => assert_eq!((ordered, number, depth), (true, 3, 1)),
             other => panic!("{other:?}"),
         }
+        let last_item = Block::Item { ordered: true, number: usize::MAX, task: None, depth: 0, spans: Vec::new() };
+        assert!(matches!(next_block(&last_item), Block::Item { number: usize::MAX, .. }));
         let task = Block::Item { ordered: false, number: 1, task: Some(true), depth: 0, spans: Vec::new() };
         match next_block(&task) {
             Block::Item { task, .. } => assert_eq!(task, Some(false), "a new to-do starts unticked"),
@@ -4633,7 +4634,7 @@ A note to self.
         apply(Action::JoinBack(1), &mut two, &mut caret, &mut changed);
         assert_eq!(two.len(), 1);
         assert_eq!(block_text(two.first().expect("one")), "firstsecond");
-        assert_eq!(caret.as_ref().map(|c| c.block), Some(0));
+        assert_eq!(caret.as_ref().map(|c| (c.block, c.selection, c.place)), Some((0, (5, 5), Some(5))));
 
         // Backspace at the start of the first block turns a heading into a paragraph.
         let mut head = blocks("# Title\n");

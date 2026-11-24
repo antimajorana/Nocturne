@@ -118,12 +118,15 @@ impl Justified {
     /// down one with it, so it stays on the same paragraph. True when anything changed.
     pub fn insert_block(&mut self, at: usize) -> bool {
         let mut moved = false;
-        for (block, _) in &mut self.blocks {
-            if *block >= at {
-                *block += 1;
-                moved = true;
+        self.blocks.retain_mut(|(block, _)| {
+            if *block < at {
+                return true;
             }
-        }
+            moved = true;
+            let Some(next) = block.checked_add(1) else { return false };
+            *block = next;
+            true
+        });
         moved
     }
 
@@ -198,6 +201,13 @@ mod tests {
         assert!(marked.insert_block(2));
         assert_eq!(write(&marked), "0, 5:high");
         assert!(!marked.insert_block(6));
+    }
+
+    #[test]
+    fn an_unrepresentable_justification_index_does_not_block_an_edit() {
+        let mut marked = parse(&format!("2:low, {}:high", usize::MAX));
+        assert!(marked.insert_block(0));
+        assert_eq!(marked.blocks(), [(3, Strength::Low)]);
     }
 
     #[test]

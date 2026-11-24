@@ -5,6 +5,7 @@ use crate::tree::{page_file, raw_title, read_node};
 use nocturne_formats::{boxes, frontmatter, html};
 use nocturne_model::{Container, Dir, PageFormat, container, id::new_id, justify, kv, tablecols, time::iso_now};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Pages larger than this are refused (a guard against hostile or accidental input).
@@ -94,19 +95,41 @@ pub fn versions(dir: &Path) -> Result<Vec<Version>> {
     Ok(found)
 }
 
-/// Restores an earlier version, first preserving the current file as another version.
+/// Restores an earlier version, preserving the page's identity and saving the current file.
 pub fn restore_version(dir: &Path, id: &str) -> Result<()> {
     if !valid_version_id(id) {
         return Err(StoreError::invalid("that page version id is not valid"));
     }
-    let (_, file) = page_file(dir).ok_or_else(|| StoreError::NotFound(format!("{} is not a page", dir.display())))?;
+    let (format, file) = page_file(dir).ok_or_else(|| StoreError::NotFound(format!("{} is not a page", dir.display())))?;
     let snapshot = version_dir(dir).join(id).join(file.file_name().unwrap_or_default());
     if !snapshot.is_file() {
         return Err(StoreError::NotFound(format!("page version {id}")));
     }
-    let contents = fs::read_to_string(&snapshot).map_err(|e| StoreError::io("read", &snapshot, e))?;
+    let mut contents = fs::read_to_string(&snapshot).map_err(|e| StoreError::io("read", &snapshot, e))?;
+    if let Some(current) = read_node(dir).filter(|node| !node.id.is_empty()) {
+        contents = with_id(format, &contents, &current.id);
+    }
+    check_page_size(&contents)?;
     snapshot_current(dir, &file, true)?;
     write_atomic_file(&file, &contents)
+}
+
+pub(crate) fn with_id(format: PageFormat, text: &str, id: &str) -> String {
+    match format {
+        PageFormat::Html if html::meta(text, "nocturne:id").as_deref() == Some(id) => text.to_string(),
+        PageFormat::Html => html::set_meta(text, "nocturne:id", &html::escape(id)),
+        PageFormat::Cmgfm => {
+            let (front, body) = frontmatter::split_front(text);
+            if frontmatter::value(&front, "id").as_deref() == Some(id) {
+                return text.to_string();
+            }
+            let id = kv::quote(id);
+            if front.is_empty() {
+                return format!("---\nid: {id}\n---\n\n{body}");
+            }
+            format!("{}{body}", frontmatter::set_value(&front, "id", &id))
+        }
+    }
 }
 
 fn version_dir(dir: &Path) -> PathBuf {
@@ -149,9 +172,12 @@ fn snapshot_current(dir: &Path, file: &Path, force: bool) -> Result<()> {
     let entry = versions.join(&id);
     fs::create_dir(&entry).map_err(|e| StoreError::io("create", &entry, e))?;
     let snapshot = entry.join(file.file_name().unwrap_or_default());
-    if let Err(e) = fs::write(&snapshot, &current) {
+    let backup = fs::metadata(file)
+        .map_err(|e| StoreError::io("read permissions", file, e))
+        .and_then(|meta| write_new_file(&snapshot, &current, Some(meta.permissions())));
+    if let Err(e) = backup {
         let _ = fs::remove_dir_all(&entry);
-        return Err(StoreError::io("write", &snapshot, e));
+        return Err(e);
     }
     let info = format!("id = {}\ncreated = {}\n", kv::quote(&id), kv::quote(&iso_now()));
     if let Err(e) = fs::write(entry.join("version.toml"), info) {
@@ -543,21 +569,47 @@ pub fn write_atomic(path: &Path, text: &str) -> Result<()> {
     if let Some(parent) = path.parent()
         && crate::tree::page_file(parent).is_some_and(|(_, page)| page == path)
     {
-        if text.len() > MAX_PAGE_BYTES {
-            return Err(StoreError::invalid("this page is too large to save"));
-        }
+        check_page_size(text)?;
         snapshot_current(parent, path, false)?;
     }
     write_atomic_file(path, text)
 }
 
+fn check_page_size(text: &str) -> Result<()> {
+    if text.len() > MAX_PAGE_BYTES {
+        return Err(StoreError::invalid("this page is too large to save"));
+    }
+    Ok(())
+}
+
 fn write_atomic_file(path: &Path, text: &str) -> Result<()> {
-    let tmp = path.with_extension("tmp-write");
-    fs::write(&tmp, text).map_err(|e| StoreError::io("write", &tmp, e))?;
+    let permissions = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => Some(meta.permissions()),
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(StoreError::io("read permissions", path, e)),
+    };
+    let tmp = path.with_file_name(format!(".nocturne-{}.tmp-write", new_id()));
+    write_new_file(&tmp, text.as_bytes(), permissions)?;
     fs::rename(&tmp, path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         StoreError::io("replace", path, e)
     })
+}
+
+fn write_new_file(path: &Path, bytes: &[u8], permissions: Option<fs::Permissions>) -> Result<()> {
+    let mut file = fs::File::create_new(path).map_err(|e| StoreError::io("create", path, e))?;
+    let written = (|| -> Result<()> {
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions).map_err(|e| StoreError::io("set permissions", path, e))?;
+        }
+        file.write_all(bytes).map_err(|e| StoreError::io("write", path, e))
+    })();
+    drop(file);
+    if written.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    written
 }
 
 #[cfg(test)]
@@ -656,6 +708,38 @@ mod tests {
         let nb = ops::create_notebook(&t.path().join("nb"), "NB", None, &s).expect("nb");
         let page = ops::create_node(&nb, "Page", NodeKind::Page, Some(format), &s).expect("page");
         (t, page)
+    }
+
+    #[test]
+    fn saving_a_page_preserves_other_files_with_the_same_stem() {
+        for format in PageFormat::ALL {
+            let (_t, page) = setup("page-save-sibling", format);
+            let sibling = page.join("index.tmp-write");
+            fs::write(&sibling, "a separate file").expect("write sibling");
+
+            save_body(&page, "new text").expect("save page");
+
+            assert_eq!(fs::read_to_string(sibling).expect("read sibling"), "a separate file");
+            assert_eq!(load_page(&page).expect("load page").body, "new text");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_a_page_preserves_its_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_t, page) = setup("page-save-permissions", PageFormat::Html);
+        let (_, file) = page_file(&page).expect("page file");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o400)).expect("read-only mode");
+
+        save_body(&page, "new text").expect("save page");
+
+        assert_eq!(fs::metadata(file).expect("metadata").permissions().mode() & 0o777, 0o400);
+        assert_eq!(load_page(&page).expect("load page").body, "new text");
+        let saved = versions(&page).expect("versions");
+        let snapshot = version_dir(&page).join(&saved[0].id).join(PageFormat::Html.file_name());
+        assert_eq!(fs::metadata(snapshot).expect("snapshot metadata").permissions().mode() & 0o777, 0o400);
     }
 
     #[test]

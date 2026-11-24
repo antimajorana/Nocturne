@@ -12,8 +12,8 @@ follows the control channel of the other Craft apps, so the same tools can drive
 nocturne --control 0
 ```
 
-`0` picks a free port. The window prints nothing; read the port and the key from the key file.
-The channel is off unless `--control` is given.
+`0` picks a free port. A console launch prints the listening port and the path to the key file.
+Read the key from that file. The channel is off unless you set `--control` or `NOCTURNE_CONTROL_PORT`.
 
 ## Security
 

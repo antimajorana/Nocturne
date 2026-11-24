@@ -720,6 +720,149 @@ fn ctrl_f_in_the_page_goes_to_search_and_writes_nothing() {
     }
 }
 
+#[test]
+fn undo_and_redo_follow_keyboard_focus_in_both_page_formats() {
+    use egui::{Key, Modifiers};
+    use nocturne_model::PageFormat;
+
+    for format in [PageFormat::Html, PageFormat::Cmgfm] {
+        let (_t, mut app, s) = sample_app("ui-search-undo");
+        let (path, original) = match format {
+            PageFormat::Html => (&s.html_page, "<p>Original words</p>"),
+            PageFormat::Cmgfm => (&s.md_page, "Original words"),
+        };
+        nocturne_store::page::save_body(path, original).expect("fixture");
+        app.open_path(&path.to_string_lossy());
+        let mut h = harness(app, LIGHT);
+        settle(&mut h);
+        ask(&mut h, "ui.caret", json!({"block": 0})).expect("page caret");
+        settle(&mut h);
+        h.key_press(Key::End);
+        ask(&mut h, "ui.text", json!({"text": " edited"})).expect("edit note");
+        settle(&mut h);
+        let edited = h.state().body().expect("open note").to_owned();
+        assert!(edited.contains("Original words edited"), "{format:?}: {edited}");
+
+        h.key_press_modifiers(Modifiers::COMMAND, Key::F);
+        settle(&mut h);
+        ask(&mut h, "ui.text", json!({"text": "findneedle"})).expect("type in search");
+        settle(&mut h);
+        let query_present = |h: &Harness<'_, NocturneApp>| {
+            h.get_all_by_role(egui::accesskit::Role::TextInput).any(|node| node.value().as_deref() == Some("findneedle"))
+        };
+        assert!(query_present(&h), "{format:?}: search has the keyboard");
+        h.key_press_modifiers(Modifiers::COMMAND, Key::Z);
+        settle(&mut h);
+        assert_eq!(h.state().body(), Some(edited.as_str()), "{format:?}: Undo in search must leave the note alone");
+        assert!(!query_present(&h), "{format:?}: Undo goes to the search box");
+
+        let redo = Modifiers::COMMAND | Modifiers::SHIFT;
+        h.key_press_modifiers(redo, Key::Z);
+        settle(&mut h);
+        assert!(query_present(&h), "{format:?}: Redo goes to the search box");
+        assert_eq!(h.state().body(), Some(edited.as_str()), "{format:?}: Redo in search must leave the note alone");
+
+        h.key_press(Key::Escape);
+        settle(&mut h);
+        ask(&mut h, "ui.caret", json!({"block": 0})).expect("return to note");
+        settle(&mut h);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::Z);
+        settle(&mut h);
+        assert!(!h.state().body().expect("open note").contains(" edited"), "{format:?}: Undo applies to the note when it has focus");
+        h.key_press_modifiers(redo, Key::Z);
+        settle(&mut h);
+        assert_eq!(h.state().body(), Some(edited.as_str()), "{format:?}: Redo restores the note edit");
+        h.key_press_modifiers(Modifiers::COMMAND, Key::S);
+        settle(&mut h);
+        let saved = nocturne_store::page::load_page(path).expect("reopen note");
+        assert_eq!(saved.format, format);
+        assert!(saved.body.contains("Original words edited"), "{format:?}: redone edit is saved");
+
+        let diagram = path.join("flow.mmd");
+        let original = "flowchart LR";
+        std::fs::write(&diagram, original).expect("diagram fixture");
+        h.state_mut().set_show_source(true);
+        settle(&mut h);
+        h.query_all_by_label_contains("flow.mmd").next().expect("source file").click();
+        settle(&mut h);
+        h.get_all_by_role(egui::accesskit::Role::MultilineTextInput)
+            .find(|node| node.value().as_deref() == Some(original))
+            .expect("diagram editor")
+            .click();
+        settle(&mut h);
+        h.key_press(Key::End);
+        ask(&mut h, "ui.text", json!({"text": "\nA --> B"})).expect("edit source");
+        settle(&mut h);
+        let changed_source = format!("{original}\nA --> B");
+        assert_eq!(std::fs::read_to_string(&diagram).expect("source saved"), changed_source);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::Z);
+        settle(&mut h);
+        assert_eq!(std::fs::read_to_string(&diagram).expect("undo saved"), original);
+        assert_eq!(h.state().body(), Some(edited.as_str()), "{format:?}: source Undo leaves the note alone");
+        h.key_press_modifiers(redo, Key::Z);
+        settle(&mut h);
+        assert_eq!(std::fs::read_to_string(&diagram).expect("redo saved"), changed_source);
+
+        h.state_mut().set_show_source(false);
+        settle(&mut h);
+        let title = h.state().title_draft().expect("title").to_owned();
+        h.get_all_by_role(egui::accesskit::Role::MultilineTextInput)
+            .find(|node| node.value().as_deref() == Some(title.as_str()))
+            .expect("title editor")
+            .click();
+        settle(&mut h);
+        assert!(h.state().title_is_focused());
+        h.key_press(Key::End);
+        ask(&mut h, "ui.text", json!({"text": " draft"})).expect("edit title");
+        settle(&mut h);
+        let draft = format!("{title} draft");
+        assert_eq!(h.state().title_draft(), Some(draft.as_str()));
+        h.key_press_modifiers(Modifiers::COMMAND, Key::Z);
+        settle(&mut h);
+        assert_eq!(h.state().title_draft(), Some(title.as_str()));
+        assert_eq!(h.state().body(), Some(edited.as_str()), "{format:?}: title Undo leaves the note body alone");
+        h.key_press_modifiers(redo, Key::Z);
+        settle(&mut h);
+        assert_eq!(h.state().title_draft(), Some(draft.as_str()));
+    }
+}
+
+#[test]
+fn backspace_joins_paragraphs_at_the_caret_in_both_formats() {
+    use egui::{Key, Modifiers};
+    use nocturne_formats::{Block, boxes};
+    use nocturne_model::PageFormat;
+
+    for format in [PageFormat::Html, PageFormat::Cmgfm] {
+        let (_t, mut app, s) = sample_app("ui-join-back-at-caret");
+        let (path, body) = match format {
+            PageFormat::Html => (&s.html_page, "<p>café</p>\n<p><b>reports</b></p>"),
+            PageFormat::Cmgfm => (&s.md_page, "café\n\n**reports**"),
+        };
+        nocturne_store::page::save_body(path, body).expect("fixture");
+        app.open_path(&path.to_string_lossy());
+        let mut h = harness(app, LIGHT);
+        settle(&mut h);
+        ask(&mut h, "ui.caret", json!({"block": 1})).expect("second paragraph");
+        settle(&mut h);
+        h.key_press(Key::Home);
+        settle(&mut h);
+        h.key_press(Key::Backspace);
+        settle(&mut h);
+        let page = look_at(&mut h)["page"].clone();
+        assert_eq!(page["caret"]["at"], json!(4), "{format:?}: caret belongs between the old and new text: {page}");
+        ask(&mut h, "ui.text", json!({"text": " "})).expect("type at the join");
+        settle(&mut h);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::S);
+        settle(&mut h);
+        let saved = nocturne_store::page::load_page(path).expect("reopen");
+        let (blocks, _) = boxes::read(format, &saved.body);
+        let [Block::Paragraph(spans)] = blocks.as_slice() else { panic!("{format:?}: expected one paragraph, got {blocks:?}") };
+        assert_eq!(spans.iter().map(|s| s.text.as_str()).collect::<String>(), "café reports");
+        assert!(spans.iter().any(|span| span.bold && span.text.contains("reports")), "{format:?}: retained bold text: {spans:?}");
+    }
+}
+
 /// Issue #148: on a new page, a click in the blank space under the date line puts a caret
 /// there, and what is typed is kept, in both formats.
 #[test]
@@ -7091,6 +7234,7 @@ fn back_steps_over_a_page_that_has_been_deleted() {
 #[test]
 fn the_back_button_and_alt_left_go_back() {
     let (_t, mut h, _) = three_pages("ui-nav-button");
+    h.ctx.set_os(egui::os::OperatingSystem::Nix);
     let (_, _, third) = nav(&mut h);
     h.query_all_by_label("Back").last().expect("the Back button").click();
     settle(&mut h);
@@ -7108,6 +7252,45 @@ fn the_back_button_and_alt_left_go_back() {
     h.query_all_by_label("Forward").last().expect("the Forward button").click();
     settle(&mut h);
     assert_eq!(nav(&mut h), (2, 0, third), "and the Forward button took it the rest of the way");
+}
+
+#[test]
+fn mac_word_movement_and_page_history_have_separate_shortcuts() {
+    use egui::{Key, Modifiers};
+
+    let (_t, mut app, s) = sample_app("ui-mac-nav");
+    nocturne_store::page::save_body(&s.md_page, "one two three").expect("fixture");
+    app.open_path(&s.html_page.to_string_lossy());
+    app.open_path(&s.md_page.to_string_lossy());
+    let mut h = harness(app, LIGHT);
+    h.ctx.set_os(egui::os::OperatingSystem::Mac);
+    settle(&mut h);
+    let original = nav(&mut h);
+    assert_eq!((original.0, original.1), (1, 0), "one page behind");
+
+    ask(&mut h, "ui.caret", json!({"block": 0})).expect("focus paragraph");
+    settle(&mut h);
+    ask(&mut h, "ui.key", json!({"key": "End"})).expect("end of paragraph");
+    settle(&mut h);
+    let end = look_at(&mut h)["page"]["caret"]["at"].as_u64().expect("caret position");
+    h.key_press_modifiers(Modifiers::ALT, Key::ArrowLeft);
+    settle(&mut h);
+    assert_eq!(nav(&mut h), original, "Option+Left keeps the current note open");
+    let left = look_at(&mut h)["page"]["caret"]["at"].as_u64().expect("caret position");
+    assert!(left < end, "Option+Left is available for word movement");
+
+    let command = Modifiers::COMMAND | Modifiers::MAC_CMD;
+    h.key_press_modifiers(command, Key::OpenBracket);
+    settle(&mut h);
+    let previous = nav(&mut h);
+    assert_eq!((previous.0, previous.1), (0, 1), "Command+[ goes back");
+    assert_ne!(previous.2, original.2);
+    h.key_press_modifiers(command, Key::CloseBracket);
+    settle(&mut h);
+    assert_eq!(nav(&mut h), original, "Command+] goes forward");
+    h.key_press_modifiers(command | Modifiers::ALT, Key::OpenBracket);
+    settle(&mut h);
+    assert_eq!(nav(&mut h), original, "Command+Option+[ is reserved for page hierarchy");
 }
 
 /// Deleting a box can be taken back, and brought forward again.
@@ -7727,12 +7910,6 @@ fn font_marks_apply_to_a_selection_across_paragraphs() {
 /// could be pasted. None of those keys was bound anywhere in the window for words. A
 /// left-to-right paragraph is an egui text box and egui answers them by itself, which is
 /// why it was only ever seen in Arabic.
-///
-/// Paste is checked against the real clipboard, because `paste_here` reads it directly
-/// through `arboard`. Copy cannot be checked the same way: `ctx.copy_text` hands the text
-/// to the platform layer, and in a harness there is no platform layer to take it. So the
-/// copy half checks that the key reached the handler, and the window itself is where the
-/// round trip is seen.
 #[test]
 fn the_clipboard_keys_work_in_an_arabic_paragraph() {
     const LINE: &str = "الملاحظات تعيش أطول من البرنامج";
@@ -7765,6 +7942,17 @@ fn the_clipboard_keys_work_in_an_arabic_paragraph() {
     settle(&mut h);
     assert_eq!(status(&mut h), "Copied", "Ctrl+C reached the copy handler");
 
+    // egui-winit translates native Ctrl/Cmd+C and X into clipboard events.
+    board.put_text("");
+    h.input_mut().events.push(egui::Event::Copy);
+    settle(&mut h);
+    assert_eq!(board.read_text(), LINE);
+    board.put_text("");
+    h.input_mut().events.push(egui::Event::Cut);
+    settle(&mut h);
+    assert_eq!(board.read_text(), LINE);
+    assert!(!h.state().body().unwrap_or_default().contains(LINE), "native cut removed the selection");
+
     // Ctrl+V puts what is on the clipboard into the page.
     const PASTED: &str = "سطر ملصوق";
     board.put_text(PASTED);
@@ -7795,6 +7983,39 @@ fn ctrl_v_works_in_an_ltr_paragraph() {
 
     let body = h.state().body().unwrap_or_default().to_string();
     assert!(body.contains(PASTED), "Ctrl+V put the clipboard into the LTR page:\n{body}");
+}
+
+#[test]
+fn native_paste_uses_clipboard_html_and_preserves_plain_text_fallback() {
+    use nocturne_ui_egui::clipboard::Board;
+
+    let mut board = MemoryBoard::new();
+    let (_t, app, s) = sample_app("ui-native-paste");
+    let mut h = harness(app.with_clipboard(Box::new(board.clone())), LIGHT);
+    page_of(&mut h, &s, "Native paste", "Ordinary text");
+    ask(&mut h, "ui.caret", json!({"block": 0})).expect("caret");
+    settle(&mut h);
+
+    let link = "https://example.com/native-paste";
+    board.set_html(&format!("<p><a href=\"{link}\">Formatted link</a></p>"), "Unformatted fallback").expect("HTML clipboard");
+    let ctx = h.ctx.clone();
+    let mut events = vec![egui::Event::Paste("Unformatted fallback".into())];
+    h.state_mut().capture_page_paste(&ctx, &mut events);
+    h.input_mut().events.extend(events);
+    settle(&mut h);
+
+    let body = h.state().body().unwrap_or_default();
+    assert!(body.contains(link), "the pasted link keeps its URL:\n{body}");
+    assert_eq!(body.matches("Formatted link").count(), 1, "the event pastes once:\n{body}");
+    assert!(!body.contains("Unformatted fallback"), "the underlying text event was consumed:\n{body}");
+
+    board.put_text("");
+    let mut events = vec![egui::Event::Paste("Platform plain text".into())];
+    h.state_mut().capture_page_paste(&ctx, &mut events);
+    h.input_mut().events.extend(events);
+    settle(&mut h);
+    let body = h.state().body().unwrap_or_default();
+    assert_eq!(body.matches("Platform plain text").count(), 1, "egui's text still works when the clipboard has no richer content:\n{body}");
 }
 
 /// Ctrl+V with nothing holding the keyboard, which is the case a picked box leaves.

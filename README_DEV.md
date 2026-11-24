@@ -36,8 +36,8 @@ The levels are cumulative:
 | Level | Purpose | Main command or trigger |
 | --- | --- | --- |
 | L0 | Fast feedback while changing code | `cargo fmt`, focused `cargo clippy`, focused `cargo test` |
-| L1 | Commit safety | Pre-commit hook: branch, PII, format, layers, assets, docs, and text checks |
-| L2 | Push safety | Pre-push hook: branch freshness, PII, and full `cargo xtask ci` |
+| L1 | Commit safety | Pre-commit checks for direct commits to `main`, scratch paths, and PII. The commit-msg hook checks the subject. |
+| L2 | Push safety | Pre-push scans outgoing files for PII. Run `cargo xtask check-branch --push` and `cargo xtask ci` locally before pushing. |
 | L3 | Merge safety | GitHub PR CI: quality checks plus build/test on Linux, Windows, and macOS |
 
 L4 is the release process rather than an ordinary development gate: packaging,

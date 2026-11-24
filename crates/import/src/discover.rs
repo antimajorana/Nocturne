@@ -100,16 +100,17 @@ fn walk(root: &Path, dir: &Path, out: &mut Scan, depth: usize) {
         }
         if kind.is_dir() {
             walk(root, &path, out, depth + 1);
-        } else if let Some(name) = path.file_name().map(|name| name.to_string_lossy().to_lowercase()) {
-            if name == ".onetoc2" {
+        } else if let Some(name) = path.file_name().map(|name| name.to_string_lossy()) {
+            if is_section_name(&name) {
+                out.files.extend(section_file(&path, root));
+            } else if name.eq_ignore_ascii_case(".onetoc2") {
                 if let Some(toc) = toc_file(&path, root) {
                     out.tocs.push(toc);
                 }
-            } else if name == ".onepkg" {
+            } else if name.eq_ignore_ascii_case(".onepkg") {
                 out.ignored.push(path);
             } else if let Some(ext) = path.extension().map(|e| e.to_string_lossy().to_lowercase()) {
                 match ext.as_str() {
-                    "one" => out.files.extend(section_file(&path, root)),
                     "onetoc2" => {
                         if let Some(toc) = toc_file(&path, root) {
                             out.tocs.push(toc);
@@ -149,27 +150,31 @@ fn section_file(path: &Path, root: &Path) -> Option<SectionFile> {
 /// `Notes (On 12-26-2025).one` and `Notes.one (On 12-26-2025)` both give `Notes` and
 /// December 26, 2025. A name with no date comes back whole, without its `.one`.
 pub fn parse_file_name(file_name: &str) -> (String, Option<Date>) {
-    let mut name = file_name.trim().to_string();
-    strip_suffix_ci(&mut name, ".one");
-    let mut date = None;
-    if name.ends_with(')')
-        && let Some(open) = name.rfind(" (On ")
-    {
-        let inside = &name[open + 5..name.len() - 1];
-        if let Some(d) = parse_date(inside) {
-            date = Some(d);
-            name.truncate(open);
-        }
-    }
-    strip_suffix_ci(&mut name, ".one");
-    let name = name.trim().to_string();
-    (if name.is_empty() { "Untitled section".to_string() } else { name }, date)
+    let name = file_name.trim();
+    let (name, date) = if let Some(stem) = strip_suffix_ci(name, ".one") {
+        backup_suffix(stem).map_or((stem, None), |(name, date)| (name, Some(date)))
+    } else if let Some((stem, date)) = backup_suffix(name) {
+        (strip_suffix_ci(stem, ".one").unwrap_or(stem), Some(date))
+    } else {
+        (name, None)
+    };
+    let name = name.trim();
+    (if name.is_empty() { "Untitled section" } else { name }.to_string(), date)
 }
 
-fn strip_suffix_ci(s: &mut String, suffix: &str) {
-    if s.len() >= suffix.len() && s.is_char_boundary(s.len() - suffix.len()) && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix) {
-        s.truncate(s.len() - suffix.len());
-    }
+fn is_section_name(name: &str) -> bool {
+    let name = name.trim();
+    strip_suffix_ci(name, ".one").is_some() || backup_suffix(name).is_some_and(|(stem, _)| strip_suffix_ci(stem, ".one").is_some())
+}
+
+fn backup_suffix(name: &str) -> Option<(&str, Date)> {
+    let (stem, suffix) = name.rsplit_once(" (On ")?;
+    Some((stem, parse_date(suffix.strip_suffix(')')?)?))
+}
+
+fn strip_suffix_ci<'a>(name: &'a str, suffix: &str) -> Option<&'a str> {
+    let (stem, ending) = name.split_at_checked(name.len().checked_sub(suffix.len())?)?;
+    ending.eq_ignore_ascii_case(suffix).then_some(stem)
 }
 
 /// `12-26-2025` (month, day, year) into a date. The month comes first because that is how
@@ -207,12 +212,17 @@ pub fn plan(files: &[SectionFile], all_versions: bool) -> Vec<Planned> {
     for (_, mut copies) in groups {
         copies.sort_by_key(|a| std::cmp::Reverse(newest_key(a)));
         let n = copies.len();
+        let mut dated_versions = BTreeMap::<Date, usize>::new();
         for (i, f) in copies.into_iter().enumerate() {
             if i == 0 {
                 out.push(Planned { file: f.clone(), copies: n, version_label: None });
             } else if all_versions {
                 let label = match f.date {
-                    Some((y, m, d)) => format!("{y}-{m:02}-{d:02}"),
+                    Some(date @ (y, m, d)) => {
+                        let count = dated_versions.entry(date).or_default();
+                        *count += 1;
+                        if *count == 1 { format!("{y}-{m:02}-{d:02}") } else { format!("{y}-{m:02}-{d:02}, copy {count}") }
+                    }
                     None => format!("copy {i}"),
                 };
                 out.push(Planned { file: f.clone(), copies: n, version_label: Some(label) });
@@ -247,6 +257,7 @@ mod tests {
         assert_eq!(parse_file_name("New Section 1 (On 12-26-2025).one"), ("New Section 1".to_string(), Some((2025, 12, 26))));
         assert_eq!(parse_file_name("New Section 1.one (On 12-24-2025)"), ("New Section 1".to_string(), Some((2025, 12, 24))));
         assert_eq!(parse_file_name("Notes.one"), ("Notes".to_string(), None));
+        assert_eq!(parse_file_name("Notes.one.one"), ("Notes.one".to_string(), None));
         assert_eq!(parse_file_name("v2.0 plan (On 1-2-2020).one"), ("v2.0 plan".to_string(), Some((2020, 1, 2))));
     }
 
@@ -274,6 +285,21 @@ mod tests {
         assert_eq!(scan.tocs.len(), 1, "a hidden TOC is available to import metadata");
         assert_eq!(scan.ignored.len(), 1, "the package file remains unimported");
         assert!(scan.ignored.iter().any(|path| path.file_name().is_some_and(|name| name == ".onepkg")));
+    }
+
+    #[test]
+    fn discovery_includes_both_backup_name_styles() {
+        let temp = TempDir::new("discover-backup-names");
+        let notebook = temp.path().join("Notebook");
+        fs::create_dir(&notebook).expect("create notebook");
+        for name in ["Notes (On 12-24-2025).one", "Notes.ONE (On 12-26-2025)", "Notes (On 12-25-2025)"] {
+            fs::write(notebook.join(name), b"section fixture").expect("write section fixture");
+        }
+        let found = scan(temp.path());
+        assert_eq!(found.files.len(), 2);
+        let newest = plan(&found.files, false);
+        assert_eq!(newest.len(), 1);
+        assert_eq!(newest[0].file.date, Some((2025, 12, 26)));
     }
 
     #[test]

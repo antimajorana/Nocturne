@@ -188,7 +188,7 @@ fn run_folder(
     progress: &mut impl FnMut(Progress),
 ) -> Result<String, String> {
     let notebook_name = safe_name(source.file_name().and_then(|v| v.to_str()).unwrap_or("Imported notebook"));
-    let (notebook_name, notebook) = unique_notebook_path(notebooks, &notebook_name);
+    let (notebook_name, notebook) = unique_container_path(notebooks, &notebook_name);
     fs::create_dir_all(&notebook).map_err(|e| format!("cannot create {}: {e}", notebook.display()))?;
     write_node(&notebook, "notebook", &notebook_name, format)?;
 
@@ -219,8 +219,7 @@ fn run_folder(
                     write_node(&destination, "group", &group_name, format)?;
                 }
             }
-            let section_name = section_name(file);
-            destination.push(section_name.clone());
+            let (section_name, destination) = unique_container_path(&destination, &section_name(file));
             let stage = staging.join(format!("{index}"));
             fs::create_dir_all(&stage).map_err(|e| format!("cannot create {}: {e}", stage.display()))?;
             if let Err(error) = run_one(file, &stage, format, cancelled) {
@@ -266,7 +265,7 @@ fn suppress_console(command: &mut Command) {
 #[cfg(not(windows))]
 fn suppress_console(_command: &mut Command) {}
 
-fn unique_notebook_path(parent: &Path, name: &str) -> (String, PathBuf) {
+fn unique_container_path(parent: &Path, name: &str) -> (String, PathBuf) {
     let candidate = parent.join(name);
     if !candidate.exists() {
         return (name.to_string(), candidate);
@@ -406,10 +405,8 @@ fn collect_pages(dir: &Path, pages: &mut Vec<PathBuf>) -> Result<(), String> {
 }
 
 fn section_name(path: &Path) -> String {
-    let mut name = path.file_stem().and_then(|v| v.to_str()).unwrap_or("Untitled section").to_string();
-    if let Some((prefix, _)) = name.rsplit_once(" (On ") {
-        name = prefix.to_string();
-    }
+    let file_name = path.file_name().map(|name| name.to_string_lossy()).unwrap_or_default();
+    let (name, _) = crate::discover::parse_file_name(&file_name);
     safe_name(&name)
 }
 
@@ -474,6 +471,7 @@ mod tests {
     fn folder_names_and_backup_dates_become_safe_container_names() {
         assert_eq!(safe_name("2026"), "2026");
         assert_eq!(section_name(Path::new("Work (On 9-29-2026).one")), "Work");
+        assert_eq!(section_name(Path::new("Work (On hold).one")), "Work (On hold)");
         assert_eq!(safe_name("A:B"), "A_B");
     }
 
@@ -499,8 +497,20 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("2026")).expect("test directory");
         fs::create_dir_all(root.join("2026 (1)")).expect("test directory");
-        assert_eq!(unique_notebook_path(&root, "2026"), ("2026 (2)".to_string(), root.join("2026 (2)")));
+        assert_eq!(unique_container_path(&root, "2026"), ("2026 (2)".to_string(), root.join("2026 (2)")));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dated_sections_use_separate_destinations() {
+        let temp = nocturne_store::testing::TempDir::new("officeimo-dated-sections");
+        let first = section_name(Path::new("Work (On 9-28-2026).one"));
+        let (_, destination) = unique_container_path(temp.path(), &first);
+        fs::create_dir(&destination).expect("write first copy");
+
+        let second = section_name(Path::new("Work (On 9-29-2026).one"));
+        assert_eq!(unique_container_path(temp.path(), &second), ("Work (1)".to_string(), temp.path().join("Work (1)")));
+        assert!(destination.is_dir());
     }
 
     #[test]

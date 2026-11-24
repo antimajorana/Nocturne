@@ -24,14 +24,16 @@ use nocturne_store::{PageFormat, Settings};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-fn take_flag_value(args: &mut Vec<String>, name: &str) -> Option<String> {
-    let i = args.iter().position(|a| a == name)?;
-    if i + 1 >= args.len() {
-        return None;
+fn take_flag_value(args: &mut Vec<String>, name: &str) -> Result<Option<String>, String> {
+    let Some(i) = args.iter().position(|a| a == name) else {
+        return Ok(None);
+    };
+    if args.get(i + 1).is_none_or(|value| value.starts_with("--")) {
+        return Err(format!("{name} requires a value"));
     }
     let v = args.remove(i + 1);
     args.remove(i);
-    Some(v)
+    Ok(Some(v))
 }
 
 /// `key=value` words into parameters. A word without `=` is an error.
@@ -131,19 +133,19 @@ fn import_onenote(root: &Path, mut args: Vec<String>) -> Result<(String, bool), 
     if args.iter().any(|a| a == "--help" || a == "-h") {
         return Ok((IMPORT_HELP.to_string(), true));
     }
-    let to = take_flag_value(&mut args, "--to").map(PathBuf::from).unwrap_or_else(|| root.to_path_buf());
-    let format = match take_flag_value(&mut args, "--format") {
+    let to = take_flag_value(&mut args, "--to")?.map(PathBuf::from).unwrap_or_else(|| root.to_path_buf());
+    let format = match take_flag_value(&mut args, "--format")? {
         Some(f) => PageFormat::parse(&f).map_err(|e| e.to_string())?,
         None => PageFormat::Html,
     };
-    let existing = match take_flag_value(&mut args, "--existing").as_deref() {
+    let existing = match take_flag_value(&mut args, "--existing")?.as_deref() {
         None | Some("skip") => Existing::Skip,
         Some("keep") => Existing::Keep,
         Some("replace") => Existing::Replace,
         Some(other) => return Err(format!("--existing takes skip, keep or replace, not '{other}'")),
     };
     let mut only = Vec::new();
-    while let Some(w) = take_flag_value(&mut args, "--only") {
+    while let Some(w) = take_flag_value(&mut args, "--only")? {
         only.push(w);
     }
     let mut take_switch = |name: &str| args.iter().position(|a| a == name).map(|i| args.remove(i)).is_some();
@@ -183,8 +185,8 @@ fn import_officeimo(root: &Path, mut args: Vec<String>) -> Result<(String, bool)
     if args.iter().any(|a| a == "--help" || a == "-h") {
         return Ok((OFFICEIMO_HELP.to_string(), true));
     }
-    let to = take_flag_value(&mut args, "--to").map(PathBuf::from).unwrap_or_else(|| root.to_path_buf());
-    let format = match take_flag_value(&mut args, "--format") {
+    let to = take_flag_value(&mut args, "--to")?.map(PathBuf::from).unwrap_or_else(|| root.to_path_buf());
+    let format = match take_flag_value(&mut args, "--format")? {
         Some(value) => nocturne_import::officeimo::Format::parse(&value)?,
         None => nocturne_import::officeimo::Format::Html,
     };
@@ -232,12 +234,18 @@ fn describe(o: &Output) -> String {
 }
 
 fn run(mut args: Vec<String>) -> Result<(String, bool), String> {
-    let explicit_root = take_flag_value(&mut args, "--notebooks").map(PathBuf::from);
-    let connect = take_flag_value(&mut args, "--connect");
+    let explicit_root = take_flag_value(&mut args, "--notebooks")?.map(PathBuf::from);
+    let connect = take_flag_value(&mut args, "--connect")?;
     let Some(cmd) = args.first().cloned() else {
         return Ok((HELP.to_string(), true));
     };
     let rest = args.get(1..).unwrap_or(&[]).to_vec();
+    if cmd == "--help" || cmd == "-h" {
+        return Ok((HELP.to_string(), true));
+    }
+    if connect.is_some() && !matches!(cmd.as_str(), "open" | "mcp") {
+        return Err("--connect is only supported with open and mcp".to_string());
+    }
     if cmd == "open" {
         // The folder the window would use: the one it remembers, unless one is given here.
         let remembered = Settings::default_location().get("last_notebooks_root").map(PathBuf::from);
@@ -339,10 +347,32 @@ mod tests {
     #[test]
     fn flag_values_are_taken_out() {
         let mut a = vec!["x".to_string(), "--notebooks".into(), "d".into(), "y".into()];
-        assert_eq!(take_flag_value(&mut a, "--notebooks").as_deref(), Some("d"));
+        assert_eq!(take_flag_value(&mut a, "--notebooks").expect("value").as_deref(), Some("d"));
         assert_eq!(a, vec!["x".to_string(), "y".into()]);
         let mut b = vec!["--notebooks".to_string()];
-        assert_eq!(take_flag_value(&mut b, "--notebooks"), None);
+        assert!(take_flag_value(&mut b, "--notebooks").is_err());
+        assert_eq!(take_flag_value(&mut b, "--connect"), Ok(None));
+    }
+
+    #[test]
+    fn missing_flag_values_do_not_consume_other_flags() {
+        let t = TempDir::new("cli-missing-flag-value");
+        let source = t.path().join("source.one");
+        let source = source.to_str().expect("source path");
+        for option in ["--to", "--only"] {
+            let result = run(args(&t, &["import", "onenote", source, option, "--dry-run"]));
+            assert_eq!(result, Err(format!("{option} requires a value")));
+        }
+        assert_eq!(run(vec!["mcp".into(), "--connect".into()]), Err("--connect requires a value".into()));
+        assert!(!t.path().join("nb").exists());
+    }
+
+    #[test]
+    fn help_and_invalid_connection_options_leave_the_notebooks_folder_alone() {
+        let t = TempDir::new("cli-help-connect");
+        assert_eq!(run(args(&t, &["--help"])), Ok((HELP.to_string(), true)));
+        assert!(run(args(&t, &["sample", "--connect", "12345"])).is_err());
+        assert!(!t.path().join("nb").exists());
     }
 
     #[test]

@@ -28,7 +28,7 @@ works too.
 - Each page becomes a **page folder**. A sub-page becomes a folder inside its page, so a
   sub-page of a sub-page of a sub-page is three folders deep. The file format stops at three
   levels; Nocturne does not stop there, it just has nothing deeper to import.
-- Text keeps bold, italic, strikethrough and links. Bullet and numbered lists keep their depth.
+- Text keeps bold, italic, underline, strikethrough and links. Bullet and numbered lists keep their depth.
   Tables become tables. Pictures and attached files are stored in the page's `assets` folder and
   linked by a relative path.
 - A page whose text mostly reads right to left is marked as a right to left page. Names and text
@@ -42,7 +42,7 @@ works too.
 | `--to FOLDER` | The notebooks folder to write into. Default: `--notebooks`, then the usual one. |
 | `--format html\|cmgfm` | The page format to write. Default `html`. |
 | `--all-versions` | The backup folder keeps many dated copies of each section. By default only the newest is imported. This adds the older ones, named with their date. |
-| `--existing skip\|keep\|replace` | When a section is already in the destination. `skip` (default) leaves it, so running twice changes nothing. `keep` imports beside it. `replace` deletes it and imports again. |
+| `--existing skip\|keep\|replace` | When a section is already in the destination. `skip` (default) leaves it, so running twice changes nothing. `keep` imports beside it. `replace` installs the completed import at the existing section's path. |
 | `--only WORD` | Only notebooks, groups or sections whose name contains the word. Repeat it for more. |
 | `--dry-run` | Plan and report, write nothing. |
 

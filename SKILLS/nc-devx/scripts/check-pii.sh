@@ -1,95 +1,58 @@
 #!/bin/bash
-# Nocturne PII Scanner - Checks for personally identifiable information
-# Run: bash SKILLS/nc-devx/scripts/check-pii.sh [--fix]
+# Scan staged changes by default, a full commit with --all, or outgoing changes with --range.
+set -euo pipefail
 
-# PII patterns to detect
-# Project-specific patterns (add your own as needed):
-PII_PATTERNS=(
-    # Prevent known personal emails - update with project-specific emails
-    # "person@domain"                # Template: replace with actual email to block
-    "[0-9]{3}-[0-9]{2}-[0-9]{4}"  # SSN-like pattern (###-##-####)
-)
+# Add project-specific patterns here.
+patterns=('[0-9]{3}-[0-9]{2}-[0-9]{4}')
+grep_patterns=()
+for pattern in "${patterns[@]}"; do
+    grep_patterns+=(-e "$pattern")
+done
 
-FIX_MODE=false
-if [[ "$1" == "--fix" ]]; then
-    FIX_MODE=true
+case "${1:-}" in
+    "" | --fix)
+        [[ $# -le 1 ]] || exit 2
+        scope=(--cached --)
+        changes=(--cached)
+        ;;
+    --all)
+        [[ $# -le 2 ]] || exit 2
+        tip=$(git rev-parse --verify "${2:-HEAD}^{commit}")
+        scope=("$tip" --)
+        ;;
+    --range)
+        [[ $# -eq 3 ]] || exit 2
+        base=$(git rev-parse --verify "$2^{commit}")
+        tip=$(git rev-parse --verify "$3^{commit}")
+        scope=("$tip" --)
+        changes=("$base" "$tip")
+        ;;
+    *)
+        echo "Usage: $0 [--all [commit] | --range base tip]" >&2
+        exit 2
+        ;;
+esac
+
+if [[ ${1:-} != --all ]]; then
+    path_list=$(mktemp)
+    trap 'rm -f "$path_list"' EXIT
+    git diff --name-only --no-renames --diff-filter=AMT -z "${changes[@]}" -- > "$path_list"
+    while IFS= read -r -d '' path; do
+        scope+=("$path")
+    done < "$path_list"
+    if (( ${#scope[@]} == 2 )); then
+        echo "No changed files to scan"
+        exit 0
+    fi
 fi
 
-# Determine what to scan
-if git rev-parse --git-dir > /dev/null 2>&1; then
-    # In a git repo: scan staged files if committing, all files if pushed
-    if [[ -n "$1" ]] && [[ "$1" != "--fix" ]]; then
-        # Called from pre-push: scan all changes
-        FILES=$(git diff origin/main --name-only 2>/dev/null || git diff --cached --name-only)
-    else
-        # Called from pre-commit: scan staged files
-        FILES=$(git diff --cached --name-only)
-    fi
-else
-    # Not in git repo: scan current directory
-    FILES=$(find . -type f -name "*.md" -o -name "*.rs" -o -name "*.sh" -o -name "*.ps1" | grep -v "\.git" | grep -v "target" | grep -v "node_modules")
-fi
-
-if [[ -z "$FILES" ]]; then
-    echo "✓ No files to scan"
-    exit 0
-fi
-
-FOUND_ISSUES=0
-ISSUES_FILE=$(mktemp)
-
-# Scan each file
-while IFS= read -r file; do
-    [[ -z "$file" ]] && continue
-    [[ ! -f "$file" ]] && continue
-
-    # Skip binary files
-    if file "$file" | grep -q "binary"; then
-        continue
-    fi
-
-    # Check each pattern
-    for pattern in "${PII_PATTERNS[@]}"; do
-        if grep -q "$pattern" "$file" 2>/dev/null; then
-            echo "$file: Found '$pattern'" >> "$ISSUES_FILE"
-            FOUND_ISSUES=$((FOUND_ISSUES + 1))
-        fi
-    done
-done <<< "$FILES"
-
-if [[ $FOUND_ISSUES -gt 0 ]]; then
-    echo "❌ PII Issues Found:"
-    echo ""
-    cat "$ISSUES_FILE"
-    echo ""
-
-    if [[ "$FIX_MODE" == true ]]; then
-        echo "Attempting to fix PII issues..."
-        # Note: Automated fixing is risky. Better to show and let user fix.
-        # This just informs them of the issue.
-        echo ""
-        echo "To fix:"
-        echo "  1. Edit the files listed above"
-        echo "  2. Remove or replace sensitive data"
-        echo "  3. Re-stage the changes: git add <file>"
-        echo "  4. Re-commit or re-push"
-    else
-        echo "To auto-check before committing:"
-        echo "  git commit  # Will run pre-commit hook"
-        echo ""
-        echo "To manually scan:"
-        echo "  bash SKILLS/nc-devx/scripts/check-pii.sh"
-        echo ""
-        echo "To fix and retry:"
-        echo "  1. Edit the files and remove PII"
-        echo "  2. git add <file>"
-        echo "  3. git commit (or git push)"
-    fi
-
-    rm -f "$ISSUES_FILE"
+if git --literal-pathspecs grep -I -l -E "${grep_patterns[@]}" "${scope[@]}"; then
+    echo "PII check failed. Review the listed files for sensitive data." >&2
     exit 1
 else
-    echo "✓ No PII detected"
-    rm -f "$ISSUES_FILE"
-    exit 0
+    result=$?
+    if [[ $result -ne 1 ]]; then
+        exit "$result"
+    fi
 fi
+echo "No PII detected"

@@ -120,14 +120,14 @@ pub fn read_node(dir: &Path) -> Option<NodeInfo> {
     })
 }
 
-/// Child folders in display order: by `order`, then by name. Skips `assets` and
-/// folders whose names start with a dot.
+/// Child folders in display order: by `order`, then by name. Skips directory links,
+/// `assets` and folders whose names start with a dot.
 pub fn child_dirs(dir: &Path) -> Vec<PathBuf> {
     let mut dirs: Vec<(u32, String, PathBuf)> = match fs::read_dir(dir) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|kind| kind.is_dir()))
             .map(|e| e.path())
-            .filter(|p| p.is_dir())
             .map(|p| (folder_name(&p), p))
             .filter(|(n, _)| n != "assets" && !n.starts_with('.'))
             .map(|(n, p)| (read_node(&p).map(|i| i.order).unwrap_or(0), n, p))
@@ -195,6 +195,19 @@ mod tests {
         assert_eq!(child_dirs(&nb), vec![a.clone(), b.clone()], "created order wins over name");
         assert!(p.join("assets").is_dir());
         assert!(child_dirs(&p).is_empty(), "assets is not a child");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_link_does_not_add_a_child_to_the_tree() {
+        let t = TempDir::new("tree-directory-link");
+        let settings = Settings::at(t.path().join("settings.toml"));
+        let notebook = ops::create_notebook(t.path(), "Notebook", None, &settings).expect("notebook");
+        let section = ops::create_node(&notebook, "Section", NodeKind::Section, None, &settings).expect("section");
+        std::os::unix::fs::symlink(&section, section.join("loop")).expect("link to the containing section");
+
+        assert!(child_dirs(&section).is_empty());
+        assert_eq!(load_tree(&notebook).expect("tree").count(), 2);
     }
 
     #[test]

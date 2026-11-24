@@ -866,6 +866,9 @@ index 0000000..295f3b0
 +            metadata(&p).map(|_| p)
 +        }
 +
++        /// The in-memory notebook has no host file permissions.
++        pub struct Permissions;
++
 +        pub struct Metadata(Option<u64>);
 +        impl Metadata {
 +            pub fn len(&self) -> u64 {
@@ -877,6 +880,9 @@ index 0000000..295f3b0
 +            pub fn is_dir(&self) -> bool {
 +                self.0.is_none()
 +            }
++            pub fn permissions(&self) -> Permissions {
++                Permissions
++            }
 +        }
 +
 +        pub fn metadata<P: AsRef<Path>>(p: P) -> io::Result<Metadata> {
@@ -885,6 +891,11 @@ index 0000000..295f3b0
 +                Some(Entry::Dir) => Ok(Metadata(None)),
 +                None => Err(missing(p.as_ref())),
 +            })
++        }
++
++        pub fn symlink_metadata<P: AsRef<Path>>(p: P) -> io::Result<Metadata> {
++            // The virtual file system has only ordinary files and directories.
++            metadata(p)
 +        }
 +
 +        pub struct DirEntry(PathBuf);

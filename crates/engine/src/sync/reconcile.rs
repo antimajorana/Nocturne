@@ -7,16 +7,18 @@ use crate::sync::manifest::{
 };
 use crate::sync::transport::{SecretStore, SyncHttpClient};
 use crate::sync::{KDRIVE_TOKEN_KEY, SyncConfig, SyncError, SyncReport};
+use nocturne_model::id::new_id;
 use nocturne_store::Settings;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const STAGE_DIR_NAME: &str = ".nocturne-sync-stage";
+const LOCKED_RUN_PREFIX: &str = "locked-run-";
 const TRASH_DIR_NAME: &str = ".sync-trash";
 const MAX_SAFE_DELETE_COUNT: usize = 10;
 
-static STAGE_RUN_SEQ: AtomicU64 = AtomicU64::new(1);
 static WRITE_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug)]
@@ -43,7 +45,7 @@ pub struct StagedSync {
     local_root: PathBuf,
     manifest_path: PathBuf,
     target_key: String,
-    stage_dir: PathBuf,
+    _stage: SyncStage,
     manifest_entries: BTreeMap<String, ManifestEntry>,
     downloads: Vec<StagedDownload>,
     local_trashes: Vec<StagedLocalTrash>,
@@ -51,11 +53,60 @@ pub struct StagedSync {
     pub discovered_drive_id: Option<u64>,
 }
 
-impl Drop for StagedSync {
-    fn drop(&mut self) {
-        if self.stage_dir.exists() {
-            let _ = std::fs::remove_dir_all(&self.stage_dir);
+#[derive(Debug)]
+struct SyncStage {
+    dir: PathBuf,
+    _lock: File,
+}
+
+impl SyncStage {
+    fn acquire(local_root: &Path) -> Result<Self, SyncError> {
+        let parent = private_sync_dir(local_root, STAGE_DIR_NAME)?;
+        // Keep a stable lock file so separate processes always lock the same file.
+        let lock_path = parent.join(".lock");
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        let lock = match options.clone().create_new(true).open(&lock_path) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let meta =
+                    std::fs::symlink_metadata(&lock_path).map_err(|e| SyncError::Io(format!("inspect sync lock {}: {e}", lock_path.display())))?;
+                if !meta.is_file() {
+                    return Err(SyncError::SafetyRefused(format!("the sync lock must be a regular file: {}", lock_path.display())));
+                }
+                options.open(&lock_path)
+            }
+            result => result,
         }
+        .map_err(|e| SyncError::Io(format!("open sync lock {}: {e}", lock_path.display())))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Err(SyncError::SafetyRefused("a sync is already in progress for this notebooks folder".into())),
+            Err(TryLockError::Error(e)) => return Err(SyncError::Io(format!("lock sync folder {}: {e}", parent.display()))),
+        }
+
+        // With the lock held, only a previous interrupted run can have left one of these folders.
+        // Earlier Nocturne versions used run-* folders and did not take this lock.
+        if let Ok(entries) = std::fs::read_dir(&parent) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if let Some(id) = name.to_str().and_then(|name| name.strip_prefix(LOCKED_RUN_PREFIX))
+                    && id.len() == 20
+                    && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && entry.file_type().is_ok_and(|kind| kind.is_dir())
+                {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+        let dir = parent.join(format!("{LOCKED_RUN_PREFIX}{}", new_id()));
+        std::fs::create_dir(&dir).map_err(|e| SyncError::Io(format!("create stage dir {}: {e}", dir.display())))?;
+        Ok(Self { dir, _lock: lock })
+    }
+}
+
+impl Drop for SyncStage {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -73,6 +124,7 @@ impl StagedSync {
 
 /// Phase 1: runs network discovery, uploads local-only changes, and stages remote downloads into
 /// `<local_root>/.nocturne-sync-stage/<run_id>/` without mutating any live local notebook file.
+/// The notebook root stays locked until the staged sync is applied or dropped.
 pub fn stage_sync(
     local_root: &Path,
     settings: &Settings,
@@ -88,6 +140,7 @@ pub fn stage_sync(
         .get_secret(KDRIVE_TOKEN_KEY)?
         .ok_or_else(|| SyncError::NotConfigured("enter a kDrive Personal API Token in Cloud Sync settings".into()))?;
     let client = KDriveClient::new(http, &config.endpoint, &token, cancel)?;
+    let stage = SyncStage::acquire(local_root)?;
 
     let (drive_id, discovered_drive_id) = match config.drive_id {
         Some(id) => (id, None),
@@ -105,27 +158,7 @@ pub fn stage_sync(
     let target_key = make_target_key(local_root, &config.endpoint, drive_id, &normalized_remote);
     let baseline = load_manifest(&manifest_path, &target_key);
 
-    let now = unix_now_secs();
-    let stage_parent = local_root.join(STAGE_DIR_NAME);
-    let pid_tag = format!("-{}-", std::process::id());
-    let pid_suffix = format!("-{}", std::process::id());
-    if let Ok(entries) = std::fs::read_dir(&stage_parent) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str()
-                && name.starts_with("run-")
-                && !name.contains(&pid_tag)
-                && !name.ends_with(&pid_suffix)
-            {
-                let _ = std::fs::remove_dir_all(entry.path());
-            }
-        }
-    }
-    let seq = STAGE_RUN_SEQ.fetch_add(1, Ordering::Relaxed);
-    let stage_dir = stage_parent.join(format!("run-{now}{pid_tag}{seq}"));
-    let _ = std::fs::remove_dir_all(&stage_dir);
-    std::fs::create_dir_all(&stage_dir).map_err(|e| SyncError::Io(format!("create stage dir {}: {e}", stage_dir.display())))?;
-
-    let stage_res = stage_sync_into_dir(
+    stage_sync_into_dir(
         &client,
         drive_id,
         discovered_drive_id,
@@ -139,15 +172,11 @@ pub fn stage_sync(
         manifest_path,
         target_key,
         baseline,
-        &stage_dir,
-        now,
+        stage,
+        unix_now_secs(),
         config,
         cancel,
-    );
-    if stage_res.is_err() {
-        let _ = std::fs::remove_dir_all(&stage_dir);
-    }
-    stage_res
+    )
 }
 
 fn is_recycled_rel_path(rel: &str, recycled_prefixes: &BTreeSet<String>) -> bool {
@@ -169,11 +198,12 @@ fn stage_sync_into_dir(
     manifest_path: PathBuf,
     target_key: String,
     baseline: BTreeMap<String, ManifestEntry>,
-    stage_dir: &Path,
+    stage: SyncStage,
     now: u64,
     config: &SyncConfig,
     cancel: Option<&AtomicBool>,
 ) -> Result<StagedSync, SyncError> {
+    let stage_dir = &stage.dir;
     let mut all_paths = BTreeSet::new();
     all_paths.extend(local_files.keys().cloned());
     all_paths.extend(remote_files.keys().cloned());
@@ -446,7 +476,7 @@ fn stage_sync_into_dir(
         local_root: local_root.to_path_buf(),
         manifest_path,
         target_key,
-        stage_dir: stage_dir.to_path_buf(),
+        _stage: stage,
         manifest_entries: next_manifest,
         downloads,
         local_trashes: planned_local_deletes,
@@ -586,13 +616,18 @@ pub fn apply_staged_sync(mut staged: StagedSync, settings: &Settings) -> Result<
     }
 
     let local_trashes = std::mem::take(&mut staged.local_trashes);
+    let mut trash_batch: Option<PathBuf> = None;
     for tr in local_trashes {
         let dest = local_path_for(&staged.local_root, &tr.rel_path)?;
         if dest.is_file()
             && let Ok((cur_sha, _)) = sha256_file(&dest)
             && cur_sha == tr.expected_local_sha256
         {
-            let trash_dest = staged.local_root.join(TRASH_DIR_NAME).join(now.to_string()).join(&tr.rel_path);
+            let batch = match &trash_batch {
+                Some(batch) => batch,
+                None => trash_batch.insert(create_trash_batch(&staged.local_root, now)?),
+            };
+            let trash_dest = batch.join(&tr.rel_path);
             if let Some(parent) = trash_dest.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| SyncError::Io(format!("create sync-trash dir {}: {e}", parent.display())))?;
             }
@@ -605,11 +640,40 @@ pub fn apply_staged_sync(mut staged: StagedSync, settings: &Settings) -> Result<
         }
     }
 
-    let _ = std::fs::remove_dir_all(&staged.stage_dir);
     staged.report.finished_unix_secs = unix_now_secs();
     save_manifest(&staged.manifest_path, &staged.target_key, &staged.manifest_entries)?;
     SyncConfig::record_last_sync(settings, &staged.report);
     Ok(std::mem::take(&mut staged.report))
+}
+
+fn create_trash_batch(local_root: &Path, now: u64) -> Result<PathBuf, SyncError> {
+    let root = private_sync_dir(local_root, TRASH_DIR_NAME)?;
+    for suffix in 0..10_000 {
+        let name = if suffix == 0 { now.to_string() } else { format!("{now}-{suffix}") };
+        let path = root.join(name);
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(SyncError::Io(format!("create sync-trash batch {}: {e}", path.display()))),
+        }
+    }
+    Err(SyncError::Io(format!("could not allocate a sync-trash batch in {}", root.display())))
+}
+
+fn private_sync_dir(local_root: &Path, name: &str) -> Result<PathBuf, SyncError> {
+    std::fs::create_dir_all(local_root).map_err(|e| SyncError::Io(format!("create notebooks folder {}: {e}", local_root.display())))?;
+    let dir = local_root.join(name);
+    match std::fs::create_dir(&dir) {
+        Ok(()) => Ok(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let meta = std::fs::symlink_metadata(&dir).map_err(|e| SyncError::Io(format!("inspect sync folder {}: {e}", dir.display())))?;
+            if !meta.is_dir() {
+                return Err(SyncError::SafetyRefused(format!("the sync folder must be a regular directory: {}", dir.display())));
+            }
+            Ok(dir)
+        }
+        Err(e) => Err(SyncError::Io(format!("create sync folder {}: {e}", dir.display()))),
+    }
 }
 
 pub fn run_sync_blocking(
@@ -635,6 +699,14 @@ fn local_path_for(local_root: &Path, rel_path: &str) -> Result<PathBuf, SyncErro
     let mut out = local_root.to_path_buf();
     for seg in rel_path.split('/') {
         out.push(seg);
+        match std::fs::symlink_metadata(&out) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(SyncError::SafetyRefused(format!("refused sync through a symbolic link: {}", out.display())));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(SyncError::Io(format!("inspect sync path {}: {e}", out.display()))),
+        }
     }
     Ok(out)
 }
@@ -701,6 +773,57 @@ fn write_staged_to_dest(staged_file: &Path, dest: &Path) -> Result<(), SyncError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_sync_storage_is_left_untouched() {
+        let t = nocturne_store::testing::TempDir::new("sync-linked-storage");
+        let root = t.path().join("notebooks");
+        let elsewhere = t.path().join("elsewhere");
+        std::fs::create_dir(&root).expect("notebooks folder");
+        let other_stage = elsewhere.join("locked-run-00000000000000000001");
+        std::fs::create_dir_all(&other_stage).expect("other staging directory");
+        std::fs::write(other_stage.join("item.part"), "another run's download").expect("other staged file");
+        std::os::unix::fs::symlink(&elsewhere, root.join(STAGE_DIR_NAME)).expect("linked staging folder");
+        std::os::unix::fs::symlink(&elsewhere, root.join(TRASH_DIR_NAME)).expect("linked trash folder");
+
+        assert!(matches!(SyncStage::acquire(&root), Err(SyncError::SafetyRefused(_))));
+        assert!(matches!(create_trash_batch(&root, 1_700_000_100), Err(SyncError::SafetyRefused(_))));
+        assert_eq!(std::fs::read_to_string(other_stage.join("item.part")).expect("outside staged file"), "another run's download");
+        assert_eq!(std::fs::read_dir(&elsewhere).expect("outside folder").count(), 1);
+
+        let stage_dir = root.join(STAGE_DIR_NAME);
+        std::fs::remove_file(&stage_dir).expect("remove linked stage folder");
+        std::fs::create_dir(&stage_dir).expect("ordinary stage folder");
+        std::os::unix::fs::symlink(other_stage.join("item.part"), stage_dir.join(".lock")).expect("linked lock file");
+        assert!(matches!(SyncStage::acquire(&root), Err(SyncError::SafetyRefused(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_folder_is_not_a_local_sync_destination() {
+        let t = nocturne_store::testing::TempDir::new("sync-linked-destination");
+        let root = t.path().join("notebooks");
+        let elsewhere = t.path().join("elsewhere");
+        std::fs::create_dir(&root).expect("notebooks folder");
+        std::fs::create_dir(&elsewhere).expect("folder outside the notebooks");
+        std::os::unix::fs::symlink(&elsewhere, root.join("linked")).expect("link to other folder");
+
+        assert!(matches!(local_path_for(&root, "linked/index.md"), Err(SyncError::SafetyRefused(_))));
+        assert_eq!(local_path_for(&root, "new/index.md").expect("ordinary path"), root.join("new/index.md"));
+    }
+
+    #[test]
+    fn trash_batches_created_in_the_same_second_keep_both_revisions() {
+        let t = nocturne_store::testing::TempDir::new("sync-trash-batches");
+        let first = create_trash_batch(t.path(), 1_700_000_100).expect("first trash batch").join("note.txt");
+        std::fs::write(&first, "first revision").expect("first revision");
+        let second = create_trash_batch(t.path(), 1_700_000_100).expect("second trash batch").join("note.txt");
+        std::fs::write(&second, "second revision").expect("second revision");
+
+        assert_eq!(std::fs::read_to_string(first).expect("first revision retained"), "first revision");
+        assert_eq!(std::fs::read_to_string(second).expect("second revision retained"), "second revision");
+    }
 
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     #[test]
@@ -826,8 +949,7 @@ mod tests {
             let config = SyncConfig { propagate_deletes, ..SyncConfig::default() };
 
             // Pass 1: trashes the first 50, defers the remaining 12 without downloading or SafetyRefused.
-            let stage_dir_1 = tmp.path().join("stage-1");
-            std::fs::create_dir_all(&stage_dir_1).expect("stage 1");
+            let stage_1 = SyncStage::acquire(tmp.path()).expect("stage 1");
             let staged_1 = stage_sync_into_dir(
                 &client,
                 7,
@@ -842,7 +964,7 @@ mod tests {
                 tmp.path().join("manifest.json"),
                 "key".into(),
                 baseline.clone(),
-                &stage_dir_1,
+                stage_1,
                 1_700_000_100,
                 &config,
                 None,
@@ -862,10 +984,11 @@ mod tests {
                     assert_eq!(staged_1.manifest_entries.get(rel), Some(entry), "deferred entry must keep its baseline");
                 }
             }
+            let next_baseline = staged_1.manifest_entries.clone();
+            drop(staged_1);
 
             // Pass 2: trashes the remaining 12 deferred files cleanly.
-            let stage_dir_2 = tmp.path().join("stage-2");
-            std::fs::create_dir_all(&stage_dir_2).expect("stage 2");
+            let stage_2 = SyncStage::acquire(tmp.path()).expect("stage 2");
             let staged_2 = stage_sync_into_dir(
                 &client,
                 7,
@@ -879,8 +1002,8 @@ mod tests {
                 BTreeMap::new(),
                 tmp.path().join("manifest.json"),
                 "key".into(),
-                staged_1.manifest_entries.clone(),
-                &stage_dir_2,
+                next_baseline,
+                stage_2,
                 1_700_000_200,
                 &config,
                 None,
