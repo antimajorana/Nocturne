@@ -1,5 +1,7 @@
 # Nocturne
 
+<img align="right" src="assets/brand/nocturne-256.png" width="96" height="96" alt="Nocturne app logo">
+
 Nocturne is an alpha notebook app that keeps your notes in local folders. Organize
 notebooks into sections and pages, then type or draw directly on the page.
 
