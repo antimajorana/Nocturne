@@ -8,7 +8,7 @@ section: utils
 priority: optional
 maintainer: Nocturne maintainers <nocturne@example.invalid>
 homepage: https://github.com/antimajorana/Nocturne
-license: GPL-3.0-only
+license: AGPL-3.0-only
 description: |-
   Nocturne is a clean-room note taking app.
   Notes live as plain files in plain folders.

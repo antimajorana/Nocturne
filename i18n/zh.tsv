@@ -373,7 +373,7 @@
 @id	ui.mermaid	Mermaid
 @id	ui.mint	薄荷色
 @id	ui.mit_license	MIT 许可证
-@id	ui.licence_summary_nocturne	Nocturne 的代码采用 GPL-3.0-only 许可证。图标设计的单独条款见 ATTRIBUTION.md。
+@id	ui.licence_summary_nocturne	Nocturne 的代码采用 AGPL-3.0-only 许可证。图标设计的单独条款见 ATTRIBUTION.md。
 @id	ui.mode	模式
 @id	ui.modify_tool	修改工具
 @id	ui.more	更多...

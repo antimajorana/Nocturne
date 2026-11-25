@@ -429,7 +429,7 @@
 @id	ui.mermaid	$$$Mermaid@@@
 @id	ui.mint	$$$mint@@@
 @id	ui.mit_license	$$$MIT license@@@
-@id	ui.licence_summary_nocturne	$$$Nocturne code: GPL-3.0-only. See ATTRIBUTION.md for the separate icon artwork terms.@@@
+@id	ui.licence_summary_nocturne	$$$Nocturne code: AGPL-3.0-only. See ATTRIBUTION.md for the separate icon artwork terms.@@@
 @id	ui.mode	$$$Mode@@@
 @id	ui.modify_tool	$$$Modify Tool@@@
 @id	ui.more	$$$More...@@@

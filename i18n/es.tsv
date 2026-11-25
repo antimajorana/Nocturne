@@ -372,7 +372,7 @@
 @id	ui.mermaid	Mermaid
 @id	ui.mint	mint
 @id	ui.mit_license	Licencia MIT
-@id	ui.licence_summary_nocturne	El código de Nocturne se distribuye bajo GPL-3.0-only. Consulta las condiciones específicas del icono en ATTRIBUTION.md.
+@id	ui.licence_summary_nocturne	El código de Nocturne se distribuye bajo AGPL-3.0-only. Consulta las condiciones específicas del icono en ATTRIBUTION.md.
 @id	ui.mode	Modo
 @id	ui.modify_tool	Herramienta de modificación
 @id	ui.more	More...

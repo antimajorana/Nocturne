@@ -18,6 +18,6 @@
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
-  <key>NSHumanReadableCopyright</key><string>Nocturne contributors. GPL-3.0-only.</string>
+  <key>NSHumanReadableCopyright</key><string>Nocturne contributors. AGPL-3.0-only.</string>
 </dict>
 </plist>

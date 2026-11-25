@@ -88,7 +88,7 @@ Last reviewed: 2026-10-17. Status of the proof of concept, measured where a numb
 | Where and when to push | Nothing is committed or pushed yet. |
 | Commit attribution lines | Two sources disagree. Resolve before the first commit. |
 
-The initial release decision on 2026-10-17 was to support `.one` import and use MIT or Apache-2.0. The current code licence is [GPL-3.0-only](LICENSE).
+The initial release decision on 2026-10-17 was to support `.one` import and use MIT or Apache-2.0. The code licence became GPL-3.0-only on 2026-11-24. It changed to [AGPL-3.0-only](LICENSE) on 2026-11-25, which is the current code licence.
 
 See [`docs/gaps.md`](docs/gaps.md) for the full list of gaps and
 [`docs/feature-parity.md`](docs/feature-parity.md) for feature parity.

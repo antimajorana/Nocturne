@@ -751,7 +751,9 @@ imports shared documents placed in `Documents/Inbox/` (Share > Nocturne), and re
 - **The Nocturne brand artwork** (banners, icons, and social assets under `assets/brand/` and
   `assets/demo/`) was created for the project; see `ATTRIBUTION.md` for third-party library
   and licence notices.
-- **The licence is GPL-3.0-only** for project-owned code. The earlier releases keep their original terms.
+- **The licence is AGPL-3.0-only** for project-owned code. The earlier releases keep their original terms
+  (MIT or Apache-2.0 through v0.0.17, GPL-3.0-only for v0.0.18; changed to AGPL-3.0-only on 2026-11-25).
+  Anyone who runs a modified version as a network service must offer its source to that service's users.
   The artwork above is outside it, and no audit of the dependencies' licences has been run.
 - **Clean room:** the `.one` format work uses only Microsoft's published specifications and
   files the owner owns. No Microsoft code or text is copied.

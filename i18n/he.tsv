@@ -372,7 +372,7 @@
 @id	ui.mermaid	Mermaid
 @id	ui.mint	מנטה
 @id	ui.mit_license	רישיון MIT
-@id	ui.licence_summary_nocturne	הקוד של Nocturne מופץ ברישיון GPL-3.0-only. התנאים הנפרדים החלים על עיצוב הסמל מופיעים בקובץ ATTRIBUTION.md.
+@id	ui.licence_summary_nocturne	הקוד של Nocturne מופץ ברישיון AGPL-3.0-only. התנאים הנפרדים החלים על עיצוב הסמל מופיעים בקובץ ATTRIBUTION.md.
 @id	ui.mode	מצב
 @id	ui.modify_tool	כלי עריכה
 @id	ui.more	עוד...
