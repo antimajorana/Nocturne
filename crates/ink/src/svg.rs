@@ -16,12 +16,14 @@
 //! panic, and a file with some good strokes and some bad gives the good ones.
 
 use crate::{Dab, Drawing, MAX_STROKES, PressureCurve, Rgb, Stroke, Tool, shape};
+use std::fmt::Write;
 
 /// Our namespace for the readings kept beside the drawn outline.
 pub const NS: &str = "https://nocturne.org/ns/ink";
 
-/// How much of a file this will read, in bytes. A drawing is small; anything approaching
-/// this is a mistake or an attack, and is refused before it is parsed.
+/// Limit for SVG files without Nocturne's editable ink marker. Editable
+/// drawings are bounded by stroke and sample counts instead: their visible
+/// SVG outlines can legitimately exceed this many bytes.
 pub const MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// Which of the two a file is written as.
@@ -101,6 +103,9 @@ pub fn write(drawing: &Drawing, flavour: Flavour) -> String {
         h = num(drawing.height)
     ));
     out.push_str("  <title>Ink</title>\n");
+    if drawing.strokes.iter().any(|stroke| stroke.tool == Tool::Pencil) {
+        pencil_grain(&mut out, drawing);
+    }
     for stroke in &drawing.strokes {
         let ring = shape::outline(stroke);
         if ring.is_empty() {
@@ -127,6 +132,9 @@ pub fn write(drawing: &Drawing, flavour: Flavour) -> String {
             out.push_str(&format!(" nc:dabs=\"{}\"", dabs_text(&stroke.dabs)));
         }
         out.push_str(&format!(" fill=\"{}\"", stroke.colour.hex()));
+        if stroke.tool == Tool::Pencil {
+            out.push_str(" mask=\"url(#nc-pencil-grain)\"");
+        }
         let opacity = stroke.tool.opacity();
         if opacity < 1.0 {
             out.push_str(&format!(" fill-opacity=\"{}\"", num(opacity)));
@@ -135,6 +143,33 @@ pub fn write(drawing: &Drawing, flavour: Flavour) -> String {
     }
     out.push_str("</svg>\n");
     out
+}
+
+fn pencil_grain(out: &mut String, drawing: &Drawing) {
+    static PATTERN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    out.push_str(PATTERN.get_or_init(|| {
+        let cell = shape::PAPER_GRAIN_CELL;
+        let tile = f32::from(shape::PAPER_GRAIN_TILE) * cell;
+        let mut pattern = format!("  <defs><pattern id=\"nc-paper-grain\" patternUnits=\"userSpaceOnUse\" width=\"{tile}\" height=\"{tile}\">\n");
+        for row in 0..shape::PAPER_GRAIN_TILE {
+            for col in 0..shape::PAPER_GRAIN_TILE {
+                let (x, y) = (f32::from(col) * cell, f32::from(row) * cell);
+                let opacity = 0.46 + 0.43 * shape::paper_grain(x + cell * 0.5, y + cell * 0.5);
+                let _ = writeln!(
+                    pattern,
+                    "    <rect x=\"{x:.4}\" y=\"{y:.4}\" width=\"{cell:.4}\" height=\"{cell:.4}\" fill=\"white\" opacity=\"{opacity:.2}\"/>"
+                );
+            }
+        }
+        pattern.push_str("  </pattern>\n");
+        pattern
+    }));
+    let region =
+        format!("x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"", num(drawing.view_x), num(drawing.view_y), num(drawing.width), num(drawing.height));
+    let _ = writeln!(
+        out,
+        "  <mask id=\"nc-pencil-grain\" maskUnits=\"userSpaceOnUse\" {region}><rect {region} fill=\"url(#nc-paper-grain)\"/></mask></defs>"
+    );
 }
 
 /// The readings as one attribute: `x,y,p x,y,p ...`.
@@ -172,7 +207,7 @@ fn dabs_from(text: &str) -> Vec<Dab> {
 /// of them is returned beside the drawing: a caller can then say that the file holds ink it
 /// will not be able to edit.
 pub fn read(text: &str) -> Result<(Drawing, usize), InkError> {
-    if text.len() > MAX_BYTES {
+    if text.len() > MAX_BYTES && !is_ink(text) {
         return Err(InkError::TooBig(text.len()));
     }
     let Some(open) = find_tag(text, "<svg") else { return Err(InkError::NotSvg) };
@@ -198,7 +233,7 @@ pub fn read(text: &str) -> Result<(Drawing, usize), InkError> {
             width: attr(tag, "nc:width").and_then(|v| v.trim().parse().ok()).unwrap_or(3.0),
             gain: attr(tag, "nc:gain").and_then(|v| v.trim().parse().ok()).unwrap_or(1.0),
             curve: attr(tag, "nc:curve").and_then(|v| PressureCurve::parse(&v)).unwrap_or_default(),
-            dabs: dabs_from(&dabs),
+            dabs: dabs_from(&dabs).into(),
         }
         .sane();
         if stroke.is_empty() {
@@ -282,6 +317,31 @@ fn unescape(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pencil_svg_has_a_shared_grain_mask_without_extra_editable_strokes() {
+        use super::*;
+        let mut drawing = Drawing::new(400.0, 400.0);
+        let mut pencil = Stroke::new(Tool::Pencil, Rgb::BLACK, 6.0);
+        pencil.add(Dab::new(-10.0, 20.0, 0.8));
+        pencil.add(Dab::new(30.0, 40.0, 0.7));
+        drawing.add(pencil);
+        let xml = write(&drawing, Flavour::Editable);
+        assert!(xml.contains("mask=\"url(#nc-pencil-grain)\""));
+        assert_eq!(xml.matches("<pattern ").count(), 1);
+        assert_eq!(read(&xml).expect("editable pencil"), (drawing.clone(), 0));
+        assert!(write(&drawing, Flavour::Plain).contains("mask=\"url(#nc-pencil-grain)\""));
+    }
+
+    #[test]
+    fn an_editable_drawing_survives_an_outline_above_the_generic_svg_limit() {
+        use super::*;
+        let mut xml = format!("<svg xmlns:nc=\"{NS}\"><path nc:dabs=\"10,20,0.7\" d=\"");
+        xml.push_str(&"M0 0 ".repeat(MAX_BYTES / 5 + 1));
+        xml.push_str("\"/></svg>");
+        let (drawing, flat) = read(&xml).expect("large editable drawing");
+        assert_eq!(flat, 0);
+        assert_eq!(drawing.strokes[0].dabs[0], Dab::new(10.0, 20.0, 0.7));
+    }
     #[test]
     fn invalid_svg_dimensions_use_a_finite_fallback() {
         for invalid in ["inf", "NaN", "-10", "0"] {

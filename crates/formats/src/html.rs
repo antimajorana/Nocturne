@@ -52,6 +52,17 @@ pub fn meta(text: &str, name: &str) -> Option<String> {
     text.get(start..start + end).map(unescape)
 }
 
+/// Removes a metadata tag emitted by `set_meta` from the head.
+pub fn remove_meta(text: &str, name: &str) -> String {
+    let (head, _) = text.split_once("</head>").unwrap_or(("", text));
+    let marker = format!("<meta name=\"{name}\" content=\"");
+    let Some(start) = head.find(&marker) else { return text.to_string() };
+    let Some(end) = head[start + marker.len()..].find("\">") else { return text.to_string() };
+    let end = start + marker.len() + end + 2;
+    let rest = &text[end..];
+    format!("{}{}", &text[..start], rest.strip_prefix('\n').unwrap_or(rest))
+}
+
 /// The text of `<title>...</title>`.
 pub fn title(text: &str) -> Option<String> {
     between(text, "<title>", "</title>").map(|t| unescape(&t))

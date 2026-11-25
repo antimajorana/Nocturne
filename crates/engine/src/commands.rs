@@ -306,6 +306,29 @@ fn page_containers(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
     Ok(Output::Text(nocturne_model::container::write(&boxes)))
 }
 
+fn page_canvas_layout(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
+    let dir = s.resolve(req(p, "path")?)?;
+    let layout = if let Some(value) = p.get("layout") {
+        let layout =
+            page::CanvasLayout::parse(value).ok_or_else(|| EngineError::BadParam("layout must be infinite, portrait, or landscape".into()))?;
+        page::set_canvas_layout(&dir, layout)?;
+        layout
+    } else {
+        page::canvas_layout(&dir)?
+    };
+    Ok(Output::Text(layout.id().into()))
+}
+
+fn view_tablet_tools(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
+    let minimized = match req(p, "minimized")? {
+        "true" => true,
+        "false" => false,
+        _ => return Err(EngineError::BadParam("minimized must be true or false".into())),
+    };
+    s.settings.set("tablet_tools_minimized", if minimized { "true" } else { "false" })?;
+    Ok(Output::Json(serde_json::json!({ "minimized": minimized })))
+}
+
 fn page_paper(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
     let path = s.resolve(req(p, "path")?)?;
     let (paper, colour, rules) = (p.get("paper"), p.get("color"), p.get("rules"));
@@ -831,6 +854,13 @@ boxes (optional): x,y,width,blocks per container, separated by semicolons. The c
         run: page_containers,
     },
     CommandSpec {
+        id: "page.canvas_layout",
+        label: "Choose the canvas layout for a page",
+        params: "path (required): the page\nlayout (optional): infinite, portrait, or landscape. Omit to read the current layout",
+        changes_tree: false,
+        run: page_canvas_layout,
+    },
+    CommandSpec {
         id: "page.paper",
         label: "The paper a page is drawn on, the colour behind it and the colour of its lines",
         params: "path (required): the page
@@ -935,6 +965,13 @@ blocks (optional): the justified paragraphs' positions among the page's blocks, 
     },
     CommandSpec { id: "tree.refresh", label: "Reload the tree from disk", params: "", changes_tree: false, run: tree_refresh },
     CommandSpec {
+        id: "view.tablet_tools",
+        label: "Minimize or expand the Tablet Studio tools",
+        params: "minimized (required): true or false",
+        changes_tree: false,
+        run: view_tablet_tools,
+    },
+    CommandSpec {
         id: "ink.toggle_eraser",
         label: "Toggle eraser",
         params: "mode (optional): toggle, eraser, or pen; default: toggle",
@@ -958,13 +995,13 @@ blocks (optional): the justified paragraphs' positions among the page's blocks, 
     CommandSpec {
         id: "ink.eraser_width",
         label: "Set the eraser's size",
-        params: "width: s, m, l, xl, or points across from 2 to 80",
+        params: "width: xs, s, m, l, xl, xxl, xxxl, or points across from 2 to 80",
         changes_tree: false,
         run: ink_eraser_width,
     },
     CommandSpec {
         id: "ink.hold_to_straighten",
-        label: "Straighten a stroke when the pen is held still",
+        label: "Snap a hand-drawn line or square when the pen is held still",
         params: "enabled (optional): true, false, or toggle; default: toggle",
         changes_tree: false,
         run: ink_hold_to_straighten,
@@ -1118,6 +1155,24 @@ mod tests {
             Output::Path(p) => p,
             other => panic!("expected a path, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn canvas_layout_and_tablet_tool_commands_validate_and_persist() {
+        let temp = TempDir::new("canvas-layout-command");
+        let mut s = session(&temp);
+        s.run("notebook.create", &p(&[("name", "Work")])).expect("notebook");
+        let page = "work/new-section-1/untitled-page";
+        let get = || p(&[("path", page)]);
+        assert_eq!(text_of(s.run("page.canvas_layout", &get()).expect("default layout")), "infinite");
+        let set = p(&[("path", page), ("layout", "landscape")]);
+        assert_eq!(text_of(s.run("page.canvas_layout", &set).expect("set orientation")), "landscape");
+        assert!(s.run("page.canvas_layout", &p(&[("path", page), ("layout", "other")])).is_err());
+        assert_eq!(text_of(s.run("page.canvas_layout", &get()).expect("saved layout")), "landscape");
+        s.run("view.tablet_tools", &p(&[("minimized", "true")])).expect("minimize");
+        assert_eq!(s.settings.get("tablet_tools_minimized").as_deref(), Some("true"));
+        assert!(s.run("view.tablet_tools", &p(&[("minimized", "other")])).is_err());
+        assert_eq!(s.settings.get("tablet_tools_minimized").as_deref(), Some("true"));
     }
 
     #[test]

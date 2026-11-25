@@ -245,6 +245,11 @@ with a way back to the code view.
 
 ## 5. Ink
 
+The canvas can show an infinite sheet, portrait sheets, or landscape sheets. The page file
+stores the choice as `nocturne:canvas-layout` in HTML and `canvas-layout` in CMGFM.
+Omitting the layout selects the infinite canvas. Sheet breaks are drawn behind the page
+and switching layouts preserves existing ink and container positions.
+
 What a pen leaves on a page. This section is as complete as the code and the owner's decisions allow.
 It says what is built, what is decided but not built, and what is open.
 
@@ -274,8 +279,8 @@ It says what is built, what is decided but not built, and what is open.
   a layer over the whole sheet, and highlighter strokes are drawn under the words.
 - **Tools:** pen (opaque, the width follows the pressure), pencil (opaque, thin), highlighter
   (see-through and flat), an eraser, and selecting strokes to move, stretch or delete them.
-- **Saving:** the ink file is written after each change: a stroke finished, erased, moved or
-  deleted.
+- **Saving:** a finished change saves the ink. On iPad, ordinary stroke saves run in a
+  background writer, and switching pages or leaving the app flushes outstanding changes.
 - **The page names its ink** with one image line (shown below). It is added the first time the page
   is drawn on and taken out when the ink is gone. Nocturne does not draw that line as a picture; it draws the layer. The
   line is there so the page's words and what is on it agree, and so another program that opens the

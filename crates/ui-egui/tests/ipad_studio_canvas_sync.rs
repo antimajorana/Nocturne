@@ -3,6 +3,8 @@
 
 use egui::os::OperatingSystem;
 use egui::{Pos2, Rect, pos2, vec2};
+use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable as _;
 use nocturne_engine::{InkActiveMode, InkPenKind, Session};
 use nocturne_store::Settings;
 use nocturne_store::testing::TempDir;
@@ -13,6 +15,9 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+
+#[allow(dead_code)]
+mod support;
 
 fn step_frame(ctx: &egui::Context, app: &mut NocturneApp, mut raw: egui::RawInput) {
     if raw.screen_rect.is_none() {
@@ -39,6 +44,104 @@ fn make_ipad_app(name: &str) -> (TempDir, egui::Context, NocturneApp, std::path:
     let ctx = egui::Context::default();
     ctx.set_os(OperatingSystem::IOS);
     (tmp, ctx, app, page_dir)
+}
+
+fn harness(app: NocturneApp) -> Harness<'static, NocturneApp> {
+    let mut h = Harness::builder()
+        .with_size(vec2(1180.0, 820.0))
+        .with_accessibility_check(false)
+        .build_ui_state(|ui, app: &mut NocturneApp| app.show(ui), app);
+    h.ctx.set_os(OperatingSystem::IOS);
+    h.run();
+    h
+}
+
+fn pointer(h: &mut Harness<'_, NocturneApp>, at: Pos2, click: Option<bool>) {
+    h.input_mut().events.push(egui::Event::PointerMoved(at));
+    if let Some(pressed) = click {
+        h.input_mut().events.push(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.step();
+}
+
+fn click_label(h: &mut Harness<'_, NocturneApp>, label: &str) {
+    let at = h.get_by_label(label).rect().center();
+    pointer(h, at, Some(true));
+    pointer(h, at, Some(false));
+    h.run();
+}
+
+fn draw_ink(h: &mut Harness<'_, NocturneApp>) -> Pos2 {
+    h.state_mut().ribbon_act_for_test(ribbon::Act::InkPen(0));
+    h.run();
+    let origin = h.state().editor_origin().expect("editor origin");
+    pointer(h, origin + vec2(125.0, 150.0), Some(true));
+    pointer(h, origin + vec2(170.0, 150.0), None);
+    pointer(h, origin + vec2(210.0, 150.0), Some(false));
+    h.run();
+    origin
+}
+
+#[test]
+fn lasso_controls_recolour_copy_and_delete_editable_ink() {
+    use nocturne_ink::{Rgb, svg};
+    let board = support::clipboard::MemoryBoard::new();
+    let (_tmp, _, app, page) = make_ipad_app("tablet-lasso-actions");
+    let mut h = harness(app.with_clipboard(Box::new(board.clone())));
+    let origin = draw_ink(&mut h);
+    h.state_mut().ribbon_act_for_test(ribbon::Act::InkPointer(ribbon::Pointer::Lasso));
+    h.run();
+    let outline = [vec2(110.0, 125.0), vec2(230.0, 125.0), vec2(230.0, 180.0), vec2(110.0, 180.0), vec2(110.0, 125.0)];
+    pointer(&mut h, origin + outline[0], Some(true));
+    for point in &outline[1..] {
+        pointer(&mut h, origin + *point, None);
+    }
+    pointer(&mut h, origin + outline[0], Some(false));
+    h.run();
+    assert_eq!(h.state().held_ink_count(), 1);
+
+    click_label(&mut h, "Colour");
+    let blue = Rgb(0x18, 0x55, 0xc4);
+    click_label(&mut h, &blue.hex());
+    click_label(&mut h, "Copy");
+    let (copied, flat) = svg::read(&board.read_text()).expect("editable ink on the clipboard");
+    assert_eq!(flat, 0);
+    assert_eq!(copied.strokes[0].colour, blue);
+    click_label(&mut h, "Delete");
+    assert_eq!(h.state().ink_stroke_count(), 0);
+    assert!(!page.join("ink.svg").exists());
+    h.state_mut().ribbon_act_for_test(ribbon::Act::InkPaste);
+    h.run();
+    assert_eq!(nocturne_ui_egui::inkpad::Pad::of_page(&page).drawing.strokes[0].colour, blue);
+}
+
+#[test]
+fn tablet_paper_and_minimized_tools_preserve_the_open_drawing() {
+    use nocturne_store::page::{CanvasLayout, canvas_layout};
+    let (_temp, _, app, page) = make_ipad_app("tablet-paper-tools");
+    let mut h = harness(app);
+    draw_ink(&mut h);
+    let bounds = h.state().ink_bounds();
+    assert!(bounds.is_some());
+    for layout in CanvasLayout::ALL {
+        h.state_mut().ribbon_act_for_test(ribbon::Act::CanvasLayout(layout));
+        h.run();
+        assert_eq!(canvas_layout(&page).expect("saved layout"), layout);
+        assert_eq!(h.state().ink_bounds(), bounds);
+    }
+    let visible = |h: &Harness<'_, NocturneApp>, id| h.ctx.memory(|m| m.areas().visible_layer_ids().iter().any(|l| l.id == egui::Id::unique(id)));
+    h.state_mut().ribbon_act_for_test(ribbon::Act::ToggleTabletTools);
+    h.run();
+    assert!(!visible(&h, "studio-apple-pencil-pill"));
+    assert!(visible(&h, "studio-pencil-minimized"));
+    click_label(&mut h, "Tools");
+    assert!(visible(&h, "studio-apple-pencil-pill"));
+    assert_eq!(h.state().ink_bounds(), bounds);
 }
 
 #[test]

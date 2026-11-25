@@ -16,6 +16,7 @@
 use crate::theme::Tokens;
 use egui::{Sense, Ui, vec2};
 use nocturne_ink::{Dab, Drawing, PressureCurve, Rgb, Stroke, TimedDab, Tool, pick, shape, svg};
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 /// What the pen is set to do, as the Draw tab has it.
@@ -34,7 +35,7 @@ pub struct Pen {
     pub pixel_eraser: bool,
     /// How wide the eraser is, in points across. It is the eraser's own, not the pen's.
     pub eraser_width: f32,
-    /// A pen held still at the end of a nearly straight stroke makes the stroke straight.
+    /// Holding the pen still cleans up a nearly straight line or a hand-drawn square.
     pub hold_to_straighten: bool,
 }
 
@@ -69,6 +70,13 @@ struct Rest {
     at: (f32, f32),
     since: f64,
     drawn: usize,
+    checked: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HeldShape {
+    Line,
+    Square,
 }
 
 /// Whether what was drawn before the pen came to rest is near enough to a straight line to be
@@ -89,12 +97,19 @@ fn nearly_straight(drawn: &[Dab], zoom: f32) -> bool {
 
 /// Makes `stroke` the straight line from where it began to `to`, at the pressure the pen held
 /// for most of what it drew before it came to rest (the middle one of those readings).
-fn straighten(stroke: &mut Stroke, drawn: usize, to: (f32, f32)) {
-    let Some(first) = stroke.dabs.first().copied() else { return };
-    let mut pressures: Vec<f32> = stroke.dabs.iter().take(drawn.max(1)).map(|d| d.pressure).collect();
+fn straighten(stroke: &mut Stroke, drawn: usize, to: (f32, f32), zoom: f32) -> Option<HeldShape> {
+    let readings = stroke.dabs.get(..drawn)?;
+    let first = *readings.first()?;
+    let mut pressures: Vec<f32> = readings.iter().map(|d| d.pressure).collect();
     pressures.sort_by(f32::total_cmp);
     let pressure = pressures.get(pressures.len() / 2).copied().unwrap_or(1.0);
-    stroke.dabs = vec![Dab::new(first.x, first.y, pressure), Dab::new(to.0, to.1, pressure)];
+    if nearly_straight(readings, zoom) {
+        stroke.dabs = vec![Dab::new(first.x, first.y, pressure), Dab::new(to.0, to.1, pressure)].into();
+        Some(HeldShape::Line)
+    } else {
+        stroke.dabs = nocturne_ink::shapes::trace_square(readings, zoom, pressure)?.into();
+        Some(HeldShape::Square)
+    }
 }
 
 /// The file a page's ink lives in, inside the page's own folder.
@@ -136,7 +151,7 @@ pub const SHEET_W: f32 = 820.0;
 pub const SHEET_H: f32 = 1100.0;
 
 /// The ink of one page.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Pad {
     /// Where the file is, whether or not it has been written yet.
     pub file: PathBuf,
@@ -177,10 +192,11 @@ pub struct Pad {
     /// undo can go back to, newest last, with when that change was made. Whatever the change (a
     /// stroke drawn, rubbed out, deleted, moved or stretched), undo puts back what was there.
     kept: Vec<Stroke>,
-    undo_steps: Vec<(Vec<Stroke>, std::time::Instant)>,
+    undo_steps: Vec<(InkHistory, std::time::Instant)>,
     /// The strokes as they were before each undo, newest last, for redo to put back. A new
     /// change starts a new branch and empties it (issue #155).
-    redo_steps: Vec<Vec<Stroke>>,
+    redo_steps: Vec<InkHistory>,
+    append_from: Option<usize>,
     /// Changed since the last finished change was kept.
     touched: bool,
     /// A pen that writes while a palm holds the window's pointer came down on the page, and has
@@ -188,8 +204,98 @@ pub struct Pad {
     pen_on_page: bool,
     /// Where the pen has come to rest in the stroke being drawn, and since when.
     rest: Option<Rest>,
-    /// The stroke being drawn was made straight: its end follows the pen until it lifts.
-    straight: bool,
+    held_shape: Option<HeldShape>,
+    render: RefCell<InkRenderCache>,
+    saving: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+}
+
+/// Handwriting appends a small tail. Other gestures can change any position in
+/// the drawing and keep the full prior state.
+#[derive(Clone, Debug)]
+struct InkHistory {
+    from: usize,
+    strokes: Vec<Stroke>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct InkView {
+    origin: egui::Pos2,
+    zoom: f32,
+    pixels_per_point: f32,
+    dark: bool,
+}
+
+impl InkView {
+    fn stroke_shape(self, stroke: &Stroke) -> egui::Shape {
+        let colour = shown_colour(stroke.colour, self.dark);
+        stroke_shape(self.origin, stroke, colour, self.pixels_per_point, self.zoom)
+    }
+}
+
+const STROKES_PER_CHUNK: usize = 64;
+
+#[derive(Clone, Debug, Default)]
+struct InkRenderCache {
+    bounds: Vec<[f32; 4]>,
+    chunks: Vec<egui::Rect>,
+    content: Option<egui::Rect>,
+    view: Option<InkView>,
+    shapes: Vec<Option<egui::Shape>>,
+}
+
+fn ink_rect([x0, y0, x1, y1]: [f32; 4]) -> egui::Rect {
+    egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1))
+}
+
+impl InkRenderCache {
+    fn update(&mut self, strokes: &[Stroke]) {
+        if self.bounds.len() > strokes.len() {
+            *self = Self::default();
+        }
+        for (i, stroke) in strokes.iter().enumerate().skip(self.bounds.len()) {
+            let bounds = stroke.bounds().map_or([0.0; 4], |(x0, y0, x1, y1)| [x0, y0, x1, y1]);
+            let rect = ink_rect(bounds);
+            self.bounds.push(bounds);
+            if i % STROKES_PER_CHUNK == 0 {
+                self.chunks.push(rect);
+            } else if let Some(last) = self.chunks.last_mut() {
+                *last = last.union(rect);
+            }
+            if !stroke.is_empty() {
+                self.content = Some(self.content.map_or(rect, |content| content.union(rect)));
+            }
+        }
+    }
+
+    fn paint(&mut self, painter: &egui::Painter, strokes: &[Stroke], view: InkView) {
+        self.update(strokes);
+        if self.view != Some(view) {
+            self.view = Some(view);
+            self.shapes.clear();
+        }
+        self.shapes.resize(strokes.len(), None);
+        let clip = painter.clip_rect();
+        if !clip.is_positive() {
+            return;
+        }
+        let local_clip = crate::minimap::viewport_in_page(clip.expand(2.0), view.origin, view.zoom);
+        for (chunk, bounds) in self.chunks.iter().enumerate() {
+            if !bounds.intersects(local_clip) {
+                continue;
+            }
+            let start = chunk * STROKES_PER_CHUNK;
+            let end = (start + STROKES_PER_CHUNK).min(strokes.len());
+            for (i, stroke) in strokes.iter().enumerate().take(end).skip(start) {
+                if !ink_rect(self.bounds[i]).intersects(local_clip) {
+                    continue;
+                }
+                let cached = self.shapes[i].get_or_insert_with(|| {
+                    if view.zoom < 0.35 { stroke_shape_lod(view.origin, stroke, view.zoom, view.dark) } else { view.stroke_shape(stroke) }
+                });
+                painter.add(cached.clone());
+            }
+        }
+    }
 }
 
 /// How many changes to the ink undo can go back through.
@@ -248,16 +354,25 @@ impl Pad {
             kept: Vec::new(),
             undo_steps: Vec::new(),
             redo_steps: Vec::new(),
+            append_from: None,
             touched: false,
             pen_on_page: false,
             rest: None,
-            straight: false,
+            held_shape: None,
+            render: RefCell::default(),
+            saving: None,
         }
         .with_kept()
     }
 
     /// Writes the ink, with its readings, which is what the page keeps.
     pub fn save(&mut self) -> std::io::Result<()> {
+        if let Some(result) = self.finish_save(true)
+            && result.is_ok()
+            && !self.dirty
+        {
+            return Ok(());
+        }
         if let Some(parent) = self.file.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -268,19 +383,67 @@ impl Pad {
             self.kept_original = Some(kept);
         }
         self.incomplete = false;
-        // A page drawn on and then rubbed clean loses its file rather than keeping an
-        // empty one, so a page with no ink has no ink in its folder either.
-        if self.drawing.is_empty() {
-            match std::fs::remove_file(&self.file) {
+        Self::write_drawing(&self.file, &self.drawing)?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    fn write_drawing(file: &Path, drawing: &Drawing) -> std::io::Result<()> {
+        if drawing.is_empty() {
+            match std::fs::remove_file(file) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
         } else {
-            nocturne_store::page::write_atomic(&self.file, &svg::write(&self.drawing, svg::Flavour::Editable)).map_err(std::io::Error::other)?;
+            nocturne_store::page::write_atomic(file, &svg::write(drawing, svg::Flavour::Editable)).map_err(std::io::Error::other)?;
         }
-        self.dirty = false;
         Ok(())
+    }
+
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.dirty || self.saving.is_some()
+    }
+
+    pub fn save_pending(&self) -> bool {
+        self.saving.is_some()
+    }
+
+    /// There is at most one writer for this page. Changes made during a write
+    /// stay dirty and the next write picks up the most recent drawing.
+    pub fn save_in_background(&mut self, ctx: &egui::Context) -> Option<std::io::Result<()>> {
+        if self.saving.is_some() {
+            return None;
+        }
+        // First/last ink changes the page's references. Keep these two
+        // transitions and recovery of incomplete older files synchronous.
+        if self.incomplete || self.drawing.is_empty() || !self.file.is_file() {
+            return Some(self.save());
+        }
+        let file = self.file.clone();
+        let drawing = self.drawing.clone();
+        let ctx = ctx.clone();
+        match std::thread::Builder::new().name("nocturne-ink-save".into()).spawn(move || {
+            let result = Self::write_drawing(&file, &drawing);
+            ctx.request_repaint();
+            result
+        }) {
+            Ok(job) => {
+                self.saving = Some(job);
+                self.dirty = false;
+                None
+            }
+            Err(error) => Some(Err(error)),
+        }
+    }
+
+    pub fn finish_save(&mut self, wait: bool) -> Option<std::io::Result<()>> {
+        if !wait && !self.saving.as_ref().is_some_and(std::thread::JoinHandle::is_finished) {
+            return None;
+        }
+        let result = self.saving.take()?.join().unwrap_or_else(|_| Err(std::io::Error::other("ink writer stopped unexpectedly")));
+        self.dirty |= result.is_err();
+        Some(result)
     }
 
     /// Copies the ink file as it is to `ink.svg.bak`, or the first free `ink-N.svg.bak`, beside
@@ -357,8 +520,8 @@ impl Pad {
         self.let_go();
         self.settle();
         let Some((before, _)) = self.undo_steps.pop() else { return false };
-        self.redo_steps.push(std::mem::replace(&mut self.drawing.strokes, before));
-        self.kept = self.drawing.strokes.clone();
+        let after = self.apply_history(before);
+        self.redo_steps.push(after);
         self.dirty = true;
         true
     }
@@ -368,11 +531,21 @@ impl Pad {
         self.let_go();
         self.settle();
         let Some(after) = self.redo_steps.pop() else { return false };
-        let before = std::mem::replace(&mut self.drawing.strokes, after);
+        let before = self.apply_history(after);
         self.undo_steps.push((before, std::time::Instant::now()));
-        self.kept = self.drawing.strokes.clone();
         self.dirty = true;
         true
+    }
+
+    fn apply_history(&mut self, step: InkHistory) -> InkHistory {
+        // History represents a suffix of the drawing in the corresponding state.
+        let from = step.from.min(self.drawing.strokes.len());
+        let old = self.drawing.strokes.split_off(from);
+        self.drawing.strokes.extend(step.strokes);
+        self.invalidate_render();
+        self.kept.truncate(from);
+        self.kept.extend(self.drawing.strokes[from..].iter().cloned());
+        InkHistory { from, strokes: old }
     }
 
     /// Whether redo has anything to put back.
@@ -432,15 +605,29 @@ impl Pad {
             return;
         }
         self.touched = false;
-        if self.drawing.strokes == self.kept {
+        let before = if let Some(from) = self.append_from.take().filter(|&from| from == self.kept.len() && from < self.drawing.strokes.len()) {
+            self.kept.extend(self.drawing.strokes[from..].iter().cloned());
+            InkHistory { from, strokes: Vec::new() }
+        } else if self.drawing.strokes == self.kept {
             return;
-        }
-        let before = std::mem::replace(&mut self.kept, self.drawing.strokes.clone());
+        } else {
+            let strokes = std::mem::replace(&mut self.kept, self.drawing.strokes.clone());
+            InkHistory { from: 0, strokes }
+        };
         self.undo_steps.push((before, std::time::Instant::now()));
         self.redo_steps.clear();
         if self.undo_steps.len() > INK_UNDO_STEPS {
             self.undo_steps.remove(0);
         }
+    }
+
+    fn add_stroke(&mut self, stroke: Stroke) -> bool {
+        let from = self.drawing.strokes.len();
+        let added = self.drawing.add(stroke);
+        if added && !self.touched && self.append_from.is_none() {
+            self.append_from = Some(from);
+        }
+        added
     }
 
     /// When the change undo would take back was made, if there is one.
@@ -465,6 +652,7 @@ impl Pad {
             return;
         }
         pick::move_by(&mut self.drawing, &self.held, dx, dy);
+        self.invalidate_render();
         self.dirty = true;
         self.touched = true;
     }
@@ -477,7 +665,14 @@ impl Pad {
 
     /// The box round each stroke, in page points, in the drawing's order.
     pub fn stroke_bounds(&self) -> Vec<[f32; 4]> {
-        (0..self.drawing.strokes.len()).map(|i| pick::bounds(&self.drawing, &[i]).map_or([0.0; 4], |(x0, y0, x1, y1)| [x0, y0, x1, y1])).collect()
+        let mut cache = self.render.borrow_mut();
+        cache.update(&self.drawing.strokes);
+        cache.bounds.clone()
+    }
+
+    fn invalidate_render(&mut self) {
+        *self.render.get_mut() = InkRenderCache::default();
+        self.append_from = None;
     }
 
     /// Moves each stroke by its own amount, in page points, in the drawing's order (Collect All,
@@ -492,6 +687,9 @@ impl Pad {
         }
         self.dirty |= moved;
         self.touched |= moved;
+        if moved {
+            self.invalidate_render();
+        }
         moved
     }
     /// Insert Space (issue #164): every stroke whose top is at or below `y`, in page points,
@@ -506,6 +704,7 @@ impl Pad {
             return false;
         }
         pick::move_by(&mut self.drawing, &below, 0.0, dy);
+        self.invalidate_render();
         self.dirty = true;
         self.touched = true;
         true
@@ -513,14 +712,18 @@ impl Pad {
 
     /// The box round all the ink on the page, in page points.
     pub fn bounds(&self) -> Option<[f32; 4]> {
-        let all: Vec<usize> = (0..self.drawing.strokes.len()).collect();
-        pick::bounds(&self.drawing, &all).map(|(x0, y0, x1, y1)| [x0, y0, x1, y1])
+        let mut cache = self.render.borrow_mut();
+        cache.update(&self.drawing.strokes);
+        cache.content.map(|rect| [rect.min.x, rect.min.y, rect.max.x, rect.max.y])
     }
 
     /// Throws away the held ink and says whether any went.
     pub fn delete_held(&mut self) -> bool {
         let went = pick::remove(&mut self.drawing, &self.held) > 0;
         self.let_go();
+        if went {
+            self.invalidate_render();
+        }
         self.dirty |= went;
         self.touched |= went;
         went
@@ -533,6 +736,46 @@ impl Pad {
         indices.sort_unstable();
         indices.dedup();
         indices.into_iter().filter_map(|i| self.drawing.strokes.get(i).cloned()).collect()
+    }
+
+    pub fn recolour_held(&mut self, colour: Rgb) -> bool {
+        let mut changed = false;
+        for &i in &self.held {
+            if let Some(stroke) = self.drawing.strokes.get_mut(i)
+                && stroke.colour != colour
+            {
+                stroke.colour = colour;
+                changed = true;
+            }
+        }
+        self.dirty |= changed;
+        self.touched |= changed;
+        if changed {
+            self.render.get_mut().shapes.clear();
+            self.append_from = None;
+        }
+        changed
+    }
+
+    pub fn paste_strokes(&mut self, mut drawing: Drawing, at: (f32, f32)) -> bool {
+        let indices: Vec<_> = (0..drawing.strokes.len()).collect();
+        let Some((x0, y0, x1, y1)) = pick::bounds(&drawing, &indices) else { return false };
+        if self.drawing.strokes.len() + drawing.strokes.len() > nocturne_ink::MAX_STROKES {
+            return false;
+        }
+        pick::move_by(&mut drawing, &indices, at.0 - (x0 + x1) * 0.5, at.1 - (y0 + y1) * 0.5);
+        let start = self.drawing.strokes.len();
+        for stroke in drawing.strokes {
+            self.add_stroke(stroke);
+        }
+        let end = self.drawing.strokes.len();
+        if start == end {
+            return false;
+        }
+        self.held = (start..end).collect();
+        self.dirty = true;
+        self.touched = true;
+        true
     }
 
     /// The box round the held ink, `[x0, y0, x1, y1]` in page points, when any is held.
@@ -548,6 +791,7 @@ impl Pad {
         for idx in targets.into_iter().rev() {
             self.drawing.strokes.remove(idx);
         }
+        self.invalidate_render();
         self.let_go();
         self.dirty = true;
         self.touched = true;
@@ -574,14 +818,18 @@ impl Pad {
     pub(crate) fn save_removing_strokes_at(&mut self, targets: Vec<usize>) -> std::io::Result<()> {
         self.settle();
         let removed: Vec<_> = targets.into_iter().rev().map(|idx| (idx, self.drawing.strokes.remove(idx))).collect();
+        let was_dirty = self.has_unsaved_changes();
+        self.dirty = true;
         if let Err(e) = self.save() {
             for (idx, stroke) in removed.into_iter().rev() {
                 self.drawing.strokes.insert(idx, stroke);
             }
+            self.dirty = was_dirty;
             return Err(e);
         }
         self.let_go();
         self.touched = true;
+        self.invalidate_render();
         self.settle();
         Ok(())
     }
@@ -679,6 +927,7 @@ fn apply_grab_transform(pad: &mut Pad, was: (f32, f32, f32, f32), grab: Grab, dx
             pick::scale_about(&mut pad.drawing, &pad.held, ox, oy, fx, fy);
         }
     }
+    pad.invalidate_render();
 }
 
 /// Returns the page-space bounds and screen-space selection box around `held`, if any strokes exist.
@@ -881,7 +1130,7 @@ pub fn show_with_input_and_handles(
     if cancel_uncommitted {
         pad.drawing_now = None;
         pad.rest = None;
-        pad.straight = false;
+        pad.held_shape = None;
         pad.predict_history.clear();
         pad.shape_from = None;
         pad.eraser_last = None;
@@ -899,49 +1148,18 @@ pub fn show_with_input_and_handles(
     if pen_frame.is_none() {
         pad.pen_on_page = false;
     }
-    let live_predict =
-        allow_stroke && pen.pointer == Pointer::Draw && pen_frame.as_ref().map_or_else(|| ui.input(|i| i.pointer.primary_down()), |pen| pen.down);
     // Painting on the layer, not through the ui, so ink outside text remains visible. Cut off
     // where the view ends as well as the page: a scrolled page reaches above the view, and this
     // layer sits above the ribbon.
     let clip = body.intersect(ui.clip_rect());
     let painter = ui.ctx().layer_painter(ui.layer_id()).with_clip_rect(clip);
-    let cull_offscreen = zoom < 0.50 || pad.drawing.strokes.len() > 64;
-    for stroke in &pad.drawing.strokes {
-        if cull_offscreen {
-            let Some(screen_bounds) = stroke_screen_bounds(stroke, origin, zoom) else {
-                continue;
-            };
-            if !screen_bounds.intersects(clip) {
-                continue;
-            }
-        }
-        if zoom < 0.35 {
-            paint_stroke_lod(&painter, origin, stroke, zoom, dark_page);
-            continue;
-        }
-        let mut scaled = stroke.clone();
-        scaled.colour = shown_colour(scaled.colour, dark_page);
-        scaled.width *= zoom;
-        for dab in &mut scaled.dabs {
-            dab.x *= zoom;
-            dab.y *= zoom;
-        }
-        paint_stroke(&painter, origin, &scaled);
-    }
-    if let Some(stroke) = &pad.drawing_now {
-        let mut scaled = stroke.clone();
-        if live_predict {
-            let tail = nocturne_ink::predict_tail(&pad.predict_history, nocturne_ink::PredictionConfig::default());
-            scaled.dabs.extend(tail);
-        }
-        scaled.colour = shown_colour(scaled.colour, dark_page);
-        scaled.width *= zoom;
-        for dab in &mut scaled.dabs {
-            dab.x *= zoom;
-            dab.y *= zoom;
-        }
-        paint_stroke(&painter, origin, &scaled);
+    let pixels_per_point = ui.ctx().pixels_per_point();
+    let view = InkView { origin, zoom, pixels_per_point, dark: dark_page };
+    let before_input = pad.drawing.strokes.len();
+    pad.render.get_mut().paint(&painter, &pad.drawing.strokes, view);
+    let accepts_ink = allow_stroke && matches!(pen.pointer, Pointer::Draw | Pointer::Shape(_));
+    if !accepts_ink && let Some(stroke) = &pad.drawing_now {
+        painter.add(view.stroke_shape(stroke));
     }
 
     // A pen or a rubber in the hand means the ink is not being held any more.
@@ -986,7 +1204,7 @@ pub fn show_with_input_and_handles(
         // The tool was put down mid-stroke; keep what was drawn rather than losing it.
         let mut changed = false;
         if let Some(stroke) = pad.drawing_now.take() {
-            changed = pad.drawing.add(stroke);
+            changed = pad.add_stroke(stroke);
         }
         // Ink a selection box picked up can be moved, stretched and deleted in the ordinary
         // pointer too.
@@ -1015,7 +1233,7 @@ pub fn show_with_input_and_handles(
     if !allow_stroke {
         let mut changed = false;
         let had_stroke = if let Some(stroke) = pad.drawing_now.take() {
-            changed = pad.drawing.add(stroke);
+            changed = pad.add_stroke(stroke);
             changed
         } else {
             false
@@ -1118,6 +1336,9 @@ pub fn show_with_input_and_handles(
                         changed |= pad.drawing.erase_at(lx + dx * frac, ly + dy * frac, radius) > 0;
                     }
                 }
+                if changed {
+                    pad.invalidate_render();
+                }
                 pad.erased_since_press |= changed;
                 pad.eraser_last = Some((x, y));
             } else {
@@ -1132,7 +1353,7 @@ pub fn show_with_input_and_handles(
             if down && pad.drawing_now.is_none() {
                 pad.predict_history.clear();
                 pad.rest = None;
-                pad.straight = false;
+                pad.held_shape = None;
                 pad.drawing_now = Some(Stroke::with_curve(pen.tool, pen.colour, pen.width, pen.gain, pen.curve));
             }
             if let Some(stroke) = pad.drawing_now.as_mut() {
@@ -1143,7 +1364,7 @@ pub fn show_with_input_and_handles(
                 // frame the pen is lifted in still counts the movements made before it lifted.
                 // A stroke that was made straight takes no more readings: only its end moves.
                 let moves = match &pen_frame {
-                    _ if pad.straight => Vec::new(),
+                    _ if pad.held_shape.is_some() => Vec::new(),
                     Some(pen) => pen
                         .moves
                         .iter()
@@ -1179,7 +1400,7 @@ pub fn show_with_input_and_handles(
                     }
                 }
                 // A pen put down and held still moves nowhere: where it rests is the point.
-                if let Some((x, y)) = at.filter(|_| down && moves.is_empty() && !pad.straight) {
+                if let Some((x, y)) = at.filter(|_| down && moves.is_empty() && pad.held_shape.is_none()) {
                     let dab = Dab::new(x, y, pressure);
                     stroke.add(dab);
                     let t_secs = pad.predict_history.last().map_or(now_secs, |prev| now_secs.max(prev.time_secs + 1.1e-4));
@@ -1189,13 +1410,11 @@ pub fn show_with_input_and_handles(
                         pad.predict_history.drain(..drop);
                     }
                 }
-                // Hold to straighten. A pen that rests for two seconds at the end of a nearly
-                // straight stroke makes it the straight line between its ends, and that line's
-                // end then follows the pen until it lifts. No guess is drawn ahead of a
-                // straight stroke.
-                if pad.straight {
-                    if let (Some((x, y)), Some(first)) = (at.filter(|_| down), stroke.dabs.first().copied()) {
-                        stroke.dabs = vec![first, Dab::new(x, y, first.pressure)];
+                if let Some(shape) = pad.held_shape {
+                    if matches!(shape, HeldShape::Line)
+                        && let (Some((x, y)), [first, last]) = (at.filter(|_| down), stroke.dabs.as_mut_slice())
+                    {
+                        *last = Dab::new(x, y, first.pressure);
                     }
                     pad.predict_history.clear();
                 } else if pen.hold_to_straighten
@@ -1203,16 +1422,15 @@ pub fn show_with_input_and_handles(
                     && let Some((x, y)) = at
                 {
                     match pad.rest.filter(|rest| (rest.at.0 - x).hypot(rest.at.1 - y) * zoom <= HOLD_DRIFT) {
-                        Some(rest) if now_secs - rest.since >= HOLD_TO_STRAIGHTEN_SECS => {
-                            let drawn = rest.drawn.clamp(2, stroke.dabs.len().max(2));
-                            if nearly_straight(stroke.dabs.get(..drawn.min(stroke.dabs.len())).unwrap_or_default(), zoom) {
-                                straighten(stroke, drawn, (x, y));
-                                pad.straight = true;
+                        Some(rest) if !rest.checked && now_secs - rest.since >= HOLD_TO_STRAIGHTEN_SECS => {
+                            pad.rest = Some(Rest { checked: true, ..rest });
+                            pad.held_shape = straighten(stroke, rest.drawn.min(stroke.dabs.len()), (x, y), zoom);
+                            if pad.held_shape.is_some() {
                                 pad.predict_history.clear();
                             }
                         }
                         Some(_) => {}
-                        None => pad.rest = Some(Rest { at: (x, y), since: now_secs, drawn: stroke.dabs.len() }),
+                        None => pad.rest = Some(Rest { at: (x, y), since: now_secs, drawn: stroke.dabs.len(), checked: false }),
                     }
                 }
                 // The stroke is painted as it grows, so the line follows the pen rather than
@@ -1222,9 +1440,9 @@ pub fn show_with_input_and_handles(
             if !down {
                 pad.predict_history.clear();
                 pad.rest = None;
-                pad.straight = false;
+                pad.held_shape = None;
                 if let Some(stroke) = pad.drawing_now.take() {
-                    changed = pad.drawing.add(stroke);
+                    changed = pad.add_stroke(stroke);
                 }
             }
         }
@@ -1245,7 +1463,7 @@ pub fn show_with_input_and_handles(
             } else {
                 pad.shape_from = None;
                 if let Some(stroke) = pad.drawing_now.take() {
-                    changed = pad.drawing.add(stroke);
+                    changed = pad.add_stroke(stroke);
                 }
             }
         }
@@ -1323,6 +1541,27 @@ pub fn show_with_input_and_handles(
             changed |= pad.delete_held();
         }
     }
+    // Use this frame's pen samples. Painting the old trail before processing input
+    // would make the visible ink an entire display frame behind the pencil.
+    if accepts_ink {
+        if let Some(stroke) = &pad.drawing_now {
+            let predicted = if down && pen.pointer == Pointer::Draw {
+                nocturne_ink::predict_tail(&pad.predict_history, nocturne_ink::PredictionConfig::default())
+            } else {
+                Vec::new()
+            };
+            let shape = if predicted.is_empty() {
+                view.stroke_shape(stroke)
+            } else {
+                let mut stroke = stroke.clone();
+                stroke.dabs.extend(predicted);
+                view.stroke_shape(&stroke)
+            };
+            painter.add(shape);
+        } else if let Some(stroke) = pad.drawing.strokes.get(before_input) {
+            painter.add(view.stroke_shape(stroke));
+        }
+    }
     ui.ctx().set_cursor_icon(match pen.pointer {
         Pointer::Erase => egui::CursorIcon::NotAllowed,
         Pointer::Lasso => lasso_cursor(pad, origin, zoom, handle_reach, here),
@@ -1369,33 +1608,14 @@ fn grab_corner(box_: egui::Rect, at: egui::Pos2, reach: f32) -> Option<Grab> {
         .map(|(_, grab)| grab)
 }
 
-fn stroke_screen_bounds(stroke: &Stroke, origin: egui::Pos2, zoom: f32) -> Option<egui::Rect> {
-    let first = stroke.dabs.first()?;
-    let mut min_x = first.x;
-    let mut max_x = first.x;
-    let mut min_y = first.y;
-    let mut max_y = first.y;
-    for d in stroke.dabs.iter().skip(1) {
-        min_x = min_x.min(d.x);
-        max_x = max_x.max(d.x);
-        min_y = min_y.min(d.y);
-        max_y = max_y.max(d.y);
-    }
-    let pad = (stroke.width * 2.0).max(2.0);
-    Some(egui::Rect::from_min_max(
-        origin + vec2((min_x - pad) * zoom, (min_y - pad) * zoom),
-        origin + vec2((max_x + pad) * zoom, (max_y + pad) * zoom),
-    ))
-}
-
-fn paint_stroke_lod(painter: &egui::Painter, origin: egui::Pos2, stroke: &Stroke, zoom: f32, dark_page: bool) {
+fn stroke_shape_lod(origin: egui::Pos2, stroke: &Stroke, zoom: f32, dark_page: bool) -> egui::Shape {
     let shown = shown_colour(stroke.colour, dark_page);
-    let colour = egui::Color32::from_rgb(shown.0, shown.1, shown.2).gamma_multiply(stroke.tool.opacity());
+    let opacity = if stroke.tool == Tool::Pencil { 0.66 } else { stroke.tool.opacity() };
+    let colour = egui::Color32::from_rgb(shown.0, shown.1, shown.2).gamma_multiply(opacity);
     let width = (stroke.width * zoom).max(0.8);
     if stroke.dabs.len() == 1 {
         let d = &stroke.dabs[0];
-        painter.circle_filled(origin + vec2(d.x * zoom, d.y * zoom), width * 0.5, colour);
-        return;
+        return egui::Shape::circle_filled(origin + vec2(d.x * zoom, d.y * zoom), width * 0.5, colour);
     }
     let mut pts = Vec::with_capacity(stroke.dabs.len().min(64));
     for (idx, d) in stroke.dabs.iter().enumerate() {
@@ -1405,9 +1625,7 @@ fn paint_stroke_lod(painter: &egui::Painter, origin: egui::Pos2, stroke: &Stroke
             pts.push(p);
         }
     }
-    if pts.len() >= 2 {
-        painter.add(egui::Shape::line(pts, egui::Stroke::new(width, colour)));
-    }
+    if pts.len() >= 2 { egui::Shape::line(pts, egui::Stroke::new(width, colour)) } else { egui::Shape::Noop }
 }
 
 /// One stroke, as triangles between the two edges of its ribbon, with a round cap at each
@@ -1495,47 +1713,78 @@ pub fn shown_colour(colour: Rgb, dark_page: bool) -> Rgb {
 }
 
 pub fn paint_stroke(painter: &egui::Painter, origin: egui::Pos2, stroke: &Stroke) {
-    let colour = egui::Color32::from_rgb(stroke.colour.0, stroke.colour.1, stroke.colour.2).gamma_multiply(stroke.tool.opacity());
-    let put = |x: f32, y: f32| egui::pos2(origin.x + x, origin.y + y);
+    painter.add(stroke_shape(origin, stroke, stroke.colour, painter.ctx().pixels_per_point(), 1.0));
+}
+
+fn stroke_shape(origin: egui::Pos2, stroke: &Stroke, Rgb(r, g, b): Rgb, pixels_per_point: f32, zoom: f32) -> egui::Shape {
+    let colour = egui::Color32::from_rgb(r, g, b).gamma_multiply(stroke.tool.opacity());
+    let put = |x: f32, y: f32| egui::pos2(origin.x + x * zoom, origin.y + y * zoom);
     let (left, right) = shape::sides(stroke);
     if left.len() < 2 {
         // A dot: one reading, so there is no ribbon, only a blob.
-        if let Some(d) = stroke.dabs.first() {
-            painter.circle_filled(put(d.x, d.y), shape::width_at(stroke, d.pressure) / 2.0, colour);
-        }
-        return;
+        return stroke.dabs.first().map_or(egui::Shape::Noop, |d| {
+            let ink = if stroke.tool == Tool::Pencil { colour.gamma_multiply(0.66) } else { colour };
+            egui::Shape::circle_filled(put(d.x, d.y), shape::width_at(stroke, d.pressure) * zoom / 2.0, ink)
+        });
     }
     // egui smooths the edges of the shapes it builds itself, but not of a mesh: a ribbon of bare
     // triangles has hard, stair-stepped edges. So each edge gets a fringe one screen pixel wide
     // that fades from the ink to nothing, the way egui feathers its own lines: the ink edge sits
     // half a pixel inside the outline and the faded edge half a pixel outside.
-    let feather = 1.0 / painter.ctx().pixels_per_point();
+    let edge_softness = match stroke.tool {
+        Tool::Pen | Tool::Highlighter => 1.0,
+        Tool::Pencil => 1.55,
+        Tool::FountainPen => 0.9,
+        Tool::BrushPen => 1.25,
+    };
+    let feather = edge_softness / pixels_per_point;
     let clear = egui::Color32::TRANSPARENT;
     let mut mesh = egui::Mesh::default();
     let mut across = egui::vec2(0.0, 1.0);
+    let graphite = stroke.tool == Tool::Pencil;
+    let brush = stroke.tool == Tool::BrushPen;
+    let lanes = if graphite || brush { 5 } else { 4 };
+    let texture = |p: egui::Pos2, base: f32, variation: f32| {
+        let local = (p - origin) / zoom;
+        colour.gamma_multiply(base + variation * shape::paper_grain(local.x, local.y))
+    };
     for (l, r) in left.iter().zip(&right) {
         let (l, r) = (put(l.0, l.1), put(r.0, r.1));
         // From the right edge to the left; a point of no width keeps the last direction.
         if let Some(d) = Some(l - r).filter(|d| d.length() > 1e-4) {
             across = d.normalized();
         }
-        let half = across * (feather / 2.0);
+        let half = across * (feather / 2.0).min((l - r).length() * 0.45);
+        let left_inside = l - half;
+        let right_inside = r + half;
         mesh.colored_vertex(l + half, clear);
-        mesh.colored_vertex(l - half, colour);
-        mesh.colored_vertex(r + half, colour);
+        if graphite {
+            mesh.colored_vertex(left_inside, texture(left_inside, 0.30, 0.48));
+            let middle = l.lerp(r, 0.5);
+            mesh.colored_vertex(middle, texture(middle, 0.54, 0.38));
+            mesh.colored_vertex(right_inside, texture(right_inside, 0.30, 0.48));
+        } else if brush {
+            mesh.colored_vertex(left_inside, texture(left_inside, 0.82, 0.18));
+            mesh.colored_vertex(l.lerp(r, 0.5), colour);
+            mesh.colored_vertex(right_inside, texture(right_inside, 0.82, 0.18));
+        } else {
+            mesh.colored_vertex(left_inside, colour);
+            mesh.colored_vertex(right_inside, colour);
+        }
         mesh.colored_vertex(r - half, clear);
     }
     #[allow(clippy::cast_possible_truncation)]
     for i in 0..(left.len() as u32 - 1) {
-        let (a, b) = (i * 4, i * 4 + 4);
+        let (a, b) = (i * lanes, (i + 1) * lanes);
         // Left fringe, the ink between the edges, right fringe.
-        for k in 0..3 {
+        for k in 0..lanes - 1 {
             mesh.add_triangle(a + k, a + k + 1, b + k);
             mesh.add_triangle(a + k + 1, b + k, b + k + 1);
         }
     }
     // Only the outward halves belong to the caps. Full circles would paint translucent
     // ink twice over the ribbon's ends, leaving darker patches within one highlighter stroke.
+    let colour = if graphite { colour.gamma_multiply(0.66) } else { colour };
     let line = shape::centre(stroke);
     if let [first, next, ..] = line.as_slice() {
         round_cap(
@@ -1543,7 +1792,7 @@ pub fn paint_stroke(painter: &egui::Painter, origin: egui::Pos2, stroke: &Stroke
             put(first.x, first.y),
             vec2(first.x - next.x, first.y - next.y),
             vec2(-1.0, 0.0),
-            shape::width_at(stroke, first.pressure) / 2.0,
+            shape::width_at(stroke, first.pressure) * zoom / 2.0,
             feather,
             colour,
         );
@@ -1554,12 +1803,12 @@ pub fn paint_stroke(painter: &egui::Painter, origin: egui::Pos2, stroke: &Stroke
             put(last.x, last.y),
             vec2(last.x - before.x, last.y - before.y),
             vec2(1.0, 0.0),
-            shape::width_at(stroke, last.pressure) / 2.0,
+            shape::width_at(stroke, last.pressure) * zoom / 2.0,
             feather,
             colour,
         );
     }
-    painter.add(egui::Shape::mesh(mesh));
+    egui::Shape::mesh(mesh)
 }
 
 /// A non-overlapping half disc, with the same physical-pixel fringe as the ribbon.
@@ -1623,6 +1872,136 @@ fn frame_moves(ui: &Ui, body: egui::Rect, origin: egui::Pos2, zoom: f32, pressur
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_drawing_reuses_old_bounds_and_journals_only_the_new_stroke() {
+        let temp = nocturne_store::testing::TempDir::new("ink-large-drawing");
+        let mut pad = Pad::of_page(temp.path());
+        for index in 0..2_048 {
+            let y = f32::from(index as u16) * 24.0;
+            let mut stroke = Stroke::new(Tool::Pen, Rgb::BLACK, 3.0);
+            stroke.add(Dab::new(40.0, y, 0.5));
+            stroke.add(Dab::new(60.0, y + 4.0, 0.7));
+            assert!(pad.add_stroke(stroke));
+            pad.touched = true;
+            pad.settle();
+        }
+        let bounds_before = pad.bounds().expect("ink bounds");
+        assert_eq!(pad.render.borrow().chunks.len(), 2_048 / STROKES_PER_CHUNK);
+        assert!(pad.undo_steps.iter().all(|(change, _)| change.from > 0 && change.strokes.is_empty()));
+        assert!(pad.add_stroke(stroke(-300.0)));
+        pad.touched = true;
+        pad.settle();
+        assert!(pad.bounds().expect("expanded ink bounds")[0] < bounds_before[0]);
+        assert!(pad.undo());
+        assert_eq!(pad.bounds(), Some(bounds_before));
+        assert!(pad.redo());
+        assert_eq!(pad.strokes(), 2_049);
+    }
+
+    #[test]
+    fn stationary_view_reuses_visible_meshes_without_building_offscreen_ink() {
+        let mut distant = stroke(30.0);
+        for dab in &mut distant.dabs {
+            dab.y += 4_000.0;
+        }
+        let mut strokes = vec![stroke(20.0), distant];
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(300.0, 200.0));
+        let view = InkView { origin: egui::Pos2::ZERO, zoom: 1.0, pixels_per_point: 1.0, dark: false };
+        let paint = |cache: &mut InkRenderCache, strokes: &[Stroke]| {
+            let input = egui::RawInput { screen_rect: Some(rect), ..Default::default() };
+            let mut output = ctx.run_ui(input, |ui| cache.paint(&ui.painter_at(rect), strokes, view));
+            output.textures_delta.clear();
+        };
+        let mut cache = InkRenderCache::default();
+        paint(&mut cache, &strokes);
+        let Some(egui::Shape::Mesh(first)) = cache.shapes[0].clone() else { panic!("visible ink mesh") };
+        assert!(cache.shapes[1].is_none());
+        strokes.push(stroke(100.0));
+        paint(&mut cache, &strokes);
+        let Some(egui::Shape::Mesh(retained)) = cache.shapes[0].as_ref() else { panic!("retained ink mesh") };
+        assert!(std::sync::Arc::ptr_eq(&first, retained));
+        assert!(cache.shapes[1].is_none());
+        assert!(cache.shapes[2].is_some());
+    }
+
+    #[test]
+    fn background_save_flushes_newer_strokes_and_never_recreates_deleted_ink() {
+        let temp = nocturne_store::testing::TempDir::new("ink-background-save");
+        let mut pad = Pad::of_page(temp.path());
+        assert!(pad.add_stroke(stroke(10.0)));
+        pad.save().expect("first ink");
+        assert!(pad.add_stroke(stroke(50.0)));
+        pad.dirty = true;
+        let ctx = egui::Context::default();
+        assert!(pad.save_in_background(&ctx).is_none());
+        assert!(pad.has_unsaved_changes());
+        assert!(pad.add_stroke(stroke(90.0)));
+        pad.dirty = true;
+        assert!(pad.save_in_background(&ctx).is_none());
+        pad.save().expect("flush both revisions");
+        assert_eq!(Pad::of_page(temp.path()).strokes(), 3);
+        assert!(pad.add_stroke(stroke(180.0)));
+        pad.dirty = true;
+        assert!(pad.save_in_background(&ctx).is_none());
+        pad.hold_touching((0.0, 0.0, 300.0, 180.0));
+        assert!(pad.delete_held());
+        pad.save().expect("delete after pending save");
+        assert!(!pad.file.exists());
+        assert!(!pad.has_unsaved_changes());
+    }
+
+    #[test]
+    fn selection_recolour_copy_paste_and_delete_preserve_ink_history() {
+        let temp = nocturne_store::testing::TempDir::new("ink-selection-actions");
+        let mut pad = Pad::of_page(temp.path());
+        for x in [10.0, 100.0] {
+            assert!(pad.add_stroke(stroke(x)));
+        }
+        pad.touched = true;
+        pad.settle();
+        pad.hold_touching((0.0, 0.0, 70.0, 80.0));
+        let colour = Rgb(30, 55, 210);
+        assert!(pad.recolour_held(colour));
+        pad.settle();
+        let selected = pad.held_strokes();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].colour, colour);
+        assert_ne!(pad.drawing.strokes[1].colour, colour);
+        let mut copied = Drawing::new(1.0, 1.0);
+        copied.add(selected[0].clone());
+        let (copied, flat) = svg::read(&svg::write(&copied, svg::Flavour::Editable)).expect("editable clipboard ink");
+        assert_eq!(flat, 0);
+        assert!(pad.paste_strokes(copied, (220.0, 140.0)));
+        pad.settle();
+        assert_eq!(pad.held_strokes()[0].colour, colour);
+        assert!(pad.delete_held());
+        pad.settle();
+        assert_eq!(pad.strokes(), 2);
+        assert!(pad.undo());
+        assert_eq!(pad.strokes(), 3);
+        assert!(pad.undo());
+        assert_eq!(pad.strokes(), 2);
+        assert!(pad.undo());
+        assert_ne!(pad.drawing.strokes[0].colour, colour);
+    }
+
+    #[test]
+    fn graphite_has_deterministic_grain_on_the_ribbon_but_pen_stays_solid() {
+        let mut graphite = Stroke::new(Tool::Pencil, Rgb::BLACK, 6.0);
+        for i in 0_u16..20 {
+            graphite.add(Dab::new(f32::from(i) * 3.0, 30.0, 0.8));
+        }
+        let render = |stroke: &Stroke| stroke_shape(egui::Pos2::ZERO, stroke, stroke.colour, 2.0, 1.0);
+        let egui::Shape::Mesh(textured) = render(&graphite) else { panic!("expected pencil mesh") };
+        assert_eq!(egui::Shape::Mesh(textured.clone()), render(&graphite));
+        let centre: std::collections::BTreeSet<_> = textured.vertices.iter().filter(|v| v.pos.y == 30.0).map(|v| v.color.a()).collect();
+        assert!(centre.len() > 8);
+        graphite.tool = Tool::Pen;
+        let egui::Shape::Mesh(pen) = render(&graphite) else { panic!("expected pen mesh") };
+        assert!(pen.vertices.iter().all(|v| v.color.a() == 0 || v.color.a() == 255));
+    }
     use nocturne_store::testing::TempDir;
 
     fn stroke(x: f32) -> Stroke {
@@ -1639,7 +2018,11 @@ mod tests {
     fn ink_stays_inside_the_part_of_the_page_on_screen() {
         let t = TempDir::new("ink-clipped-to-view");
         let mut pad = Pad::of_page(t.path());
+        let mut crossing = stroke(180.0);
+        crossing.dabs[0].y = 285.0;
+        crossing.dabs[1].y = 325.0;
         pad.drawing.add(stroke(100.0));
+        pad.drawing.add(crossing);
         let ctx = egui::Context::default();
         let pen = Pen { pointer: crate::ribbon::Pointer::Draw, ..Pen::default() };
         let tokens = crate::theme::Tokens::for_theme(crate::theme::Theme { mode: crate::theme::Mode::Light, accent: crate::theme::Accent::Default });
@@ -1652,7 +2035,7 @@ mod tests {
             show(ui, body, body, body.min, &mut pad, pen, 1.0, &tokens, 1.0);
         });
         out.textures_delta.clear();
-        assert!(!out.shapes.is_empty(), "the stroke is painted");
+        assert_eq!(out.shapes.len(), 1, "only the stroke crossing the visible edge is painted");
         for shape in &out.shapes {
             assert!(view.contains_rect(shape.clip_rect), "ink clipped to {:?}, beyond the view {view:?}", shape.clip_rect);
         }

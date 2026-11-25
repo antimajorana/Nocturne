@@ -8,10 +8,10 @@ behavior; it is not a claim that every part is implemented yet.
 The thickness chooser should behave more like a musical scale than a linear ruler. A linear
 `1 -> 50 px` mapping gives too little useful control among thin writing sizes and makes the
 largest sizes dominate the control. Use geometric/logarithmic spacing for the selectable
-thicknesses, for example:
+thicknesses. The current nib sizes in points are:
 
 ```text
-1, 1.4, 2, 3, 4.5, 6.5, 9, 13, 19, 28, 40, 60 px
+0.4, 0.7, 1, 1.4, 2, 2.8, 3.5, 4.5, 6, 9, 14, 20, 32, 50, 80
 ```
 
 The exact values may change after visual testing, but the important rule is multiplicative
@@ -55,7 +55,7 @@ Ink should not use a generic Gaussian blur. The renderer should provide:
 
 - crisp, antialiased coverage for ordinary thin pen strokes;
 - a subtle translucent fringe, roughly 1-2 physical pixels, for broad pen and brush strokes;
-- a softer, more textured edge for pencil;
+- page-space graphite grain and a softer edge for pencil;
 - mostly crisp pressure-shaped edges for fountain pen;
 - a broad translucent edge for highlighter.
 

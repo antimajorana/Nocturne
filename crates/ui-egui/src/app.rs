@@ -503,6 +503,7 @@ struct Editor {
     colour: Option<nocturne_model::NodeColor>,
     /// The colour of this page's rule and grid lines, when it was given one (issue #288).
     rule_colour: Option<nocturne_model::NodeColor>,
+    canvas_layout: nocturne_store::page::CanvasLayout,
     /// What the page looked like before each change, so a change can be taken back.
     history: crate::history::History,
     /// The ink files in the page's folder. The folder is what decides: the page's own
@@ -1140,6 +1141,7 @@ pub struct NocturneApp {
     minimap_override: Option<bool>,
     /// Whether the infinite-canvas minimap body is folded to its compact header chip.
     minimap_collapsed: bool,
+    tablet_tools_minimized: bool,
     /// Whether lifting the eraser after rubbing out ink returns to the last writing pen.
     eraser_auto_return: bool,
     /// Cached presence of a saved kDrive token so Studio top bar avoids per-frame Keychain/disk reads.
@@ -1330,6 +1332,7 @@ impl NocturneApp {
             }
         });
         let minimap_collapsed = session.settings.get("minimap_collapsed").map(|v| !v.trim().eq_ignore_ascii_case("false")).unwrap_or(true);
+        let tablet_tools_minimized = session.settings.get("tablet_tools_minimized").as_deref() == Some("true");
         let eraser_auto_return = session.settings.get("eraser_auto_return").is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
         let library_grid = crate::library_grid::LibraryGrid::load(&session.settings);
         let mut app = NocturneApp {
@@ -1409,6 +1412,7 @@ impl NocturneApp {
             last_tablet_studio,
             minimap_override,
             minimap_collapsed,
+            tablet_tools_minimized,
             eraser_auto_return,
             sync_has_token: None,
             soft_keyboard_visible: false,
@@ -2780,6 +2784,7 @@ impl NocturneApp {
     /// Whether the page being edited has unsaved changes.
     pub fn is_dirty(&self) -> bool {
         self.editor.as_ref().is_some_and(|e| e.dirty_since.is_some() || e.saving.is_some())
+            || self.pad.as_ref().is_some_and(crate::inkpad::Pad::has_unsaved_changes)
     }
 
     /// Where the page's words were drawn last frame. Its ink is measured from the top
@@ -3164,6 +3169,7 @@ impl NocturneApp {
                 paper: appearance.0,
                 colour: appearance.1,
                 rule_colour: nocturne_store::page::rule_colour(dir).ok().flatten().and_then(|c| nocturne_model::NodeColor::parse(&c)),
+                canvas_layout: nocturne_store::page::canvas_layout(dir).unwrap_or_default(),
                 history: crate::history::History::new(crate::history::Step::new(first.0, first.1, first.2, None, crate::history::Kind::Edit)),
                 origin: egui::Pos2::ZERO,
                 origin_in_canvas: None,
@@ -3271,6 +3277,10 @@ impl NocturneApp {
     /// written: what comes next (another page, closing, a command) may read the file.
     fn save_now(&mut self) {
         self.take_saves(true);
+        if let Some(pad) = self.pad.as_mut().filter(|pad| pad.has_unsaved_changes()) {
+            let result = pad.save();
+            self.ink_save_completed(result, true);
+        }
         let Some(ed) = self.editor.as_mut() else { return };
         if ed.dirty_since.is_none() {
             return;
@@ -4103,6 +4113,8 @@ impl NocturneApp {
             eraser_pixel: self.session.ink_options().eraser_kind == nocturne_engine::EraserKind::Pixel,
             eraser_width: self.session.ink_options().eraser_width,
             show_minimap: self.minimap_visible(ctx),
+            tablet_tools_minimized: self.tablet_tools_minimized,
+            canvas_layout: self.editor.as_ref().map(|ed| ed.canvas_layout).unwrap_or_default(),
             table_borders: self.caret_table_has_borders(),
             table_align: self.caret_cells_align(),
             table_shade: self.caret_cells_shade(),
@@ -4304,7 +4316,7 @@ impl NocturneApp {
                     self.start_background_sync(ctx);
                 } else if self.sync_dirty_since_last {
                     let page_clean = !self.saver.busy() && self.editor.as_ref().is_none_or(|e| e.dirty_since.is_none());
-                    let ink_clean = self.pad.as_ref().is_none_or(|p| !p.dirty);
+                    let ink_clean = self.pad.as_ref().is_none_or(|p| !p.has_unsaved_changes());
                     let edit_quiet = self.last_local_edit_at.map_or(std::time::Duration::from_secs(60), |t| t.elapsed());
                     if page_clean && ink_clean && edit_quiet >= std::time::Duration::from_secs(25) && since_last >= std::time::Duration::from_secs(60)
                     {
@@ -5146,6 +5158,8 @@ impl NocturneApp {
             eraser_pixel: self.session.ink_options().eraser_kind == nocturne_engine::EraserKind::Pixel,
             eraser_width: self.session.ink_options().eraser_width,
             show_minimap: self.minimap_visible(ui.ctx()),
+            tablet_tools_minimized: self.tablet_tools_minimized,
+            canvas_layout: self.editor.as_ref().map(|ed| ed.canvas_layout).unwrap_or_default(),
             table_borders: self.caret_table_has_borders(),
             table_align: self.caret_cells_align(),
             table_shade: self.caret_cells_shade(),
@@ -5586,8 +5600,8 @@ impl NocturneApp {
             ribbon::Act::PageWidth => self.fit_page_width = true,
             ribbon::Act::FitAllContent => {
                 if let Some(ed) = self.editor.as_ref() {
-                    let stroke_bounds = self.pad.as_ref().map(crate::inkpad::Pad::stroke_bounds).unwrap_or_default();
-                    let bounds_page = crate::minimap::content_bounds_page(&ed.last_frames, &stroke_bounds);
+                    let ink = self.pad.as_ref().and_then(crate::inkpad::Pad::bounds);
+                    let bounds_page = crate::minimap::content_bounds_page(&ed.last_frames, ink.as_slice());
                     let view_size = self.page_view_rect.or(self.page_rect).map_or(vec2(820.0, 620.0), |r| r.size());
                     let target_zoom = crate::minimap::compute_fit_zoom_percent(bounds_page, view_size);
                     self.set_zoom_percent(target_zoom);
@@ -5601,6 +5615,25 @@ impl NocturneApp {
                 let next = !self.minimap_visible_now();
                 self.minimap_override = Some(next);
                 let _ = self.session.settings.set("show_minimap", if next { "true" } else { "false" });
+            }
+            ribbon::Act::ToggleTabletTools => {
+                let next = !self.tablet_tools_minimized;
+                if self.run("view.tablet_tools", &params(&[("minimized", if next { "true" } else { "false" })])).is_some() {
+                    self.tablet_tools_minimized = next;
+                    self.tool_settings_open = false;
+                }
+            }
+            ribbon::Act::CanvasLayout(layout) => {
+                if let Some(path) = self.editor.as_ref().map(|ed| path_str(&ed.dir)) {
+                    self.save_now();
+                    if self.run("page.canvas_layout", &params(&[("path", &path), ("layout", layout.id())])).is_some()
+                        && let Some(ed) = self.editor.as_mut()
+                    {
+                        ed.canvas_layout = layout;
+                        self.sync_dirty_since_last = true;
+                        self.last_local_edit_at = Some(Instant::now());
+                    }
+                }
             }
             ribbon::Act::ToolbarDock(dock) => self.session.set_toolbar_dock(dock),
             ribbon::Act::DockRoster(roster) => self.session.set_dock_roster(roster),
@@ -5715,6 +5748,34 @@ impl NocturneApp {
             ribbon::Act::Tag(tag) => self.apply_tag(tag),
             ribbon::Act::Clipboard(which) => self.clipboard(which),
             ribbon::Act::Paste => self.paste_here(None),
+            ribbon::Act::InkCopySelection => {
+                if let Some(pad) = self.pad.as_ref().filter(|pad| pad.holding() > 0) {
+                    let mut drawing = nocturne_ink::Drawing::new(1.0, 1.0);
+                    for stroke in pad.held_strokes() {
+                        drawing.add(stroke);
+                    }
+                    let svg = nocturne_ink::svg::write(&drawing, nocturne_ink::svg::Flavour::Editable);
+                    match self.clipboard.set_text(&svg) {
+                        Ok(()) => self.say(crate::tl_id!("ui.copied")),
+                        Err(error) => self.complain(&error),
+                    }
+                }
+            }
+            ribbon::Act::InkDeleteSelection => {
+                if self.pad.as_mut().is_some_and(crate::inkpad::Pad::delete_held) {
+                    self.ink_selection_changed();
+                }
+            }
+            ribbon::Act::InkColourSelection(colour) => {
+                if self.pad.as_mut().is_some_and(|pad| pad.recolour_held(colour)) {
+                    self.ink_selection_changed();
+                }
+            }
+            ribbon::Act::InkPaste => {
+                if !self.clipboard.text().is_some_and(|text| self.paste_ink(&text)) {
+                    self.say(crate::tl_id!("ui.no_ink_on_clipboard"));
+                }
+            }
             ribbon::Act::Indent(deeper) => self.indent_block(deeper),
             ribbon::Act::ClearFormatting => self.clear_formatting(),
             ribbon::Act::Direction(d) => self.apply_direction(d),
@@ -5908,6 +5969,9 @@ impl NocturneApp {
             return;
         }
         let dir = ed.dir.clone();
+        if fallback_text.as_deref().is_some_and(|text| self.paste_ink(text)) {
+            return;
+        }
         if let Some(picture) = self.clipboard.picture() {
             self.paste_picture(&dir, picture);
             return;
@@ -5924,6 +5988,9 @@ impl NocturneApp {
         }
         match fallback_text.or_else(|| self.clipboard.text()) {
             Some(text) => {
+                if self.paste_ink(&text) {
+                    return;
+                }
                 let new = pageedit::blocks_to_paste(&text);
                 if !self.paste_blocks(new) {
                     self.insert_in_page(&text);
@@ -5931,6 +5998,67 @@ impl NocturneApp {
                 self.say(crate::tl_id!("ui.pasted"));
             }
             None => self.say(crate::tl_id!("ui.there_is_nothing_on_the_clipboard_to_paste")),
+        }
+    }
+
+    /// Handles the editable SVG placed on the clipboard by Copy Ink.
+    fn paste_ink(&mut self, text: &str) -> bool {
+        use nocturne_ink::svg;
+        if !svg::is_ink(text) {
+            return false;
+        }
+        let Some(ed) = self.editor.as_ref().filter(|ed| ed.writable) else { return true };
+        let centre = self.page_view_rect.or(self.page_rect).map_or(ed.origin + vec2(120.0, 120.0), |view| view.center());
+        let at = (centre - ed.origin) / (self.zoom_percent as f32 / 100.0).max(0.05);
+        if let Ok((drawing, 0)) = svg::read(text)
+            && self.pad.as_mut().is_some_and(|pad| pad.paste_strokes(drawing, (at.x, at.y)))
+        {
+            self.ink_selection_changed();
+        } else {
+            self.complain(crate::tl_id!("ui.cannot_paste_ink"));
+        }
+        true
+    }
+
+    fn ink_selection_changed(&mut self) {
+        let Some(pad) = self.pad.as_mut() else { return };
+        pad.settle();
+        let result = pad.save();
+        let now = Instant::now();
+        self.last_ink_change = Some(now);
+        self.sync_dirty_since_last = true;
+        self.last_local_edit_at = Some(now);
+        self.ink_save_completed(result, true);
+    }
+
+    fn ink_save_completed(&mut self, result: std::io::Result<()>, references_may_change: bool) {
+        match result {
+            Ok(()) if self.pad.as_ref().is_none_or(|pad| !pad.has_unsaved_changes()) => {
+                let count = self.ink_stroke_count().to_string();
+                self.say(crate::i18n::format_message_id("ui.drawing_saved_count_strokes", &[("count", &count)]));
+            }
+            Ok(()) => {}
+            Err(error) => self.complain(&crate::i18n::format_message_id("ui.cannot_write_the_drawing_error", &[("error", &error.to_string())])),
+        }
+        if references_may_change {
+            self.tell_kept_ink();
+            self.sync_ink_reference();
+        }
+        if let Some(ed) = self.editor.as_ref() {
+            self.library_grid.invalidate_page(&ed.dir);
+        }
+    }
+
+    fn poll_ink_save(&mut self, ctx: &Context) {
+        if let Some(pad) = self.pad.as_mut().filter(|pad| pad.save_pending()) {
+            if let Some(result) = pad.finish_save(false) {
+                let follow_up = if result.is_ok() && pad.dirty { pad.save_in_background(ctx) } else { None };
+                self.ink_save_completed(result, false);
+                if let Some(result) = follow_up {
+                    self.ink_save_completed(result, true);
+                }
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(35));
         }
     }
 
@@ -6766,9 +6894,6 @@ impl NocturneApp {
     /// Saves both the open page and its editable ink drawing immediately.
     pub fn save_open_page(&mut self) {
         self.save_now();
-        if let Some(p) = self.pad.as_mut() {
-            let _ = p.save();
-        }
     }
 
     /// True when Tablet Studio is active and using the two-pane Library Grid view.
@@ -7973,7 +8098,14 @@ impl NocturneApp {
             return;
         }
         let ours = self.words_are_ours();
-        if (copy || cut) && ours && self.page_owns_clipboard_input(ctx) {
+        if copy
+            && self.held_ink_count() > 0
+            && matches!(self.pointer, ribbon::Pointer::Lasso | ribbon::Pointer::Pick)
+            && self.page_owns_clipboard_input(ctx)
+        {
+            ctx.input_mut(|i| i.events.retain(|event| !matches!(event, egui::Event::Copy)));
+            self.ribbon_act(ribbon::Act::InkCopySelection);
+        } else if (copy || cut) && ours && self.page_owns_clipboard_input(ctx) {
             ctx.input_mut(|i| i.events.retain(|event| !matches!(event, egui::Event::Copy | egui::Event::Cut)));
             if copy {
                 self.clipboard("copy");
@@ -9593,22 +9725,31 @@ impl NocturneApp {
                             follow: &mut Option<String>,
                             rename: &mut Option<String>| {
                 let viewport = ui.available_rect_before_wrap().shrink2(vec2(0.0, 1.0));
-                if wide && let Some(wash) = page_colour {
-                    ui.painter_at(viewport).rect_filled(viewport, 0.0, wash);
-                }
-                if wide && rules.on() {
+                if wide || ed.canvas_layout != nocturne_store::page::CanvasLayout::Infinite {
+                    let visible = viewport.with_max_y(viewport.max.y.max(ui.clip_rect().max.y));
+                    let painter = ui.painter_at(visible);
                     let lines = crate::theme::rule_lines_in(&tokens, ed.rule_colour);
-                    crate::ribbon::paint_paper_canvas(
-                        &ui.painter_at(viewport),
-                        viewport,
-                        rules,
-                        zoom_scale,
-                        // Through the page's origin, so a box on the grid sits on a line. A page
-                        // not yet drawn as boxes counts from the canvas's corner.
-                        viewport.translate(self.canvas_pan).min + ed.origin_in_canvas.unwrap_or_default(),
-                        lines.0,
-                        lines.1,
-                    );
+                    let origin = viewport.translate(self.canvas_pan).min + ed.origin_in_canvas.unwrap_or_default();
+                    if let Some(sheet) = crate::canvas_paper::sheet_size(ed.canvas_layout) {
+                        crate::canvas_paper::paint(
+                            &painter,
+                            visible,
+                            origin,
+                            zoom_scale,
+                            sheet,
+                            rules,
+                            lines,
+                            page_colour.unwrap_or(tokens.editor),
+                            &tokens,
+                        );
+                    } else {
+                        if let Some(wash) = page_colour {
+                            painter.rect_filled(viewport, 0.0, wash);
+                        }
+                        if rules.on() {
+                            crate::ribbon::paint_paper_canvas(&painter, viewport, rules, zoom_scale, origin, lines.0, lines.1);
+                        }
+                    }
                 }
                 let content_rect = viewport.translate(self.canvas_pan);
                 ui.scope_builder(egui::UiBuilder::new().id_salt("page-canvas-content").max_rect(content_rect), |ui| {
@@ -9783,6 +9924,9 @@ impl NocturneApp {
                                 if let Some([x0, _, x1, _]) = pad.as_ref().and_then(|p| p.bounds()) {
                                     span = (span.0.min(top.x + x0 * zoom_scale), span.1.max(top.x + x1 * zoom_scale));
                                 }
+                                if let Some(sheet) = crate::canvas_paper::sheet_size(ed.canvas_layout) {
+                                    span.1 = span.1.max(left + sheet.x * zoom_scale);
+                                }
                                 page_span = Some(span);
                             }
                             // Insert Space (issue #164): a drag down the page pushes everything that
@@ -9914,6 +10058,13 @@ impl NocturneApp {
                             }
                             ed.origin = moved.origin;
                             ed.origin_in_canvas = Some(moved.origin - content_rect.min);
+                            if ed.canvas_layout != nocturne_store::page::CanvasLayout::Infinite {
+                                let ink_bottom = pad.as_ref().and_then(crate::inkpad::Pad::bounds).map_or(0.0, |bounds| bounds[3]);
+                                let bottom = moved.bottom.max(ink_bottom);
+                                if let Some(end) = crate::canvas_paper::sheet_end(ed.canvas_layout, bottom) {
+                                    ui.set_min_height((moved.origin.y - ui.min_rect().top() + end * zoom_scale).max(0.0));
+                                }
+                            }
                             if moved.changed.link.is_some() {
                                 *follow = moved.changed.link;
                             }
@@ -10039,6 +10190,7 @@ impl NocturneApp {
                                 eraser_pixel: self.session.ink_options().eraser_kind == nocturne_engine::EraserKind::Pixel,
                                 eraser_width: self.session.ink_options().eraser_width,
                                 show_minimap,
+                                tablet_tools_minimized: self.tablet_tools_minimized,
                                 can_undo: (ed.writable && ed.history.can_undo()) || pad.as_ref().is_some_and(crate::inkpad::Pad::can_undo),
                                 can_redo: (ed.writable && ed.history.can_redo()) || pad.as_ref().is_some_and(crate::inkpad::Pad::can_redo),
                                 can_ink_redo: pad.as_ref().is_some_and(crate::inkpad::Pad::can_redo),
@@ -10091,6 +10243,12 @@ impl NocturneApp {
                             }
                         }
                     }
+                    if matches!(self.pointer, ribbon::Pointer::Lasso | ribbon::Pointer::Pick)
+                        && pad.as_ref().is_some_and(|p| p.holding() > 0 && !p.gesture_active())
+                        && let Some(selection) = crate::inkpad::held_area(ui.ctx()).filter(|rect| rect.intersects(view))
+                    {
+                        crate::ink_selection::selection_actions(ui.ctx(), selection.intersect(view), view, &tokens, &mut pill_acts);
+                    }
                     let ocr_cfg = self.session.ocr_config();
                     if (ocr_cfg.enabled || ocr_cfg.handwriting_enabled)
                         && self.math_ocr.is_none()
@@ -10103,7 +10261,8 @@ impl NocturneApp {
                             crate::math_ocr::convert_buttons(ui.ctx(), held_rect, view, ocr_cfg.enabled, ocr_cfg.handwriting_enabled, &tokens);
                     }
                     if show_minimap {
-                        let stroke_bounds = pad.as_ref().map(crate::inkpad::Pad::stroke_bounds).unwrap_or_default();
+                        let stroke_bounds =
+                            if self.minimap_collapsed { Vec::new() } else { pad.as_ref().map(crate::inkpad::Pad::stroke_bounds).unwrap_or_default() };
                         minimap_out = crate::minimap::show(
                             ui.ctx(),
                             view,
@@ -10282,15 +10441,9 @@ impl NocturneApp {
             pad.settle();
         }
         if ink_changed && let Some(pad) = self.pad.as_mut() {
-            let strokes = pad.strokes();
-            match pad.save() {
-                Ok(()) => self.say(crate::i18n::format_message_id("ui.drawing_saved_count_strokes", &[("count", &strokes.to_string())])),
-                Err(e) => self.complain(&crate::i18n::format_message_id("ui.cannot_write_the_drawing_error", &[("error", &e.to_string())])),
-            }
-            self.tell_kept_ink();
-            self.sync_ink_reference();
-            if let Some(dir) = self.editor.as_ref().map(|e| e.dir.clone()) {
-                self.library_grid.invalidate_page(&dir);
+            let result = if cfg!(target_os = "ios") { pad.save_in_background(ui.ctx()) } else { Some(pad.save()) };
+            if let Some(result) = result {
+                self.ink_save_completed(result, true);
             }
         }
         if let Some(href) = follow {
@@ -10649,6 +10802,7 @@ impl NocturneApp {
                             self.last_tablet_studio = self.is_tablet_studio(ctx);
                             self.minimap_override = None;
                             self.minimap_collapsed = true;
+                            self.tablet_tools_minimized = false;
                             self.qat = quickaccess::Config::default();
                             self.rack = nocturne_ink::rack::parse("");
                             self.nib = 0;
@@ -12069,6 +12223,19 @@ impl NocturneApp {
                 if id == "sync.configure" {
                     self.sync_has_token = None;
                     self.cached_sync_config = None;
+                } else if id == "view.tablet_tools" {
+                    self.tablet_tools_minimized = self.session.settings.get("tablet_tools_minimized").as_deref() == Some("true");
+                    if self.tablet_tools_minimized {
+                        self.tool_settings_open = false;
+                    }
+                } else if id == "page.canvas_layout" && params.contains_key("layout") {
+                    if let Some(ed) = self.editor.as_mut()
+                        && let Ok(layout) = nocturne_store::page::canvas_layout(&ed.dir)
+                    {
+                        ed.canvas_layout = layout;
+                    }
+                    self.sync_dirty_since_last = true;
+                    self.last_local_edit_at = Some(Instant::now());
                 } else if id == "sync.now"
                     && let Some(dir) = self.editor.as_ref().map(|ed| ed.dir.clone())
                     && dir.is_dir()
@@ -12520,6 +12687,7 @@ impl NocturneApp {
         }
         self.poll_control(ctx);
         self.poll_import(ctx);
+        self.poll_ink_save(ctx);
         self.poll_sync(ctx);
         self.poll_ocr_model_download();
         if let Some(mode) = self.pending_math_ocr_start.take() {

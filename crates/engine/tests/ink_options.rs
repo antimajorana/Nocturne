@@ -25,7 +25,7 @@ fn a_fresh_session_has_the_object_eraser_at_its_small_size_and_straightening_on(
     let t = TempDir::new("ink-options-fresh");
     let s = session(&t);
     assert_eq!(s.ink_options(), InkOptions { eraser_kind: EraserKind::Object, eraser_width: 6.0, hold_to_straighten: true });
-    assert_eq!(ERASER_SIZES, [("s", 6.0), ("m", 12.0), ("l", 24.0), ("xl", 40.0)]);
+    assert_eq!(ERASER_SIZES, [("xs", 2.0), ("s", 6.0), ("m", 12.0), ("l", 24.0), ("xl", 40.0), ("xxl", 56.0), ("xxxl", 80.0)]);
     for id in ["ink.eraser_mode", "ink.eraser_width", "ink.hold_to_straighten"] {
         let spec = registry().iter().find(|c| c.id == id).unwrap_or_else(|| panic!("{id} is a command"));
         assert!(!spec.changes_tree, "{id} does not change the notebooks");

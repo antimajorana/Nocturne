@@ -449,11 +449,11 @@ fn the_picture_is_dark_ink_on_white_with_a_margin_and_fits_a_fixed_size() {
 
     // A page-wide line still fits, and a far-off or broken stroke does not make a huge picture.
     let mut wide = Stroke::new(Tool::Pen, Rgb::BLACK, 2.0);
-    wide.dabs = vec![Dab::new(0.0, 0.0, 1.0), Dab::new(5000.0, 30.0, 1.0)];
+    wide.dabs = vec![Dab::new(0.0, 0.0, 1.0), Dab::new(5000.0, 30.0, 1.0)].into();
     let img = image::load_from_memory(&ocr::raster::png(&[wide]).expect("png")).expect("png");
     assert!(img.width() <= ocr::raster::MAX_SIDE && img.height() <= ocr::raster::MAX_SIDE);
     let mut broken = Stroke::new(Tool::Pen, Rgb::BLACK, 2.0);
-    broken.dabs = vec![Dab { x: f32::NAN, y: 0.0, pressure: 1.0 }, Dab { x: f32::INFINITY, y: 4.0, pressure: 1.0 }];
+    broken.dabs = vec![Dab { x: f32::NAN, y: 0.0, pressure: 1.0 }, Dab { x: f32::INFINITY, y: 4.0, pressure: 1.0 }].into();
     assert!(matches!(ocr::raster::png(&[broken]), Err(OcrError::NoInk)));
 }
 

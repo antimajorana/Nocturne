@@ -228,6 +228,15 @@ Parameters:
 - path (required): the page
 - boxes (optional): x,y,width,blocks per container, separated by semicolons. The counts must add up to the page's blocks. They are written into the page's text as elements around the blocks; empty puts the page back in one column. Without it, the current arrangement is reported
 
+## `page.canvas_layout`
+
+Choose the canvas layout for a page.
+
+Parameters:
+
+- path (required): the page
+- layout (optional): infinite, portrait, or landscape. Omit to read the current layout
+
 ## `page.paper`
 
 The paper a page is drawn on, the colour behind it and the colour of its lines.
@@ -356,6 +365,14 @@ Reload the tree from disk.
 
 No parameters.
 
+## `view.tablet_tools`
+
+Minimize or expand the Tablet Studio tools.
+
+Parameters:
+
+- minimized (required): true or false
+
 ## `ink.toggle_eraser`
 
 Toggle eraser.
@@ -386,11 +403,11 @@ Set the eraser's size.
 
 Parameters:
 
-- width: s, m, l, xl, or points across from 2 to 80
+- width: xs, s, m, l, xl, xxl, xxxl, or points across from 2 to 80
 
 ## `ink.hold_to_straighten`
 
-Straighten a stroke when the pen is held still.
+Snap a hand-drawn line or square when the pen is held still.
 
 Parameters:
 

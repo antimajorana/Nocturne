@@ -1033,7 +1033,7 @@
 @id	ui.eraser_size_named	$$$Eraser size {size}@@@
 @id	ui.tool_settings	$$$Tool settings@@@
 @id	ui.move_tool_bar	$$$Move the tool bar@@@
-@id	ui.hold_to_straighten	$$$Hold 2 seconds to straighten a line@@@
+@id	ui.hold_to_straighten	$$$Hold 2 seconds to snap a line or square@@@
 @id	ui.tool_settings_eraser	$$$Eraser@@@
 @id	ui.tool_bar_position	$$$Tool bar position@@@
 @id	ui.edge_bottom	$$$Bottom@@@
@@ -1136,3 +1136,11 @@
 @id	ui.ocr_text_edit_label	$$$Recognised text@@@
 @id	ui.ocr_insert_text	$$$Insert text@@@
 @id	ui.ocr_recognition_heading	$$$Handwriting & equation recognition@@@
+@id	ui.canvas_layout	$$$Canvas layout@@@
+@id	ui.canvas_infinite	$$$Infinite canvas@@@
+@id	ui.canvas_portrait	$$$Portrait pages@@@
+@id	ui.canvas_landscape	$$$Landscape pages@@@
+@id	ui.minimize_drawing_tools	$$$Minimise drawing tools@@@
+@id	ui.paste_ink	$$$Paste ink@@@
+@id	ui.no_ink_on_clipboard	$$$There is no ink on the clipboard@@@
+@id	ui.cannot_paste_ink	$$$Could not paste the copied ink@@@

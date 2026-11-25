@@ -436,6 +436,63 @@ pub fn set_appearance(dir: &Path, paper: Option<&str>, colour: Option<&str>) -> 
 const RULES_KEY: &str = "rule-color";
 const RULES_META: &str = "nocturne:rule-color";
 
+const CANVAS_KEY: &str = "canvas-layout";
+const CANVAS_META: &str = "nocturne:canvas-layout";
+
+/// The arrangement of paper behind the page's content.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CanvasLayout {
+    #[default]
+    Infinite,
+    Portrait,
+    Landscape,
+}
+
+impl CanvasLayout {
+    pub const ALL: [Self; 3] = [Self::Infinite, Self::Portrait, Self::Landscape];
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Infinite => "infinite",
+            Self::Portrait => "portrait",
+            Self::Landscape => "landscape",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|layout| layout.id().eq_ignore_ascii_case(value.trim()))
+    }
+}
+
+pub fn canvas_layout(dir: &Path) -> Result<CanvasLayout> {
+    let (format, _) = page_file(dir).ok_or_else(|| StoreError::NotFound(format!("{} is not a page", dir.display())))?;
+    let head = head_text(dir)?;
+    let value = match format {
+        PageFormat::Html => html::meta(&head, CANVAS_META),
+        PageFormat::Cmgfm => frontmatter::value(&head, CANVAS_KEY),
+    };
+    Ok(value.and_then(|value| CanvasLayout::parse(&value)).unwrap_or_default())
+}
+
+pub fn set_canvas_layout(dir: &Path, layout: CanvasLayout) -> Result<()> {
+    let (format, file) = page_file(dir).ok_or_else(|| StoreError::NotFound(format!("{} is not a page", dir.display())))?;
+    let text = fs::read_to_string(&file).map_err(|e| StoreError::io("read", &file, e))?;
+    let value = (layout != CanvasLayout::Infinite).then_some(layout.id());
+    let out = match format {
+        PageFormat::Html => match value {
+            Some(value) => html::set_meta(&text, CANVAS_META, value),
+            None => html::remove_meta(&text, CANVAS_META),
+        },
+        PageFormat::Cmgfm => {
+            let (front, body) = frontmatter::split_front(&text);
+            let front =
+                value.map_or_else(|| frontmatter::remove_value(&front, CANVAS_KEY), |value| frontmatter::set_value(&front, CANVAS_KEY, value));
+            format!("{front}{body}")
+        }
+    };
+    if out == text { Ok(()) } else { write_atomic(&file, &out) }
+}
+
 /// The colour a page's rule and grid lines are drawn in (issue #288), as it is written, or
 /// `None` when the page says nothing and its lines are the theme's own grey.
 pub fn rule_colour(dir: &Path) -> Result<Option<String>> {
@@ -708,6 +765,21 @@ mod tests {
         let nb = ops::create_notebook(&t.path().join("nb"), "NB", None, &s).expect("nb");
         let page = ops::create_node(&nb, "Page", NodeKind::Page, Some(format), &s).expect("page");
         (t, page)
+    }
+
+    #[test]
+    fn canvas_layout_survives_body_edits_in_both_page_formats() {
+        for format in PageFormat::ALL {
+            let (_temp, dir) = setup("canvas-layout", format);
+            assert_eq!(canvas_layout(&dir).expect("legacy default"), CanvasLayout::Infinite);
+            for layout in [CanvasLayout::Portrait, CanvasLayout::Landscape, CanvasLayout::Infinite] {
+                set_canvas_layout(&dir, layout).expect("set layout");
+                save_body(&dir, "Existing note contents").expect("write body");
+                assert_eq!(load_page(&dir).expect("load").body, "Existing note contents");
+                assert_eq!(canvas_layout(&dir).expect("read layout"), layout);
+                assert_eq!(head_text(&dir).expect("read source").contains(CANVAS_KEY), layout != CanvasLayout::Infinite);
+            }
+        }
     }
 
     #[test]
