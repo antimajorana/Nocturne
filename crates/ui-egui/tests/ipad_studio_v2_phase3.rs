@@ -186,7 +186,7 @@ fn tool_settings_holds_the_switches_the_eraser_and_the_bars_edge() {
     assert!(h.state().is_finger_drawing());
 
     assert!(h.state().session().ink_options().hold_to_straighten);
-    let straighten = named(&h, "Hold 2 seconds to straighten a line").expect("hold to straighten").center();
+    let straighten = named(&h, "Hold 2 seconds to snap a line or square").expect("hold to snap").center();
     click(&mut h, straighten);
     assert!(!h.state().session().ink_options().hold_to_straighten);
 

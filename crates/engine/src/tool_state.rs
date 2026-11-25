@@ -141,7 +141,7 @@ impl EraserKind {
 }
 
 /// The eraser's named sizes and how wide each is, in points across.
-pub const ERASER_SIZES: [(&str, f32); 4] = [("s", 6.0), ("m", 12.0), ("l", 24.0), ("xl", 40.0)];
+pub const ERASER_SIZES: [(&str, f32); 7] = [("xs", 2.0), ("s", 6.0), ("m", 12.0), ("l", 24.0), ("xl", 40.0), ("xxl", 56.0), ("xxxl", 80.0)];
 
 /// The narrowest and widest the eraser may be, in points across.
 pub const MIN_ERASER_WIDTH: f32 = 2.0;
@@ -160,7 +160,7 @@ pub struct InkOptions {
 impl Default for InkOptions {
     fn default() -> Self {
         // The small eraser is the size the eraser had when it took its width from a thin pen.
-        Self { eraser_kind: EraserKind::Object, eraser_width: ERASER_SIZES[0].1, hold_to_straighten: true }
+        Self { eraser_kind: EraserKind::Object, eraser_width: 6.0, hold_to_straighten: true }
     }
 }
 

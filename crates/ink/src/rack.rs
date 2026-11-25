@@ -20,7 +20,7 @@ pub struct Nib {
 
 /// The thinnest and thickest a nib may be, in tenths of a point.
 pub const MIN_TENTHS: u16 = 4;
-pub const MAX_TENTHS: u16 = 400;
+pub const MAX_TENTHS: u16 = 800;
 
 /// No rack may be longer than this: it has to fit on a ribbon, and a damaged settings file
 /// must not be able to fill one.
@@ -130,7 +130,7 @@ pub const PALETTE: [[Rgb; 6]; 5] = [
 ];
 
 /// The thicknesses the tool editor offers as dots, in tenths of a point, thinnest first.
-pub const THICKNESSES: [u16; 6] = [4, 10, 20, 35, 60, 140];
+pub const THICKNESSES: [u16; 15] = [4, 7, 10, 14, 20, 28, 35, 45, 60, 90, 140, 200, 320, 500, 800];
 
 #[cfg(test)]
 mod tests {

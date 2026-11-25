@@ -18,6 +18,19 @@ pub const DOCK_NIB_CROSS: f32 = 42.0;
 /// How many points inward toward the canvas the active pen rises above inactive pens.
 pub const ACTIVE_NIB_RAISE: f32 = 9.0;
 
+pub(crate) fn thickness_button(ui: &mut egui::Ui, tenths: u16, chosen: bool, t: &Tokens) -> bool {
+    let points = f32::from(tenths) / 10.0;
+    let (rect, response) = ui.allocate_exact_size(vec2(46.0, 46.0), egui::Sense::click());
+    let width = format!("{points:.1}");
+    let name = crate::i18n::format_message_id("ui.size_pt", &[("size", &width)]);
+    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, chosen, name.clone()));
+    crate::tablet_chrome::paint_studio_btn_chrome(ui, rect, &response, chosen, true, t);
+    let colour = if chosen { t.accent } else { t.text };
+    ui.painter().circle_filled(rect.center_top() + vec2(0.0, 14.0), (points * 0.5).clamp(1.5, 8.5), colour);
+    ui.painter().text(rect.center_bottom() - vec2(0.0, 6.0), egui::Align2::CENTER_BOTTOM, width, egui::FontId::proportional(11.0), colour);
+    response.on_hover_text(name).clicked()
+}
+
 /// Theme-derived colours for an upright pen or highlighter silhouette.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NibColors {

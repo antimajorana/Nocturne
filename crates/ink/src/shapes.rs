@@ -135,11 +135,78 @@ pub fn trace(shape: Shape, from: (f32, f32), to: (f32, f32), pressure: f32) -> V
     along(&points, pressure)
 }
 
-/// The dabs along a traced outline: a sample every few points, and each corner repeated.
-///
-/// A stroke is drawn through its dabs with a curve, which is what makes handwriting look
-/// written. A shape must not be rounded off by it: the samples keep the line straight
-/// between corners, and a corner repeated three times pulls the curve into a point.
+/// Fits a square to a near-closed freehand outline, preserving its rotation and center.
+pub fn trace_square(drawn: &[Dab], zoom: f32, pressure: f32) -> Option<Vec<Dab>> {
+    // Split a closed loop along its diagonal. The farthest point on either
+    // side of that diagonal is the other corner on that half of the loop.
+    let first = *drawn.first()?;
+    let last = *drawn.last()?;
+    let farthest = |from: Dab| (0..drawn.len()).max_by(|&a, &b| distance(from, drawn[a]).total_cmp(&distance(from, drawn[b])));
+    let a = farthest(first)?;
+    let c = farthest(drawn[a])?;
+    let diagonal = distance(drawn[a], drawn[c]);
+    if diagonal * zoom < 28.0 || distance(first, last) > diagonal * 0.19 {
+        return None;
+    }
+    let arc = |start: usize, end: usize| (start..drawn.len()).chain(0..end).take(if end >= start { end - start } else { drawn.len() - start + end });
+    let corner = |start, end| {
+        arc(start, end).max_by(|&i, &j| cross(drawn[start], drawn[end], drawn[i]).abs().total_cmp(&cross(drawn[start], drawn[end], drawn[j]).abs()))
+    };
+    let b = corner(a, c)?;
+    let d = corner(c, a)?;
+    let corners = [a, b, c, d];
+    let mut side_sum = 0.0;
+    let mut shortest = f32::INFINITY;
+    let mut longest = 0.0_f32;
+    let mut sign = 0.0;
+    for i in 0..4 {
+        let (start, end, next) = (corners[i], corners[(i + 1) % 4], corners[(i + 2) % 4]);
+        let side = distance(drawn[start], drawn[end]);
+        let angle = cross(drawn[start], drawn[end], drawn[next]) / (side * distance(drawn[end], drawn[next]));
+        if !(0.52 * diagonal..=0.88 * diagonal).contains(&side)
+            || !angle.is_finite()
+            || angle.abs() < 0.86
+            || (i > 0 && angle * sign < 0.0)
+            || arc(start, end).any(|j| cross(drawn[start], drawn[end], drawn[j]).abs() > 0.11 * side * side)
+        {
+            return None;
+        }
+        side_sum += side;
+        shortest = shortest.min(side);
+        longest = longest.max(side);
+        sign = angle.signum();
+    }
+    if longest > shortest * 1.35 {
+        return None;
+    }
+
+    let [a, b, c, d] = corners.map(|i| drawn[i]);
+    let (cx, cy) = ((a.x + b.x + c.x + d.x) * 0.25, (a.y + b.y + c.y + d.y) * 0.25);
+    // Average all four sides in the same direction before normalizing.
+    let ux = b.x - a.x + c.x - d.x + sign * (c.y - b.y + d.y - a.y);
+    let uy = b.y - a.y + c.y - d.y - sign * (c.x - b.x + d.x - a.x);
+    let half = side_sum * 0.125 / ux.hypot(uy);
+    let (ux, uy) = (ux * half, uy * half);
+    let (vx, vy) = (-sign * uy, sign * ux);
+    let points = [
+        (cx - ux - vx, cy - uy - vy),
+        (cx + ux - vx, cy + uy - vy),
+        (cx + ux + vx, cy + uy + vy),
+        (cx - ux + vx, cy - uy + vy),
+        (cx - ux - vx, cy - uy - vy),
+    ];
+    Some(along(&points, pressure))
+}
+
+fn distance(a: Dab, b: Dab) -> f32 {
+    (b.x - a.x).hypot(b.y - a.y)
+}
+
+fn cross(a: Dab, b: Dab, p: Dab) -> f32 {
+    (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x)
+}
+
+/// Samples the straight edges and repeats the corners to preserve them during smoothing.
 fn along(points: &[(f32, f32)], pressure: f32) -> Vec<Dab> {
     const STEP: f32 = 7.0;
     const CORNER: usize = 3;
@@ -229,6 +296,26 @@ fn star(cx: f32, cy: f32, rx: f32, ry: f32) -> Vec<(f32, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hold_fit_cleans_up_a_rotated_square_without_snapping_curves_or_open_shapes() {
+        let tilt = 0.37_f32;
+        let (sin, cos) = tilt.sin_cos();
+        let rough = [(0.0, 0.0), (22.0, -2.0), (44.0, 1.0), (42.0, 23.0), (45.0, 42.0), (21.0, 44.0), (0.0, 43.0), (-2.0, 22.0), (2.0, 2.0)];
+        let drawn: Vec<_> = rough.into_iter().map(|(x, y)| Dab::new(90.0 + x * cos - y * sin, 30.0 + x * sin + y * cos, 0.4)).collect();
+        let fitted = trace_square(&drawn, 1.0, 0.6).expect("a rough square");
+        assert_eq!(fitted.first(), fitted.last());
+        assert!(fitted.iter().all(|dab| dab.pressure == 0.6));
+        let corners: Vec<_> = fitted.windows(3).filter_map(|w| (w[0] == w[1] && w[1] == w[2]).then_some(w[0])).collect();
+        assert_eq!(corners.len(), 5);
+        let side = distance(corners[0], corners[1]);
+        assert!(corners.windows(2).all(|w| (distance(w[0], w[1]) - side).abs() < 0.001));
+        assert!((cross(corners[0], corners[1], corners[2]).abs() - side * side).abs() < 0.01);
+        assert!(trace_square(&drawn[..7], 1.0, 0.6).is_none());
+        assert!(trace_square(&trace(Shape::Circle, (0.0, 0.0), (70.0, 70.0), 0.7), 1.0, 0.6).is_none());
+        assert!(trace_square(&trace(Shape::Triangle, (0.0, 0.0), (70.0, 70.0), 0.7), 1.0, 0.6).is_none());
+        assert!(trace_square(&trace(Shape::Rectangle, (0.0, 0.0), (64.0, 42.0), 0.7), 1.0, 0.6).is_none());
+    }
 
     fn box_of(dabs: &[Dab]) -> (f32, f32, f32, f32) {
         let left = dabs.iter().map(|d| d.x).fold(f32::MAX, f32::min);

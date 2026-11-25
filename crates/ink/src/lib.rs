@@ -161,6 +161,55 @@ impl Rgb {
     }
 }
 
+/// Pressure samples shared between the live drawing, undo, and save snapshots.
+/// Editing a stroke makes its samples private before changing them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Dabs(std::sync::Arc<Vec<Dab>>);
+
+impl From<Vec<Dab>> for Dabs {
+    fn from(readings: Vec<Dab>) -> Self {
+        Self(std::sync::Arc::new(readings))
+    }
+}
+
+impl FromIterator<Dab> for Dabs {
+    fn from_iter<T: IntoIterator<Item = Dab>>(iter: T) -> Self {
+        iter.into_iter().collect::<Vec<_>>().into()
+    }
+}
+
+impl std::ops::Deref for Dabs {
+    type Target = Vec<Dab>;
+
+    fn deref(&self) -> &Vec<Dab> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Dabs {
+    fn deref_mut(&mut self) -> &mut Vec<Dab> {
+        std::sync::Arc::make_mut(&mut self.0)
+    }
+}
+
+impl<'a> IntoIterator for &'a Dabs {
+    type Item = &'a Dab;
+    type IntoIter = std::slice::Iter<'a, Dab>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut Dabs {
+    type Item = &'a mut Dab;
+    type IntoIter = std::slice::IterMut<'a, Dab>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
 /// One press of the pen to its lift.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Stroke {
@@ -175,12 +224,12 @@ pub struct Stroke {
     pub gain: f32,
     /// Monotonic pressure-response curve applied before gain.
     pub curve: PressureCurve,
-    pub dabs: Vec<Dab>,
+    pub dabs: Dabs,
 }
 
 impl Default for Stroke {
     fn default() -> Self {
-        Self { tool: Tool::Pen, colour: Rgb::BLACK, width: 3.0, gain: 1.0, curve: PressureCurve::Linear, dabs: Vec::new() }
+        Self { tool: Tool::Pen, colour: Rgb::BLACK, width: 3.0, gain: 1.0, curve: PressureCurve::Linear, dabs: Dabs::default() }
     }
 }
 
@@ -188,10 +237,10 @@ impl Default for Stroke {
 pub const MIN_GAIN: f32 = 0.3;
 pub const MAX_GAIN: f32 = 3.0;
 
-/// The smallest and largest a stroke may be asked to be, in points. A stroke outside this
-/// is a file that has been meddled with, or a slider that got away.
+/// The smallest and largest a stroke may be, in points. The upper limit is
+/// four times the widest selectable nib, allowing the full sensitivity range.
 pub const MIN_WIDTH: f32 = 0.4;
-pub const MAX_WIDTH: f32 = 80.0;
+pub const MAX_WIDTH: f32 = 320.0;
 
 /// No stroke may hold more readings than this. A pen reports about 200 a second, so this is
 /// several minutes of one unbroken line, and it stops a damaged file eating the window.
@@ -202,7 +251,7 @@ pub const MAX_STROKES: usize = 20_000;
 
 impl Stroke {
     pub fn new(tool: Tool, colour: Rgb, width: f32) -> Self {
-        Self { tool, colour, width: Self::sane_width(width), gain: 1.0, curve: PressureCurve::Linear, dabs: Vec::new() }
+        Self { tool, colour, width: Self::sane_width(width), gain: 1.0, curve: PressureCurve::Linear, dabs: Dabs::default() }
     }
 
     /// The same, drawn with a pen set to answer pressure more or less readily.

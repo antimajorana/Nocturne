@@ -95,7 +95,7 @@ pub(crate) fn for_each_centre(stroke: &Stroke, mut emit: impl FnMut(Dab)) {
 pub fn centre(stroke: &Stroke) -> Vec<Dab> {
     let dabs = &stroke.dabs;
     if dabs.len() < 3 {
-        return dabs.clone();
+        return dabs.to_vec();
     }
     let mut out = Vec::with_capacity(centre_len(dabs));
     for_each_centre(stroke, |d| out.push(d));
@@ -126,6 +126,24 @@ pub fn width_at(stroke: &Stroke, pressure: f32) -> f32 {
     let felt = if (stroke.gain - 1.0).abs() < f32::EPSILON { curved } else { curved.powf(1.0 / stroke.gain) };
     let share = floor + (1.0 - floor) * felt;
     (stroke.width * share).max(crate::MIN_WIDTH)
+}
+
+/// Stable paper grain in page coordinates. Neighbouring marks pick up the same
+/// surface texture, and scrolling or zooming never changes its placement.
+pub(crate) const PAPER_GRAIN_CELL: f32 = 1.0 / 1.7;
+pub(crate) const PAPER_GRAIN_TILE: u16 = 16;
+
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+pub fn paper_grain(x: f32, y: f32) -> f32 {
+    let ix = (x / PAPER_GRAIN_CELL).floor() as i32 as u32;
+    let iy = (y / PAPER_GRAIN_CELL).floor() as i32 as u32;
+    let tile = u32::from(PAPER_GRAIN_TILE);
+    let mut hash = (ix % tile).wrapping_mul(0x9e37_79b9) ^ (iy % tile).wrapping_mul(0x85eb_ca6b);
+    hash ^= hash >> 16;
+    hash = hash.wrapping_mul(0x7feb_352d);
+    hash ^= hash >> 15;
+    (hash & 255) as f32 / 255.0
 }
 
 #[inline]

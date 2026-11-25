@@ -114,6 +114,8 @@ pub enum Act {
     FitAllContent,
     /// Show or fold away the infinite-canvas minimap.
     ToggleMinimap,
+    ToggleTabletTools,
+    CanvasLayout(nocturne_store::page::CanvasLayout),
     /// Move the Tablet Studio tool bar to an edge of the page view.
     ToolbarDock(nocturne_engine::ToolbarDock),
     /// Set which tools the Tablet Studio tool bar shows, and in what order.
@@ -223,6 +225,10 @@ pub enum Act {
     InkUndo,
     /// Put back the stroke Undo stroke last took back.
     InkRedo,
+    InkCopySelection,
+    InkDeleteSelection,
+    InkColourSelection(Rgb),
+    InkPaste,
     /// Put a drawing on the page at the caret.
     InkInsert,
     /// Save the drawing beside the page as a plain picture, with no pen readings in it.
@@ -545,6 +551,8 @@ pub struct View<'a> {
     pub eraser_width: f32,
     /// Whether the infinite-canvas minimap is currently shown.
     pub show_minimap: bool,
+    pub tablet_tools_minimized: bool,
+    pub canvas_layout: nocturne_store::page::CanvasLayout,
     /// True while the caret is in a table, which is when the Table tab is offered.
     pub in_table: bool,
     /// Whether the table the caret is in is drawn with lines round its cells.
@@ -2602,7 +2610,7 @@ fn modify_tool(ui: &mut Ui, id: egui::Id, under: Rect, i: usize, nib: Nib, rack_
                     ui.separator();
 
                     ui.label(egui::RichText::new(crate::tl_id!("ui.thickness")).size(11.5).color(t.muted));
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         for tenths in rack::THICKNESSES {
                             let here = nib.tenths == tenths;
                             let (dot, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
@@ -3333,6 +3341,24 @@ fn table_tab(ui: &mut Ui, view: &View<'_>, t: &Tokens, acts: &mut Vec<Act>) {
     });
 }
 
+pub(crate) fn canvas_layout_choices(ui: &mut Ui, current: nocturne_store::page::CanvasLayout, acts: &mut Vec<Act>) {
+    use nocturne_store::page::CanvasLayout;
+    mark_popup_open(ui.ctx());
+    for layout in CanvasLayout::ALL {
+        let label = match layout {
+            CanvasLayout::Infinite => crate::tl_id!("ui.canvas_infinite"),
+            CanvasLayout::Portrait => crate::tl_id!("ui.canvas_portrait"),
+            CanvasLayout::Landscape => crate::tl_id!("ui.canvas_landscape"),
+        };
+        if ui.selectable_label(layout == current, label).clicked() {
+            if layout != current {
+                acts.push(Act::CanvasLayout(layout));
+            }
+            ui.close();
+        }
+    }
+}
+
 fn view_tab(ui: &mut Ui, source: bool, view: &View<'_>, t: &Tokens, acts: &mut Vec<Act>) {
     // The groups OneNote's View tab has, in its order: Views, Layout, Tools, Page Setup,
     // Zoom, Window. What Nocturne does not have says so rather than being left out.
@@ -3383,6 +3409,9 @@ fn view_tab(ui: &mut Ui, source: bool, view: &View<'_>, t: &Tokens, acts: &mut V
     });
     group(ui, crate::tl_id!("ui.page_setup"), t, |ui| {
         rule_lines_menu(ui, view, t, acts);
+        ui.add_enabled_ui(view.has_page && !source, |ui| {
+            ui.menu_button(crate::tl_id!("ui.canvas_layout"), |ui| canvas_layout_choices(ui, view.canvas_layout, acts));
+        });
         rows(ui, |ui| {
             // i18n-exempt: T is the compact symbol on the page-title toggle.
             if small(ui, None, "T", crate::tl_id!("ui.hide_page_title"), crate::tl_id!("ui.hide_the_page_title"), view.hide_title, t).clicked() {

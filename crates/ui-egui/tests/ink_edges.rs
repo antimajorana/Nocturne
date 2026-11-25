@@ -4,6 +4,9 @@ use egui::vec2;
 use egui_kittest::Harness;
 use nocturne_ink::{Dab, Rgb, Stroke, Tool};
 
+#[allow(dead_code)]
+mod support;
+
 /// A diagonal stroke 3 points wide, drawn as the page draws ink, at one pixel per point.
 fn render_diagonal() -> image::RgbaImage {
     let mut stroke = Stroke::new(Tool::Pen, Rgb(0, 0, 0), 3.0);
@@ -11,12 +14,12 @@ fn render_diagonal() -> image::RgbaImage {
         let t = i as f32 / 59.0;
         stroke.add(Dab::new(20.0 + 200.0 * t, 20.0 + 37.0 * t, 0.8));
     }
-    let mut h = Harness::builder().with_size(vec2(240.0, 80.0)).with_pixels_per_point(1.0).build_ui(move |ui| {
+    let mut h = Harness::builder().with_size(vec2(240.0, 80.0)).with_pixels_per_point(1.0).renderer(support::gpu::renderer()).build_ui(move |ui| {
         ui.painter().rect_filled(ui.max_rect(), 0.0, egui::Color32::WHITE);
         nocturne_ui_egui::inkpad::paint_stroke(ui.painter(), egui::Pos2::ZERO, &stroke);
     });
     h.run();
-    h.render().expect("an offscreen renderer")
+    support::gpu::render(&mut h).expect("an offscreen renderer")
 }
 
 /// The edges of a stroke fade into the paper, as egui's own lines do, rather than stepping from
@@ -44,14 +47,16 @@ fn render_straight(
     let mut stroke = Stroke::new(tool, Rgb(255, 221, 51), 32.0);
     stroke.add(Dab::new(start.x, start.y, 1.0));
     stroke.add(Dab::new(end.x, end.y, 1.0));
-    let mut h = Harness::builder().with_size(vec2(240.0, 240.0)).with_pixels_per_point(pixels_per_point).build_ui(move |ui| {
-        ui.painter().rect_filled(ui.max_rect(), 0.0, background);
-        for _ in 0..copies {
-            nocturne_ui_egui::inkpad::paint_stroke(ui.painter(), egui::Pos2::ZERO, &stroke);
-        }
-    });
+    let mut h = Harness::builder().with_size(vec2(240.0, 240.0)).with_pixels_per_point(pixels_per_point).renderer(support::gpu::renderer()).build_ui(
+        move |ui| {
+            ui.painter().rect_filled(ui.max_rect(), 0.0, background);
+            for _ in 0..copies {
+                nocturne_ui_egui::inkpad::paint_stroke(ui.painter(), egui::Pos2::ZERO, &stroke);
+            }
+        },
+    );
     h.run();
-    h.render().expect("an offscreen renderer")
+    support::gpu::render(&mut h).expect("an offscreen renderer")
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]

@@ -8,15 +8,13 @@ document must remain consistent with it.
 
 ## Thickness
 
-The thickness chooser should use perceptual, geometric spacing rather than a linear `1 -> 50 px`
-scale. A useful initial family is:
+The thickness chooser uses roughly geometric spacing, from fine writing to broad marks:
 
 ```text
-1, 1.4, 2, 3, 4.5, 6.5, 9, 13, 19, 28, 40, 60 px
+0.4, 0.7, 1, 1.4, 2, 2.8, 3.5, 4.5, 6, 9, 14, 20, 32, 50, 80 pt
 ```
 
-These values are a design target, not a promise that the current selector already uses them.
-The selector may show friendly labels, while the renderer keeps a precise width.
+Tablet Studio offers separate eraser sizes from 2 to 80 points.
 
 ## Pressure
 
@@ -40,10 +38,9 @@ range delivered to Nocturne, a curve alone cannot restore the missing physical d
 ## Ink edges
 
 Ink should not be rendered with a generic blur. Thin pen lines should remain crisp and
-antialiased. Broad pen and brush strokes may have a subtle translucent fringe; pencil may be
-softer or textured; fountain pen should stay mostly crisp; highlighter should have a broader,
-translucent edge. The fringe is a small fixed physical width, not a percentage of the stroke, so
-thick ink remains solid instead of becoming hazy.
+antialiased. Pencil uses graphite grain in page coordinates, and brush edges use a softer fringe
+around a solid core. Fountain pen has a crisp pressure-shaped edge. Highlighter lays down a
+translucent, pressure-flat mark. The fringe uses a fixed physical width.
 
 The editable ink data must preserve the original points, pressure readings, tool, selected width,
 and sensitivity. Edge treatment is a rendering concern and must not destroy that information.

@@ -791,3 +791,12 @@
 @id	ui.welcome_wizard_finish	Terminer
 @id	ui.welcome_wizard_done_title	Merci
 @id	ui.welcome_wizard_done_body	Nocturne est prêt à l'emploi. Vos choix sont enregistrés. Cette configuration ne réapparaîtra qu'après une réinitialisation des préférences.
+@id	ui.canvas_layout	Disposition du canevas
+@id	ui.canvas_infinite	Canevas infini
+@id	ui.canvas_portrait	Pages en portrait
+@id	ui.canvas_landscape	Pages en paysage
+@id	ui.minimize_drawing_tools	Réduire les outils de dessin
+@id	ui.paste_ink	Coller l’encre
+@id	ui.no_ink_on_clipboard	Le presse-papiers ne contient pas d’encre
+@id	ui.cannot_paste_ink	Impossible de coller l’encre copiée
+@id	ui.hold_to_straighten	Maintenir 2 secondes pour ajuster une ligne ou un carré

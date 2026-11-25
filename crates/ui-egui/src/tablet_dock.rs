@@ -61,6 +61,10 @@ pub fn show_pencil_pill(
     if view_rect.width() < 320.0 || view_rect.height() < 160.0 {
         return (acts, None);
     }
+    if view.tablet_tools_minimized {
+        let (pivot, anchor) = dock_anchor(view_rect, studio.toolbar_dock, edge_clearance);
+        return crate::tablet_chrome::show_minimized_tools(ctx, pivot, anchor, t);
+    }
     let palette_id = Id::unique("studio-nib-palette-open");
     let shapes_open_id = Id::unique("studio-shapes-palette-open");
     let mut palette_for = ctx.data(|d| d.get_temp::<Option<usize>>(palette_id)).flatten();
@@ -364,13 +368,7 @@ fn draw_tool_popovers(
                 }
                 ui.separator();
                 for tenths in rack::THICKNESSES {
-                    let w = f32::from(tenths) / 10.0;
-                    let chosen = nib.tenths.abs_diff(tenths) <= 3;
-                    let (wr, ws) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::click());
-                    ws.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, chosen, crate::tl_id!("ui.pen_thickness")));
-                    paint_studio_btn_chrome(ui, wr, &ws, chosen, true, t);
-                    ui.painter().circle_filled(wr.center(), (w * 0.5).clamp(1.5, 8.5), if chosen { t.accent } else { t.text });
-                    if ws.clicked() {
+                    if crate::tablet_nibs::thickness_button(ui, tenths, nib.tenths == tenths, t) {
                         acts.push(Act::InkRack(RackEdit::Set(nib_idx, Nib::new(nib.tool, nib.colour, tenths))));
                     }
                 }

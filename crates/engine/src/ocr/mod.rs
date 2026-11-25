@@ -735,7 +735,7 @@ mod tests {
         let t = TempDir::new("ocr-local-handwriting-fallback");
         let mut s = Session::new(&t.path().join("notebooks"), Settings::at(t.path().join("settings").join("s.toml"))).expect("session");
         let mut stroke = Stroke::new(Tool::Pen, Rgb::BLACK, 2.0);
-        stroke.dabs = vec![Dab::new(10.0, 10.0, 1.0), Dab::new(80.0, 10.0, 1.0)];
+        stroke.dabs = vec![Dab::new(10.0, 10.0, 1.0), Dab::new(80.0, 10.0, 1.0)].into();
 
         assert!(s.set_handwriting_ocr_enabled(true));
         let mut cfg_p = Params::new();

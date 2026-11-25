@@ -16,6 +16,23 @@ pub use crate::tablet_nibs::{
 
 pub const UI_LAYOUT_KEY: &str = "ui_layout_mode";
 
+pub(crate) fn show_minimized_tools(ctx: &Context, pivot: Align2, anchor: egui::Pos2, tokens: &Tokens) -> (Vec<Act>, Option<Rect>) {
+    let mut acts = Vec::new();
+    let response = egui::Area::new(Id::unique("studio-pencil-minimized")).order(Order::Foreground).pivot(pivot).fixed_pos(anchor).show(ctx, |ui| {
+        egui::Frame::NONE
+            .fill(tokens.surface_elevated)
+            .stroke(Stroke::new(1.0, tokens.border))
+            .corner_radius(RADIUS_PILL)
+            .inner_margin(egui::Margin::same(4))
+            .show(ui, |ui| {
+                if ui.add(egui::Button::new(crate::tl_id!("ui.tools")).min_size(vec2(52.0, 36.0))).clicked() {
+                    acts.push(Act::ToggleTabletTools);
+                }
+            });
+    });
+    (acts, Some(response.response.rect))
+}
+
 /// How far floating Tablet Studio chrome keeps from the edge of the page view.
 pub(crate) const DOCK_MARGIN: f32 = 12.0;
 
@@ -355,7 +372,21 @@ fn view_menu(ui: &mut Ui, input: &StudioTopBarIn<'_>, out: &mut StudioTopBarOut)
     if ui.checkbox(&mut minimap_on, crate::tl_id!("ui.show_minimap")).changed() {
         out.acts.push(Act::ToggleMinimap);
     }
+    let mut minimized = input.view.tablet_tools_minimized;
+    if ui.checkbox(&mut minimized, crate::tl_id!("ui.minimize_drawing_tools")).changed() {
+        out.acts.push(Act::ToggleTabletTools);
+        ui.close();
+    }
     ui.separator();
+    ui.add_enabled_ui(input.view.has_page && !input.show_source, |ui| {
+        ui.menu_button(crate::tl_id!("ui.canvas_layout"), |ui| crate::ribbon::canvas_layout_choices(ui, input.view.canvas_layout, &mut out.acts));
+    });
+    if matches!(input.view.pointer, crate::ribbon::Pointer::Lasso | crate::ribbon::Pointer::Pick)
+        && ui.button(crate::tl_id!("ui.paste_ink")).clicked()
+    {
+        out.acts.push(Act::InkPaste);
+        ui.close();
+    }
     let next_rules = match input.view.rules {
         RuleLines::None => RuleLines::College,
         RuleLines::College => RuleLines::GridMedium,

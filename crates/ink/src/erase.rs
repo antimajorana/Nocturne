@@ -212,7 +212,7 @@ fn finish(stroke: &Stroke, run: &mut Vec<Point>, pieces: &mut Vec<Stroke>) {
         }
     }
     let dabs: Vec<Dab> = points.iter().zip(&keep).filter(|(_, keep)| **keep).map(|(p, _)| p.dab.sane()).collect();
-    pieces.push(Stroke { dabs, ..stroke.clone() });
+    pieces.push(Stroke { dabs: dabs.into(), ..stroke.clone() });
 }
 
 /// The closest two points of a piece are left to each other near a cut, a little under the
@@ -234,7 +234,7 @@ mod tests {
 
     fn line(x0: f32, x1: f32, y: f32, width: f32) -> Stroke {
         let mut s = Stroke::new(Tool::Pen, Rgb(0x18, 0x55, 0xc4), width);
-        s.dabs = vec![Dab::new(x0, y, 1.0), Dab::new(x1, y, 1.0)];
+        s.dabs = vec![Dab::new(x0, y, 1.0), Dab::new(x1, y, 1.0)].into();
         s
     }
 
@@ -288,7 +288,7 @@ mod tests {
         let far = line(0.0, 200.0, 20.0, 4.0);
         let near_miss = line(0.0, 200.0, 107.5, 4.0);
         let mut dot = Stroke::new(Tool::Pen, Rgb::BLACK, 4.0);
-        dot.dabs = vec![Dab::new(300.0, 100.0, 1.0)];
+        dot.dabs = vec![Dab::new(300.0, 100.0, 1.0)].into();
         let before = vec![far, near_miss, dot];
         let mut d = sheet(before.clone());
         assert!(!d.erase_pixel_segment((100.0, 100.0), (120.0, 100.0), 5.0), "5 + 2 does not reach a stroke 7.5 away");
@@ -303,7 +303,7 @@ mod tests {
     #[test]
     fn a_stroke_wholly_under_the_eraser_goes_and_a_speck_is_not_left_behind() {
         let mut dot = Stroke::new(Tool::Pen, Rgb::BLACK, 4.0);
-        dot.dabs = vec![Dab::new(100.0, 100.0, 1.0)];
+        dot.dabs = vec![Dab::new(100.0, 100.0, 1.0)].into();
         // The short line's right end sticks 0.3 out from under the eraser: too little to keep.
         let mut d = sheet(vec![dot, line(98.0, 107.3, 100.0, 4.0), line(0.0, 300.0, 200.0, 4.0)]);
         assert!(d.erase_pixel_segment((100.0, 100.0), (100.0, 100.0), 5.0));
@@ -335,7 +335,7 @@ mod tests {
         let mut strokes: Vec<Stroke> = (0..MAX_STROKES - 1)
             .map(|i| {
                 let mut s = Stroke::new(Tool::Pen, Rgb::BLACK, 1.0);
-                s.dabs = vec![Dab::new(1000.0 + i as f32, 1000.0, 1.0)];
+                s.dabs = vec![Dab::new(1000.0 + i as f32, 1000.0, 1.0)].into();
                 s
             })
             .collect();
