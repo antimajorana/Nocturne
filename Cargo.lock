@@ -3154,7 +3154,7 @@ dependencies = [
 
 [[package]]
 name = "nocturne"
-version = "0.0.13"
+version = "0.0.19"
 dependencies = [
  "eframe",
  "egui",
@@ -3175,7 +3175,7 @@ dependencies = [
 
 [[package]]
 name = "nocturne-android"
-version = "0.0.13"
+version = "0.0.19"
 dependencies = [
  "android_logger",
  "eframe",
@@ -3193,7 +3193,7 @@ dependencies = [
 
 [[package]]
 name = "nocturne-cli"
-version = "0.0.13"
+version = "0.0.19"
 dependencies = [
  "nocturne-engine",
  "nocturne-import",
@@ -3205,7 +3205,7 @@ dependencies = [
 
 [[package]]
 name = "nocturne-demo"
-version = "0.0.13"
+version = "0.0.19"
 dependencies = [
  "nocturne-formats",
  "nocturne-ink",
@@ -3215,14 +3215,14 @@ dependencies = [
 
 [[package]]
 name = "nocturne-diagram"
-version = "0.0.13"
+version = "0.0.19"
 dependencies = [
  "mermaid-rs-renderer",
 ]
 
 [[package]]
 name = "nocturne-engine"
-version = "0.0.13"
+version = "0.0.19"
 dependencies = [
  "image",
  "nocturne-formats",
@@ -3238,14 +3238,14 @@ dependencies = [
 
 [[package]]
 name = "nocturne-formats"
-version = "0.0.13"
+version = "0.0.19"
 dependencies = [
  "nocturne-model",
 ]
 
 [[package]]
 name = "nocturne-import"
-version = "0.0.13"
+version = "0.0.19"
 dependencies = [
  "cab",
  "nocturne-formats",
@@ -3256,18 +3256,18 @@ dependencies = [
 
 [[package]]
 name = "nocturne-ink"
-version = "0.0.13"
+version = "0.0.19"
 
 [[package]]
 name = "nocturne-input-language"
-version = "0.0.13"
+version = "0.0.19"
 dependencies = [
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "nocturne-ios"
-version = "0.0.13"
+version = "0.0.19"
 dependencies = [
  "block2 0.6.2",
  "eframe",
@@ -3292,7 +3292,7 @@ dependencies = [
 
 [[package]]
 name = "nocturne-math"
-version = "0.0.13"
+version = "0.0.19"
 dependencies = [
  "ratex-font",
  "ratex-layout",
@@ -3302,7 +3302,7 @@ dependencies = [
 
 [[package]]
 name = "nocturne-mcp"
-version = "0.0.13"
+version = "0.0.19"
 dependencies = [
  "nocturne-engine",
  "nocturne-store",
@@ -3311,18 +3311,18 @@ dependencies = [
 
 [[package]]
 name = "nocturne-model"
-version = "0.0.13"
+version = "0.0.19"
 dependencies = [
  "web-time",
 ]
 
 [[package]]
 name = "nocturne-onenote"
-version = "0.0.13"
+version = "0.0.19"
 
 [[package]]
 name = "nocturne-setup"
-version = "0.0.13"
+version = "0.0.19"
 dependencies = [
  "nocturne-store",
  "rfd",
@@ -3330,7 +3330,7 @@ dependencies = [
 
 [[package]]
 name = "nocturne-store"
-version = "0.0.13"
+version = "0.0.19"
 dependencies = [
  "log",
  "nocturne-formats",
@@ -3340,7 +3340,7 @@ dependencies = [
 
 [[package]]
 name = "nocturne-text"
-version = "0.0.13"
+version = "0.0.19"
 dependencies = [
  "nocturne-model",
  "parley",
@@ -3348,7 +3348,7 @@ dependencies = [
 
 [[package]]
 name = "nocturne-ui-egui"
-version = "0.0.13"
+version = "0.0.19"
 dependencies = [
  "arboard",
  "craft-i18n",
@@ -7018,7 +7018,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.0.13"
+version = "0.0.19"
 dependencies = [
  "proc-macro2",
  "serde_json",
