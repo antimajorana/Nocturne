@@ -10,7 +10,7 @@ fn main() {
     res.set_icon("../../assets/app-icon/nocturne.ico");
     res.set("ProductName", "Nocturne");
     res.set("FileDescription", "Nocturne command line (alpha)");
-    res.set("LegalCopyright", "GPL-3.0-only");
+    res.set("LegalCopyright", "AGPL-3.0-only");
     if let Err(e) = res.compile() {
         // Without the resource the program still works, only with the default file icon.
         println!("cargo:warning=could not embed the icon: {e}");

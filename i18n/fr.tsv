@@ -372,7 +372,7 @@
 @id	ui.mermaid	Mermaid
 @id	ui.mint	mint
 @id	ui.mit_license	Licence MIT
-@id	ui.licence_summary_nocturne	Le code de Nocturne est sous licence GPL-3.0-only. Les conditions propres à l’illustration de l’icône figurent dans ATTRIBUTION.md.
+@id	ui.licence_summary_nocturne	Le code de Nocturne est sous licence AGPL-3.0-only. Les conditions propres à l’illustration de l’icône figurent dans ATTRIBUTION.md.
 @id	ui.mode	Mode
 @id	ui.modify_tool	Modifier l'outil
 @id	ui.more	More...

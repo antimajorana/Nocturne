@@ -179,7 +179,7 @@ if (-not $ZipOnly) {
   }
   $paragraphs = [System.Collections.Generic.List[string]]::new()
   $paragraphs.Add('\b Nocturne\b0')
-  $paragraphs.Add((ConvertTo-RtfText 'Nocturne code is licensed under the GNU General Public License, version 3 only. The full licence follows. See NOTICE for source downloads and ATTRIBUTION.md for the terms of third-party material and brand artwork.'))
+  $paragraphs.Add((ConvertTo-RtfText 'Nocturne code is licensed under the GNU Affero General Public License, version 3 only. The full licence follows. See NOTICE for source downloads and ATTRIBUTION.md for the terms of third-party material and brand artwork.'))
   $title = $true  # the licence opens with its name: show it bold
   foreach ($para in ((Get-Content -Raw (Join-Path $Root 'LICENSE')) -split '\r?\n\s*\r?\n')) {
     $joined = (($para -split '\r?\n') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' '

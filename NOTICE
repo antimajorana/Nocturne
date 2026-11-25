@@ -1,7 +1,7 @@
 Nocturne
 Copyright (c) 2026 antimajorana.
-Project-owned code is licensed under the GNU General Public License, version 3
-only (GPL-3.0-only). The full text accompanies the program in LICENSE.
+Project-owned code is licensed under the GNU Affero General Public License,
+version 3 only (AGPL-3.0-only). The full text accompanies the program in LICENSE.
 
 Source and build instructions
 
@@ -14,6 +14,11 @@ Releases through v0.0.17 were offered under MIT or Apache-2.0. Their grants
 continue to apply to the code distributed under them. Copies of those license
 texts are included in licenses/Nocturne-legacy-MIT.txt and
 licenses/Nocturne-legacy-Apache-2.0.txt.
+
+Release v0.0.18 was offered under the GNU General Public License, version 3 only
+(GPL-3.0-only). That grant continues to apply to the code distributed under it.
+On 2026-11-25 the license of project-owned code changed to AGPL-3.0-only, which
+applies from that change onward.
 
 Third-party material
 

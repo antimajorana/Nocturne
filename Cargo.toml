@@ -7,7 +7,7 @@ default-members = ["crates/*", "apps/nocturne", "apps/nocturne-cli", "apps/noctu
 version = "0.0.13"
 edition = "2024"
 rust-version = "1.95"
-license = "GPL-3.0-only"
+license = "AGPL-3.0-only"
 repository = "https://github.com/antimajorana/Nocturne"
 publish = false
 
